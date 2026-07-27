@@ -807,20 +807,27 @@ def ensure_matching_browser(
         grabber,
         uid,
         preferred_port=preferred_port,
+        require_capture_ready=False,
     )
     if match:
         matched_port = int(match.get("port") or 0)
         if matched_port:
             remember_browser_port(browser_slot, matched_port)
-        logger.info(
-            "网页账号校验通过：UID=%s，CDP=%s",
-            mask_uid(uid),
-            match["port"],
-        )
-        return match
+            preferred_port = matched_port
+        if match.get("captureReady"):
+            logger.info(
+                "网页账号校验通过：UID=%s，CDP=%s",
+                mask_uid(uid),
+                match["port"],
+            )
+            return match
     process: subprocess.Popen[Any] | None = None
-    existing_identity = None
-    if preferred_port is not None and port_is_listening(preferred_port):
+    existing_identity = match
+    if (
+        existing_identity is None
+        and preferred_port is not None
+        and port_is_listening(preferred_port)
+    ):
         existing_identity = web_identity(grabber, preferred_port)
     if existing_identity and existing_identity.get("page"):
         port = preferred_port
