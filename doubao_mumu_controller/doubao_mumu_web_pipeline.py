@@ -313,9 +313,28 @@ def discover_mumu_instances(
 
 
 def resolve_adb() -> Path:
+    configured = Path(str(os.environ.get("ADB_PATH") or "").strip())
+    if str(configured) and configured.is_file():
+        return configured
     adb = first_existing(mumu.ADB_CANDIDATES)
     if adb:
         return adb
+    manager = resolve_mumu_manager()
+    if manager is not None:
+        install_root = manager.parent
+        dynamic_candidates = [
+            install_root / "adb.exe",
+            install_root / "shell" / "adb.exe",
+            install_root.parent / "adb.exe",
+            install_root.parent / "shell" / "adb.exe",
+            install_root.parent / "nx_main" / "adb.exe",
+        ]
+        nx_device = install_root.parent / "nx_device"
+        if nx_device.is_dir():
+            dynamic_candidates.extend(nx_device.glob("*/shell/adb.exe"))
+        adb = first_existing(dynamic_candidates)
+        if adb:
+            return adb
     located = run_text(["where.exe", "adb"], timeout=5, check=False)
     for line in located.stdout.splitlines():
         path = Path(line.strip())

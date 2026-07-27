@@ -68,18 +68,21 @@ def environment_check() -> dict[str, object]:
     import websocket  # noqa: F401
 
     from doubao_mumu_web_pipeline import (
+        resolve_adb,
         resolve_chrome,
         resolve_mumu_manager,
     )
     from doubao_mumu_loop import (
-        ADB_CANDIDATES,
         APPIUM_MAIN_CANDIDATES,
         APPIUM_NODE_CANDIDATES,
     )
 
     mumu_manager = resolve_mumu_manager()
     chrome = resolve_chrome()
-    adb = next((path for path in ADB_CANDIDATES if path.is_file()), None)
+    try:
+        adb = resolve_adb()
+    except Exception:
+        adb = None
     appium_node = next(
         (path for path in APPIUM_NODE_CANDIDATES if path.is_file()),
         None,

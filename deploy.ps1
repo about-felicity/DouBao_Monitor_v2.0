@@ -96,6 +96,7 @@ if (-not $appium) {
     )
 }
 if (-not $appium) { throw "Appium is still unavailable after installation." }
+$env:Path = (Split-Path -Parent $appium) + ";" + $env:Path
 
 Write-Host "[4/6] Checking the UiAutomator2 driver..."
 $appiumVersionResult = Invoke-NativeCapture $appium @("--version")
@@ -139,16 +140,11 @@ if (-not (Test-Path -LiteralPath $keyFile)) {
     Copy-Item -LiteralPath $keyExample -Destination $keyFile
     Write-Host "Created the local key file. Add your own API key if AI fallback is required: $keyFile"
 }
-$chrome = @(
-    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe")
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-if (-not $chrome) { throw "Google Chrome was not found. Install Chrome first." }
-$mumu = @(
-    (Join-Path $env:ProgramFiles "Netease\MuMu\nx_main\MuMuManager.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Netease\MuMu\nx_main\MuMuManager.exe")
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-if (-not $mumu) { throw "MuMu was not found. Install and start MuMu first." }
+$environmentCheck = Join-Path $controllerRoot "doubao_remote_startup.py"
+& $python $environmentCheck --check-only --no-open-dashboard
+if ($LASTEXITCODE -ne 0) {
+    throw "Environment check failed. Ensure Chrome and MuMu are installed and MuMu is running."
+}
 
 Write-Host "[6/6] Starting the control panel and local dashboard..."
 $env:DOUBAO_NO_LAUNCHER_PAUSE = "1"
