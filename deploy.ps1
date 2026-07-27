@@ -98,10 +98,27 @@ if (-not $appium) {
 if (-not $appium) { throw "Appium is still unavailable after installation." }
 
 Write-Host "[4/6] Checking the UiAutomator2 driver..."
+$appiumVersionResult = Invoke-NativeCapture $appium @("--version")
+$appiumVersion = $appiumVersionResult.Output.Trim()
+$appiumMajor = 2
+if ($appiumVersion -match "(\d+)\.") {
+    $appiumMajor = [int]$Matches[1]
+}
+# UiAutomator2 5.x requires Appium 3. Appium 2.19 must use the latest
+# compatible 4.x line instead of the unqualified latest driver.
+$uiautomator2Spec = if ($appiumMajor -ge 3) {
+    "uiautomator2"
+}
+else {
+    "uiautomator2@4.2.9"
+}
+Write-Host "Appium $appiumVersion -> driver $uiautomator2Spec"
 $driverList = Invoke-NativeCapture $appium @("driver", "list", "--installed", "--json")
 $installedDrivers = $driverList.Output
 if ($driverList.ExitCode -ne 0 -or $installedDrivers -notmatch "uiautomator2") {
-    $driverInstall = Invoke-NativeCapture $appium @("driver", "install", "uiautomator2")
+    $driverInstall = Invoke-NativeCapture $appium @(
+        "driver", "install", $uiautomator2Spec
+    )
     if ($driverInstall.Output) { Write-Host $driverInstall.Output.Trim() }
     if ($driverInstall.ExitCode -ne 0) {
         # Some Appium builds return a non-zero exit code when the driver is
