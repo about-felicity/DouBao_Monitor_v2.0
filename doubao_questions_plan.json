@@ -1,0 +1,25 @@
+{
+  "mode": "sequential",
+  "items": [
+    {
+      "question": "推荐一款染发剂",
+      "rounds": 30
+    },
+    {
+      "question": "推荐一款眉毛增长液",
+      "rounds": 30
+    },
+    {
+      "question": "JSV染发剂怎么样",
+      "rounds": 30
+    },
+    {
+      "question": "梵玢染发剂怎么样",
+      "rounds": 30
+    },
+    {
+      "question": "首迷染发剂怎么样",
+      "rounds": 30
+    }
+  ]
+}

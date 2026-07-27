@@ -1,0 +1,5 @@
+Pillow>=11.0
+requests>=2.32
+websocket-client>=1.8
+lxml>=5.0
+openpyxl>=3.1

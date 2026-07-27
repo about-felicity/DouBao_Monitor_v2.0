@@ -1,0 +1,86 @@
+# Secrets and authenticated sessions
+doubao_mumu_controller/doubao_api_keys.env
+doubao_mumu_controller/doubao_lan_pairing.json
+doubao_mumu_controller/doubao_remote_sync_config.json
+**/.env
+**/*cookie*
+**/*session*
+**/*credential*
+**/*token*.json
+
+# Browser profiles and runtime state
+runtime/
+**/chrome_profile*/
+**/chrome_profiles/
+**/user_data/
+doubao_pending_saves/
+doubao_mumu_controller/portable_runtime/
+
+# Generated deploy bundles and dependency trees
+doubao_standalone_deploy/
+doubao_remote_deploy/
+node_modules/
+__pycache__/
+*.py[cod]
+
+# Logs, temporary state, screenshots and UI dumps
+*.log
+*.err
+*.out
+*.tmp
+*.pid
+/*.png
+/*.xml
+doubao_mumu_controller/*.jsonl
+doubao_mumu_controller/*_state.json
+doubao_mumu_controller/*_results.json
+doubao_mumu_controller/doubao_panel_readiness.json
+doubao_mumu_controller/doubao_mumu_web_diagnostics/
+doubao_mumu_controller/_test_artifacts/
+
+# Historical and repair backups
+data_cleanup_backups/
+deleted_scrape_backup_*/
+doubao_source_capture_source_backup_*/
+doubao_source_capture_source_backup_*.zip
+doubao_source_capture_source_backup_*.rar
+*.bak
+*.bak_*
+*.bak.*
+*.before_*
+*.before-*
+
+# Unrelated experiments kept on the development machine
+deepseek_db_dump/
+deepseek*
+*deepseek*
+image_pro/
+mumu-python-api/
+outputs/
+reports/
+bing_smzdm.html
+
+# Local diagnostics and scratch scripts
+/_audit_*
+/_check_*
+/_tmp_*
+/tmp_*
+/*_test.py
+/unicode_*test*
+/*_test_state.json
+/*_test_results.jsonl
+/*test*_state.json
+/*test*_results.jsonl
+/*_long_test_state.json
+/*_long_test_results.jsonl
+doubao_web_dom_snapshot.json
+doubao_api_check.json
+
+# SQLite transient files and worker locks
+*.db-shm
+*.db-wal
+*.lock
+
+# Local office/export artifacts
+~$*
+*.xlsx

@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "device_index": "",
+  "question_mode": "interleaved",
+  "questions": [
+    {
+      "text": "推荐一款染发剂",
+      "repeat": 2
+    },
+    {
+      "text": "推荐一款眉毛增长液",
+      "repeat": 2
+    },
+    {
+      "text": "推荐一款睫毛增长液",
+      "repeat": 2
+    }
+  ],
+  "runtime": {
+    "min_wait": 8.0,
+    "stable_seconds": 5.0,
+    "answer_timeout": 240.0,
+    "sync_timeout": 300.0,
+    "retry_delay": 5.0,
+    "cooldown_min": 10.0,
+    "cooldown_max": 20.0,
+    "max_round_retries": 0,
+    "verbose": false
+  },
+  "schedule": {
+    "mode": "none",
+    "daily_time": "09:00",
+    "interval_minutes": 60,
+    "once_datetime": "2026-07-24 09:00"
+  }
+}
