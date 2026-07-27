@@ -1854,11 +1854,16 @@ class DoubaoMuMuControlPanel:
                     grabber,
                     account["uid"],
                     preferred_port=preferred_port,
+                    require_capture_ready=False,
                 )
                 browser_process = None
                 identity: dict[str, Any]
                 if browser:
                     identity = browser
+                    matched_port = int(identity.get("port") or 0)
+                    if matched_port:
+                        pipeline.remember_browser_port(index, matched_port)
+                        preferred_port = matched_port
                 elif (
                     preferred_port is not None
                     and pipeline.port_is_listening(preferred_port)

@@ -647,6 +647,33 @@ def remember_browser_port(slot: str | int | None, port: int) -> None:
     temporary.replace(BROWSER_SLOT_MAP_PATH)
 
 
+def browser_candidate_ports(preferred_port: int | None = None) -> list[int]:
+    """Return browser CDP ports in account-matching priority order."""
+    ports: list[int] = []
+
+    def add(value: Any) -> None:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+
+    add(preferred_port)
+    try:
+        mapping = json.loads(
+            BROWSER_SLOT_MAP_PATH.read_text(encoding="utf-8")
+        )
+        if isinstance(mapping, dict):
+            for value in mapping.values():
+                add(value)
+    except Exception:
+        pass
+    for port in CDP_SCAN_PORTS:
+        add(port)
+    return ports
+
+
 def doubao_debug_port_ready(port: int) -> bool:
     try:
         with urllib.request.urlopen(
@@ -668,13 +695,11 @@ def find_matching_browser(
     uid: str,
     *,
     preferred_port: int | None = None,
+    require_capture_ready: bool = True,
 ) -> dict[str, Any] | None:
-    ports = (
-        [preferred_port]
-        if preferred_port is not None
-        else CDP_SCAN_PORTS
-    )
-    for port in ports:
+    # Login order is user-controlled. The slot's original port is only a hint;
+    # scan all known browser windows so swapped logins can be remapped by UID.
+    for port in browser_candidate_ports(preferred_port):
         if not port_is_listening(port):
             continue
         try:
@@ -684,7 +709,10 @@ def find_matching_browser(
         if (
             identity.get("loggedIn")
             and identity.get("uid") == uid
-            and identity.get("captureReady")
+            and (
+                identity.get("captureReady")
+                or not require_capture_ready
+            )
         ):
             return identity
     return None
@@ -781,6 +809,9 @@ def ensure_matching_browser(
         preferred_port=preferred_port,
     )
     if match:
+        matched_port = int(match.get("port") or 0)
+        if matched_port:
+            remember_browser_port(browser_slot, matched_port)
         logger.info(
             "网页账号校验通过：UID=%s，CDP=%s",
             mask_uid(uid),
