@@ -75,6 +75,9 @@ def environment_check() -> dict[str, object]:
     from doubao_mumu_loop import (
         APPIUM_MAIN_CANDIDATES,
         APPIUM_NODE_CANDIDATES,
+        android_sdk_root_for_adb,
+        resolve_global_appium,
+        resolve_java_home,
     )
 
     mumu_manager = resolve_mumu_manager()
@@ -98,24 +101,24 @@ def environment_check() -> dict[str, object]:
     if adb is None:
         raise RuntimeError("找不到 ADB；请确认 MuMu 安装完整。")
     if appium_node is None or appium_main is None:
-        global_appium = subprocess.run(
-            ["where.exe", "appium.cmd"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-        )
-        if global_appium.returncode != 0:
+        global_appium = resolve_global_appium()
+        if global_appium is None:
             raise RuntimeError(
                 "找不到便携 Appium、影刀 Appium 或全局 appium.cmd。"
             )
+    else:
+        global_appium = None
+    android_sdk = android_sdk_root_for_adb(adb)
+    java_home = resolve_java_home()
     return {
         "python": sys.version.split()[0],
         "mumu_manager": str(mumu_manager),
         "chrome": str(chrome),
         "adb": str(adb),
         "portable_appium": bool(appium_node and appium_main),
+        "global_appium": str(global_appium or ""),
+        "android_sdk": str(android_sdk),
+        "java_home": str(java_home),
     }
 
 

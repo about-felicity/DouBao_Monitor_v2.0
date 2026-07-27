@@ -2094,6 +2094,18 @@ class DoubaoMuMuControlPanel:
             )
             return
         try:
+            from doubao_remote_startup import environment_check
+
+            environment_check()
+        except Exception as exc:
+            self.status_var.set("运行环境未就绪")
+            messagebox.showerror(
+                "运行环境未就绪",
+                f"{exc}\n\n请重新运行根目录的“一键部署并启动.bat”。",
+            )
+            self.log(f"任务未启动，运行环境自检失败：{exc}")
+            return
+        try:
             config = self.collect_config()
             self.write_config(config)
             self.save_brand_settings()

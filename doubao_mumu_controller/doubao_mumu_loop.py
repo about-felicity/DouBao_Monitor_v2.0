@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -57,10 +58,22 @@ APPIUM_MAIN_CANDIDATES = [
     / "main.js",
     Path(r"C:\ProgramData\ShadowBot\support_x64\mobile\NodeJS\node_modules\appium\build\lib\main.js"),
 ]
+GLOBAL_APPIUM_CANDIDATES = [
+    Path(os.environ.get("APPDATA", "")) / "npm" / "appium.cmd",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "npm" / "appium.cmd",
+]
 JAVA_HOME_CANDIDATES = [
     BASE_DIR / "portable_runtime" / "JavaSDK",
     Path(r"C:\ProgramData\ShadowBot\support_x64\mobile\JavaSDK\jdk1.8.0_241"),
     Path(r"C:\Program Files\Android\openjdk\jdk-21.0.8"),
+    Path(r"C:\Program Files\Microsoft"),
+    Path(r"C:\Program Files\Eclipse Adoptium"),
+]
+ANDROID_SDK_CANDIDATES = [
+    BASE_DIR / "portable_runtime" / "AndroidSDK",
+    Path(os.environ.get("ANDROID_SDK_ROOT", "")),
+    Path(os.environ.get("ANDROID_HOME", "")),
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk",
 ]
 MUMU_SERIAL_CANDIDATES = [
     "127.0.0.1:5555",
@@ -100,8 +113,28 @@ def first_existing(paths: Iterable[Path]) -> Path | None:
     return next((path for path in paths if path.exists()), None)
 
 
+def resolve_global_appium() -> Path | None:
+    """Find Appium even when npm's per-user bin directory is absent from PATH."""
+    explicit = first_existing(
+        path for path in GLOBAL_APPIUM_CANDIDATES if str(path).strip()
+    )
+    if explicit is not None:
+        return explicit.resolve()
+    located = run_process(
+        ["where.exe", "appium.cmd"],
+        check=False,
+        timeout=5,
+    ).stdout.splitlines()
+    return first_existing(Path(value.strip()) for value in located if value.strip())
+
+
 def android_sdk_root_for_adb(adb_path: str | Path) -> Path:
     """Resolve the SDK root required by Appium from the selected adb.exe."""
+    for candidate in ANDROID_SDK_CANDIDATES:
+        if str(candidate).strip() and (
+            candidate / "platform-tools" / "adb.exe"
+        ).exists():
+            return candidate.resolve()
     adb = Path(adb_path).resolve()
     if adb.parent.name.casefold() == "platform-tools":
         root = adb.parent.parent
@@ -110,9 +143,22 @@ def android_sdk_root_for_adb(adb_path: str | Path) -> Path:
     for parent in adb.parents:
         if (parent / "platform-tools" / "adb.exe").exists():
             return parent
-    raise AutomationError(
-        f"无法根据 ADB 路径确定 Android SDK 根目录：{adb}"
-    )
+
+    # MuMu ships a complete adb binary but does not place it under the Android
+    # SDK directory layout expected by Appium. Build a small, ignored runtime
+    # shim from those files instead of requiring a second adb installation.
+    platform_tools = BASE_DIR / "runtime" / "android-sdk" / "platform-tools"
+    platform_tools.mkdir(parents=True, exist_ok=True)
+    for name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+        source = adb.parent / name
+        if source.exists():
+            shutil.copy2(source, platform_tools / name)
+    shim_adb = platform_tools / "adb.exe"
+    if not shim_adb.exists():
+        raise AutomationError(
+            f"无法根据 ADB 路径准备 Android SDK 兼容目录：{adb}"
+        )
+    return platform_tools.parent.resolve()
 
 
 def resolve_java_home() -> Path:
@@ -412,8 +458,10 @@ class AppiumClient:
             ) from exc
 
         value = data.get("value")
+        error_code = ""
         error_text = ""
         if isinstance(value, dict):
+            error_code = str(value.get("error") or "").strip()
             error_text = " ".join(
                 str(value.get(key) or "")
                 for key in ("error", "message")
@@ -421,7 +469,7 @@ class AppiumClient:
         if (
             response.status_code >= 400
             or data.get("status") not in (None, 0)
-            or error_text
+            or error_code
         ):
             message = error_text or json.dumps(data, ensure_ascii=False)
             if "invalid session" in message.lower():
@@ -459,12 +507,8 @@ class AppiumClient:
                 "info",
             ]
         else:
-            global_appium = run_process(
-                ["where.exe", "appium.cmd"],
-                check=False,
-                timeout=5,
-            ).stdout.splitlines()
-            if not global_appium:
+            global_appium = resolve_global_appium()
+            if global_appium is None:
                 raise AutomationError(
                     "Appium 未运行，且找不到影刀自带或全局安装的 Appium。"
                 )
@@ -472,7 +516,7 @@ class AppiumClient:
                 "cmd.exe",
                 "/d",
                 "/c",
-                global_appium[0],
+                str(global_appium),
                 "-p",
                 str(listen_port),
                 "--base-path",

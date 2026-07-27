@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
+if exist "%APPDATA%\npm\appium.cmd" set "PATH=%APPDATA%\npm;%PATH%"
+
 set "PYTHON_EXE=python"
 set "PYTHONW_EXE=pythonw"
 if exist "%LocalAppData%\Python\pythoncore-3.14-64\python.exe" set "PYTHON_EXE=%LocalAppData%\Python\pythoncore-3.14-64\python.exe"

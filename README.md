@@ -6,7 +6,9 @@
 
 1. 安装 Google Chrome、MuMu 模拟器和 Python 3.11 以上版本。
 2. 启动需要使用的 MuMu 实例，并在每个实例的豆包 App 中登录账号。
-3. 双击根目录的 `一键部署并启动.bat`。
+3. 双击根目录的 `一键部署并启动.bat`。部署程序会检查并安装
+   Appium、UiAutomator2 和 Java；MuMu 自带的 ADB 会自动适配为 Appium
+   可识别的 Android SDK 目录。
 4. 程序会为每个 MuMu 实例建立独立的调试 Chrome。首次运行时，在各 Chrome 中登录对应的豆包账号，然后回到控制面板点击“重新检测账号”。
 5. 两端账号匹配后即可开始循环提问。
 

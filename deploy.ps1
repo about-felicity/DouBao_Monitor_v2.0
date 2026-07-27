@@ -23,6 +23,25 @@ function Install-WithWinget([string]$Id, [string]$Label) {
     }
 }
 
+function Resolve-JavaHome {
+    $java = Resolve-CommandPath "java.exe"
+    if ($java) { return Split-Path -Parent (Split-Path -Parent $java) }
+    $roots = @(
+        (Join-Path $env:ProgramFiles "Microsoft"),
+        (Join-Path $env:ProgramFiles "Eclipse Adoptium"),
+        (Join-Path $controllerRoot "portable_runtime\JavaSDK")
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $candidate = Get-ChildItem -LiteralPath $root -Filter java.exe -File -Recurse `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($candidate -and $candidate.Directory.Name -eq "bin") {
+            return $candidate.Directory.Parent.FullName
+        }
+    }
+    return $null
+}
+
 function Invoke-NativeCapture([string]$Executable, [string[]]$Arguments) {
     # Windows PowerShell converts ordinary native stderr messages into
     # NativeCommandError records. Appium writes progress banners to stderr
@@ -97,6 +116,15 @@ if (-not $appium) {
 }
 if (-not $appium) { throw "Appium is still unavailable after installation." }
 $env:Path = (Split-Path -Parent $appium) + ";" + $env:Path
+
+$javaHome = Resolve-JavaHome
+if (-not $javaHome) {
+    Install-WithWinget "Microsoft.OpenJDK.17" "Microsoft OpenJDK 17"
+    $javaHome = Resolve-JavaHome
+}
+if (-not $javaHome) { throw "Java is still unavailable after installation." }
+$env:JAVA_HOME = $javaHome
+$env:Path = (Join-Path $javaHome "bin") + ";" + $env:Path
 
 Write-Host "[4/6] Checking the UiAutomator2 driver..."
 $appiumVersionResult = Invoke-NativeCapture $appium @("--version")
