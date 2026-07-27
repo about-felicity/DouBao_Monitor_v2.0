@@ -16,6 +16,19 @@ runtime/
 doubao_pending_saves/
 doubao_mumu_controller/portable_runtime/
 
+# Machine-local collected data (historical examples live in sample_data/)
+/doubao_refs_result.csv
+/doubao_products_result.csv
+/doubao_answers_result.csv
+/doubao_capture_skips.csv
+/doubao_capture_runtime_errors.csv
+/doubao_source_ai_cache.json
+/doubao_source_cache.json
+/doubao_brand_ai_cache.json
+/doubao_source_content_index.json
+/doubao_source_content.db
+/doubao_run_counter.txt
+
 # Generated deploy bundles and dependency trees
 doubao_standalone_deploy/
 doubao_remote_deploy/
