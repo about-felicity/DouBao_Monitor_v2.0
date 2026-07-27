@@ -23,6 +23,34 @@ function Install-WithWinget([string]$Id, [string]$Label) {
     }
 }
 
+function Invoke-NativeCapture([string]$Executable, [string[]]$Arguments) {
+    # Windows PowerShell converts ordinary native stderr messages into
+    # NativeCommandError records. Appium writes progress banners to stderr
+    # even when the command succeeds, so capture them without letting the
+    # global Stop policy abort deployment.
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process `
+            -FilePath $Executable `
+            -ArgumentList $Arguments `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        $stdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+        $stderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Output = ((@($stdout, $stderr) | Where-Object { $_ }) -join [Environment]::NewLine)
+    }
+}
+
 Set-Location -LiteralPath $projectRoot
 Write-Host "[1/6] Checking Python..."
 $python = Resolve-CommandPath "python.exe" @(
@@ -70,10 +98,21 @@ if (-not $appium) {
 if (-not $appium) { throw "Appium is still unavailable after installation." }
 
 Write-Host "[4/6] Checking the UiAutomator2 driver..."
-& $appium driver list --installed 2>&1 | Out-String | Tee-Object -Variable installedDrivers | Out-Null
-if ($installedDrivers -notmatch "uiautomator2") {
-    & $appium driver install uiautomator2
-    if ($LASTEXITCODE -ne 0) { throw "UiAutomator2 driver installation failed." }
+$driverList = Invoke-NativeCapture $appium @("driver", "list", "--installed", "--json")
+$installedDrivers = $driverList.Output
+if ($driverList.ExitCode -ne 0 -or $installedDrivers -notmatch "uiautomator2") {
+    $driverInstall = Invoke-NativeCapture $appium @("driver", "install", "uiautomator2")
+    if ($driverInstall.Output) { Write-Host $driverInstall.Output.Trim() }
+    if ($driverInstall.ExitCode -ne 0) {
+        # Some Appium builds return a non-zero exit code when the driver is
+        # already present. Verify once more instead of failing the deployment.
+        $installedDrivers = (
+            Invoke-NativeCapture $appium @("driver", "list", "--installed", "--json")
+        ).Output
+        if ($installedDrivers -notmatch "uiautomator2") {
+            throw "UiAutomator2 driver installation failed."
+        }
+    }
 }
 
 Write-Host "[5/6] Preparing local configuration and desktop software..."
