@@ -1683,25 +1683,29 @@ def update_answer_review(run_no, answer_hash, review_status, model):
 
 def find_existing_source_run(payload):
     """Find a partially/successfully saved capture so retries are idempotent."""
-    if not os.path.exists(OUT_CSV):
-        return None
     chat_id = chat_id_from_url(payload.get("url", ""))
     extracted_at = str(payload.get("extractedAt") or "").strip()
     if not chat_id or not extracted_at:
         return None
-    try:
-        with open(OUT_CSV, "r", encoding="utf-8-sig", newline="") as f:
-            for row in csv.DictReader(f):
-                if (
-                    str(row.get("chat_id") or "") == chat_id
-                    and str(row.get("extracted_at") or "").strip() == extracted_at
-                ):
-                    return {
-                        "run_no": str(row.get("run_no") or ""),
-                        "run_time": str(row.get("run_time") or "") or now_str(),
-                    }
-    except Exception:
-        return None
+    # A zero-reference capture has no row in OUT_CSV, but its answer is already
+    # persisted. Search both datasets so a later backend-reference recovery
+    # repairs the original run instead of creating a duplicate dashboard run.
+    for path in (OUT_CSV, OUT_ANSWERS_CSV):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    if (
+                        str(row.get("chat_id") or "") == chat_id
+                        and str(row.get("extracted_at") or "").strip() == extracted_at
+                    ):
+                        return {
+                            "run_no": str(row.get("run_no") or ""),
+                            "run_time": str(row.get("run_time") or "") or now_str(),
+                        }
+        except Exception:
+            continue
     return None
 
 
@@ -1724,35 +1728,69 @@ def append_csv(payload):
         if existing_run:
             run_no = existing_run["run_no"]
             run_time = existing_run["run_time"]
-            debug_log("source append deduplicated; run_no=" + str(run_no))
         else:
-            exists = os.path.exists(OUT_CSV)
             run_no = next_run_no()
             run_time = now_str()
+
+        source_rows = [{
+            "run_no": run_no,
+            "run_time": run_time,
+            "chat_id": chat_id_from_url(payload.get("url", "")),
+            "chat_title": payload.get("chatTitle") or payload.get("title") or "",
+            "question": payload.get("question") or "",
+            "page_url": payload.get("url") or "",
+            **capture_metadata(payload),
+            "status": payload.get("status") or "",
+            "complete": payload.get("complete"),
+            "count": payload.get("count"),
+            "expected_count": payload.get("expectedCount"),
+            "index": item.get("index"),
+            "title": item.get("title"),
+            "href": item.get("href"),
+            "source": item.get("source"),
+            "extracted_at": payload.get("extractedAt") or "",
+        } for item in rows]
+
+        if existing_run:
+            with open(OUT_CSV, "r", encoding="utf-8-sig", newline="") as f:
+                current_rows = list(csv.DictReader(f))
+            existing_source_rows = [
+                row for row in current_rows
+                if str(row.get("run_no") or "") == str(run_no)
+            ]
+            if len(source_rows) > len(existing_source_rows):
+                merged_rows = [
+                    row for row in current_rows
+                    if str(row.get("run_no") or "") != str(run_no)
+                ] + source_rows
+                fd, temp_path = tempfile.mkstemp(
+                    prefix="doubao_refs_recovery_",
+                    suffix=".csv",
+                    dir=BASE_DIR,
+                )
+                os.close(fd)
+                try:
+                    with open(temp_path, "w", encoding="utf-8-sig", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+                        writer.writeheader()
+                        writer.writerows(merged_rows)
+                    os.replace(temp_path, OUT_CSV)
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                debug_log(
+                    "source run repaired; run_no=%s old=%s new=%s"
+                    % (run_no, len(existing_source_rows), len(source_rows))
+                )
+            else:
+                debug_log("source append deduplicated; run_no=" + str(run_no))
+        else:
+            exists = os.path.exists(OUT_CSV)
             with open(OUT_CSV, "a", encoding="utf-8-sig", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=FIELDS)
                 if not exists:
                     writer.writeheader()
-
-                for item in rows:
-                    writer.writerow({
-                        "run_no": run_no,
-                        "run_time": run_time,
-                        "chat_id": chat_id_from_url(payload.get("url", "")),
-                        "chat_title": payload.get("chatTitle") or payload.get("title") or "",
-                        "question": payload.get("question") or "",
-                        "page_url": payload.get("url") or "",
-                        **capture_metadata(payload),
-                        "status": payload.get("status") or "",
-                        "complete": payload.get("complete"),
-                        "count": payload.get("count"),
-                        "expected_count": payload.get("expectedCount"),
-                        "index": item.get("index"),
-                        "title": item.get("title"),
-                        "href": item.get("href"),
-                        "source": item.get("source"),
-                        "extracted_at": payload.get("extractedAt") or "",
-                    })
+                writer.writerows(source_rows)
 
     append_products_csv(payload, run_no, run_time)
     return run_no, len(rows)

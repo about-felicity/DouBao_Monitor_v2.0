@@ -1341,8 +1341,11 @@ def grab_and_save(
     old_max_attempts = os.environ.get("DOUBAO_GRAB_MAX_ATTEMPTS")
     old_eval_timeout = os.environ.get("DOUBAO_GRAB_EVAL_TIMEOUT")
     old_reload_retry = os.environ.get("DOUBAO_GRAB_RELOAD_RETRY")
-    os.environ["DOUBAO_NO_REFERENCE_ANSWER_MIN_LENGTH"] = "1"
-    os.environ["DOUBAO_GRAB_MAX_ATTEMPTS"] = "3"
+    # A freshly reloaded Doubao shell can expose a short placeholder answer
+    # before its reference block hydrates. Do not classify that transient state
+    # as a legitimate zero-reference response.
+    os.environ["DOUBAO_NO_REFERENCE_ANSWER_MIN_LENGTH"] = "120"
+    os.environ["DOUBAO_GRAB_MAX_ATTEMPTS"] = "5"
     os.environ["DOUBAO_GRAB_EVAL_TIMEOUT"] = "25"
     os.environ["DOUBAO_GRAB_RELOAD_RETRY"] = "2"
     try:

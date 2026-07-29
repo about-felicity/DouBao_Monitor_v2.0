@@ -29,6 +29,7 @@ PRODUCT_AI_WORKER_SCRIPT = os.path.join(BASE_DIR, "doubao_product_ai_worker.py")
 PENDING_SAVE_DIR = os.path.join(BASE_DIR, "doubao_pending_saves")
 CAPTURE_SKIP_CSV = os.path.join(BASE_DIR, "doubao_capture_skips.csv")
 CAPTURE_RUNTIME_ERROR_CSV = os.path.join(BASE_DIR, "doubao_capture_runtime_errors.csv")
+EXPECTED_REFERENCE_HINTS = {}
 CAPTURE_SKIP_FIELDS = [
     "skip_no", "first_seen_at", "last_seen_at", "attempts", "status",
     "chat_url", "chat_title", "question", "reason", "body_length",
@@ -969,6 +970,8 @@ def parse_plugin_value(value):
 
 def grab_with_retry(ws_url, latest_href=""):
     last_payload = None
+    expected_hint_key = str(latest_href or "").rstrip("/")
+    max_expected_count_seen = int(EXPECTED_REFERENCE_HINTS.get(expected_hint_key) or 0)
     reload_count = 0
     # The reference header can render well before its anchors. Keep a real
     # hydration budget even when an older launcher still exports "2".
@@ -1059,16 +1062,30 @@ def grab_with_retry(ws_url, latest_href=""):
                         print("extension button wait failed:", repr(ready_exc))
             continue
 
-        # Older loaded versions of the extension used 10 as a fallback when
-        # no reference header existed. Trust the live page instead of that
-        # stale default so an empty shell is never chased as ten references.
         live_state = current_page_state(ws_url)
+        payload_expected_count = int(payload.get("expectedCount") or 0)
+        live_expected_count = int(live_state.get("expectedCount") or 0)
+        max_expected_count_seen = max(
+            max_expected_count_seen,
+            payload_expected_count,
+            live_expected_count,
+        )
+        payload_url_key = str(payload.get("url") or latest_href or "").rstrip("/")
+        if max_expected_count_seen > 0:
+            EXPECTED_REFERENCE_HINTS[expected_hint_key or payload_url_key] = max_expected_count_seen
+            EXPECTED_REFERENCE_HINTS[payload_url_key] = max_expected_count_seen
+
+        # A Doubao reload briefly removes the reference header before the
+        # conversation payload hydrates. Never turn a previously observed
+        # positive count into "no references" during that transient shell.
         if (
             int(payload.get("count") or 0) == 0
             and not live_state.get("hasReferenceHeader")
             and int(live_state.get("externalAnchorCount") or 0) == 0
         ):
-            payload["expectedCount"] = 0
+            payload["expectedCount"] = max_expected_count_seen
+        elif max_expected_count_seen > payload_expected_count:
+            payload["expectedCount"] = max_expected_count_seen
         last_payload = payload
         print("grab attempt %s/%s:" % (index, mode), json.dumps({
             "count": payload.get("count"),

@@ -284,6 +284,115 @@
     }));
   }
 
+  async function extractBackendReferences() {
+    const conversationId = (location.pathname.match(/\/chat\/(\d+)/) || [])[1];
+    let endpoint = performance.getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .find((url) => url.includes("/im/chain/single?"));
+    if (!conversationId) return [];
+    if (!endpoint) {
+      function storedJson(key) {
+        try {
+          return JSON.parse(localStorage.getItem(key) || "{}");
+        } catch (_) {
+          return {};
+        }
+      }
+      const deviceId = storedJson("samantha_web_web_id").web_id || "";
+      const teaId = storedJson("__tea_cache_tokens_497858").web_id || deviceId;
+      const query = new URLSearchParams({
+        version_code: "20800",
+        language: "zh",
+        device_platform: "web",
+        doubao_device_platform: "web",
+        aid: "497858",
+        real_aid: "497858",
+        pkg_type: "release_version",
+        device_id: deviceId,
+        pc_version: "3.29.6",
+        doubao_pc_version: "3.29.6",
+        web_id: teaId,
+        tea_uuid: teaId,
+        region: "CN",
+        sys_region: "CN",
+        samantha_web: "1",
+        web_platform: "browser",
+        "use-olympus-account": "1",
+        web_tab_id: crypto.randomUUID()
+      });
+      endpoint = `${location.origin}/im/chain/single?${query}`;
+    }
+
+    const request = {
+      cmd: 3100,
+      uplink_body: {
+        pull_singe_chain_uplink_body: {
+          conversation_id: conversationId,
+          anchor_index: Number.MAX_SAFE_INTEGER,
+          conversation_type: 3,
+          direction: 1,
+          limit: 20,
+          ext: {},
+          filter: { index_list: [] },
+          evaluate_ab_params: "",
+          evaluate_common_params: ""
+        }
+      },
+      sequence_id: crypto.randomUUID(),
+      channel: 2,
+      version: "1"
+    };
+    const response = await fetch(endpoint, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json; encoding=utf-8",
+        "Agw-Js-Conv": "str"
+      },
+      body: JSON.stringify(request)
+    });
+    if (!response.ok) return [];
+
+    const payload = await response.json();
+    const messages = payload &&
+      payload.downlink_body &&
+      payload.downlink_body.pull_singe_chain_downlink_body &&
+      payload.downlink_body.pull_singe_chain_downlink_body.messages || [];
+    const seen = new Set();
+    const rows = [];
+
+    messages.forEach((message) => {
+      (message.content_block || []).forEach((block) => {
+        const searchBlock = block &&
+          block.content &&
+          block.content.search_query_result_block;
+        if (!searchBlock) return;
+        (searchBlock.results || []).forEach((result) => {
+          const card = Object.values(result || {})
+            .find((value) => value && typeof value === "object" && value.url);
+          if (!card || !isReferenceHref(card.url)) return;
+          const title = cleanText(card.title || card.summary || card.sitename || card.url);
+          const href = new URL(card.url, location.href).href;
+          const key = `${title}|${href}`;
+          if (!title || seen.has(key)) return;
+          seen.add(key);
+          rows.push({
+            index: rows.length + 1,
+            title,
+            href,
+            source: "doubao /im/chain/single"
+          });
+        });
+      });
+    });
+
+    const expected = expectedReferenceCount();
+    return (expected > 0 ? rows.slice(0, expected) : rows).map((item, index) => ({
+      ...item,
+      index: index + 1
+    }));
+  }
+
   function answerText() {
     const root = findReferenceMessageRoot();
     const clone = (root || document.body).cloneNode(true);
@@ -316,7 +425,16 @@
       await sleep(700);
     }
 
-    return extractReferences();
+    const rows = extractReferences();
+    if (rows.length === 0 || (expected > 0 && rows.length < expected)) {
+      try {
+        const backendRows = await extractBackendReferences();
+        if (backendRows.length > rows.length) return backendRows;
+      } catch (error) {
+        console.warn("Doubao backend reference fallback failed", error);
+      }
+    }
+    return rows;
   }
 
   function createPanel() {
@@ -481,7 +599,7 @@
   }
 
   function saveResult(rows) {
-    const expected = expectedReferenceCount();
+    const expected = Math.max(expectedReferenceCount(), rows.length);
     const payload = {
       ok: true,
       status: "done",
