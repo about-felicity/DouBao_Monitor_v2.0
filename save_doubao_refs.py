@@ -671,7 +671,42 @@ def canonical_ai_brand(brand, product_name="", sub_brand=""):
         return "吕RYO"
     if brand in ("康王", "拜耳康王", "拜耳") and "康王" in combined:
         return "康王"
-    return brand
+    try:
+        import doubao_dashboard_server as dashboard
+        return dashboard.canonical_brand_name(brand)
+    except Exception:
+        return brand
+
+
+def normalize_ai_product_brand_prefix(product_name, canonical_brand):
+    """Collapse repeated Chinese/English brand aliases to one master prefix."""
+    product = str(product_name or "").strip()
+    brand = str(canonical_brand or "").strip()
+    if not product or not brand:
+        return product
+    aliases = {brand}
+    try:
+        import doubao_dashboard_server as dashboard
+        aliases.update(dashboard.aliases_for_brand(brand))
+    except Exception:
+        pass
+    remainder = product
+    for _ in range(4):
+        changed = False
+        for alias in sorted(aliases, key=len, reverse=True):
+            match = re.match(
+                r"^\s*" + re.escape(alias) + r"(?=$|[\s·/（）()\-—+])",
+                remainder,
+                re.I,
+            )
+            if not match:
+                continue
+            remainder = remainder[match.end():].lstrip(" \t·/（）()-—+")
+            changed = True
+            break
+        if not changed:
+            break
+    return (brand + (" " + remainder if remainder else "")).strip()
 
 
 def normalize_ai_products(parsed):
@@ -689,8 +724,8 @@ def normalize_ai_products(parsed):
         brand = str(raw.get("brand") or raw.get("parent_brand") or "").strip()
         sub_brand = str(raw.get("sub_brand") or "").strip()
         brand = canonical_ai_brand(brand, product, sub_brand)
-        if brand and product and brand not in product:
-            product = (brand + " " + product).strip()
+        if brand and product:
+            product = normalize_ai_product_brand_prefix(product, brand)
         product = re.sub(r"\s+", " ", product).strip(" -—：:；;。")
         product = strip_product_leading_noise(product)
         product = normalize_known_product_alias(product)
@@ -722,7 +757,10 @@ def normalize_ai_products(parsed):
             rank_type = "appearance_order"
         # Treat spacing/punctuation-only variants as the same recommendation,
         # e.g. "质润 二硫化硒洗发水" and "质润二硫化硒洗发水".
-        key = re.sub(r"[\s\-_—·]+", "", product).lower()
+        key = (
+            re.sub(r"[\s\-_—·+]+", "", brand).casefold(),
+            re.sub(r"[\s\-_—·+]+", "", product).casefold(),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -851,6 +889,11 @@ def build_product_prompt(answer_text):
             "Keep the rank from the answer. Use rank_type=explicit_rank only when the body gives a numeric/ordinal rank; otherwise use rank_type=appearance_order and rank by first recommendation appearance.",
             "For dashboard aggregation, brand must be the stable master brand, not a concatenated master-brand + sub-brand/product-line name. Keep the sub-brand or series in product_name and sub_brand. Example: 花王莉婕泡沫染发剂 => brand=花王, sub_brand=莉婕, product_name=花王莉婕泡沫染发剂.",
             "If the answer only gives a sub-brand, you may use stable brand ownership knowledge to normalize brand, but never invent or expand product_name beyond the answer text.",
+            "Within one answer, the same brand must always use exactly one normalized brand string. Merge casing, spacing, decorative-symbol, Chinese/English co-name, and common typo variants instead of returning separate brands.",
+            "Prefer the stable Chinese consumer-facing master brand when Chinese and English names refer to the same brand. Examples: Fresh/馥蕾诗=>馥蕾诗, Freiol/福来=>福来, Moroccanoil/摩洛哥油=>摩洛哥油, Cavilla/CAVILLA/卡薇拉=>卡维拉.",
+            "Normalize known formatting variants: DS 实验室=>DS实验室, Spēs=>Spes, vsve=>VSVE, +OKSS+/OKSS+=>OKSS. Decorative plus signs are not part of the master brand.",
+            "Do not use a product line or duplicated prefix as brand. Examples: 仁和匠心=>仁和, 章华汉草=>章华, 甘椰植萃=>甘椰, 因士柔酸=>因士.",
+            "Do not output the same recommendation twice under brand aliases. Deduplicate by normalized brand + normalized product identity.",
             "If the answer only evaluates one named product and does not recommend a list, return an empty products array.",
             "Each item must have rank, brand, sub_brand, product_name, evidence.",
         ],

@@ -813,6 +813,21 @@ BRAND_FORBIDDEN_WORDS = (
 )
 
 BRAND_ALIAS_RULES = (
+    (("DS实验室", "DS 实验室", "DS Laboratories"), "DS实验室"),
+    (("CAVILLA", "Cavilla", "卡维拉", "卡薇拉"), "卡维拉"),
+    (("GeraX", "Gerax"), "GeraX"),
+    (("VSVE", "vsve", "威诗薇儿"), "VSVE"),
+    (("OKSS", "OKSS+", "+OKSS", "+OKSS+", "+okss", "+okss+"), "OKSS"),
+    (("Spes", "Spēs", "诗裴丝"), "Spes"),
+    (("Freiol", "福来 Freiol", "福来"), "福来"),
+    (("Fresh", "馥蕾诗"), "馥蕾诗"),
+    (("Moroccanoil", "摩洛哥油"), "摩洛哥油"),
+    (("PEACH JO", "PEACH JO+", "PEACH JO +"), "PEACH JO+"),
+    (("伊丽莎白雅顿", "雅顿"), "伊丽莎白雅顿"),
+    (("仁和匠心", "人仁和匠心", "仁和"), "仁和"),
+    (("章华汉草", "章华"), "章华"),
+    (("甘椰植萃", "甘椰"), "甘椰"),
+    (("因士柔", "因士"), "因士"),
     (("优色林", "Eucerin"), "优色林"),
     (("欧舒丹", "L'OCCITANE", "L’occitane"), "欧舒丹"),
     (("浴见",), "浴见"),
