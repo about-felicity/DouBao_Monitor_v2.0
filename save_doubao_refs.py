@@ -1069,6 +1069,32 @@ def review_products_with_ai(answer_text):
         result = call_openai_product_extractor(text)
         method = "openai"
     if result is not None:
+        # A model response can contain a valid product while omitting its
+        # brand. Fill only names present in the curated canonical vocabulary;
+        # never promote an arbitrary product name into a brand.
+        try:
+            import doubao_dashboard_server as dashboard
+            for item in result:
+                if str(item.get("brand_name") or "").strip():
+                    continue
+                product_name = str(item.get("product_name") or "").strip()
+                folded_product = product_name.casefold()
+                canonical = ""
+                for aliases, brand in sorted(
+                    dashboard.BRAND_ALIAS_RULES,
+                    key=lambda rule: max(len(alias) for alias in rule[0]),
+                    reverse=True,
+                ):
+                    if any(folded_product.startswith(alias.casefold()) for alias in aliases):
+                        canonical = brand
+                        break
+                if not canonical:
+                    inferred = infer_brand_from_product_name(product_name)
+                    canonical = dashboard.canonical_brand_name(inferred)
+                if canonical in dashboard.KNOWN_BRANDS:
+                    item["brand_name"] = canonical
+        except Exception:
+            pass
         debug_log("AI product review completed; ai_count=" + str(len(result)))
         return result, "ai_verified", method, product_ai_model_label()
 

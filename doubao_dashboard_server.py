@@ -813,6 +813,7 @@ BRAND_FORBIDDEN_WORDS = (
 )
 
 BRAND_ALIAS_RULES = (
+    (("加利古",), "加利古"),
     (("DS实验室", "DS 实验室", "DS Laboratories"), "DS实验室"),
     (("CAVILLA", "Cavilla", "卡维拉", "卡薇拉"), "卡维拉"),
     (("GeraX", "Gerax"), "GeraX"),
