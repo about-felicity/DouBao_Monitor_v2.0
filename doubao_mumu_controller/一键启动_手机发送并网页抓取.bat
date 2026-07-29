@@ -7,7 +7,7 @@ set "PYTHON_EXE=python"
 if exist "%LocalAppData%\Python\pythoncore-3.14-64\python.exe" set "PYTHON_EXE=%LocalAppData%\Python\pythoncore-3.14-64\python.exe"
 
 echo [豆包 MuMu 流水线] 正在自动识别设备和账号...
-"%PYTHON_EXE%" -c "import PIL, requests, websocket" >nul 2>nul
+"%PYTHON_EXE%" -c "import PIL, requests, websocket, scrapling" >nul 2>nul
 if errorlevel 1 (
   echo 首次运行：正在安装 Python 依赖...
   "%PYTHON_EXE%" -m pip install -r "%~dp0requirements.txt"

@@ -14,7 +14,7 @@ if errorlevel 1 (
   exit /b 2
 )
 
-"%PYTHON_EXE%" -c "import PIL, requests, websocket, lxml, openpyxl" >nul 2>nul
+"%PYTHON_EXE%" -c "import PIL, requests, websocket, lxml, openpyxl, scrapling" >nul 2>nul
 if errorlevel 1 (
   echo Installing Python dependencies...
   "%PYTHON_EXE%" -m pip install -r "%~dp0requirements.txt"

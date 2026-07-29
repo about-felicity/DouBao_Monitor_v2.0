@@ -898,9 +898,8 @@ def call_anthropic_product_extractor(answer_text):
     for attempt in range(1, attempts + 1):
         body = {
             "model": model,
-            # A larger allowance avoids cutting off a valid JSON list halfway
-            # through when the answer recommends several products.
-            "max_tokens": 1400,
+            # Keep enough room for every recommendation and its evidence.
+            "max_tokens": 3000,
             "temperature": 0,
             "system": "Return one valid JSON object only. Do not use markdown or commentary.",
             "messages": [
@@ -1002,10 +1001,9 @@ def review_products_with_ai(answer_text):
     not recommend a product.  A failed call is kept distinct so it can be
     retried instead of silently falling back to inaccurate regex output.
 
-    Extraction order:
-      1. Fast-match the configured/local brand vocabulary. Any hit is returned
-         immediately without calling a paid model.
-      2. Fall back to the large model only when the vocabulary has zero hits.
+    The vocabulary/rule result is only a failure fallback.  A partial
+    vocabulary hit must never skip the model because that silently drops
+    unknown brands from otherwise valid multi-product answers.
     """
     text = strip_reference_prefix(answer_text)
     rule_products = extract_products(text)
@@ -1016,16 +1014,6 @@ def review_products_with_ai(answer_text):
     if mode == "off":
         products = historical_products if historical_products else rule_products
         return products, "rule_unverified", "rule", ""
-
-    # The local brand vocabulary is authoritative and cheap.  If it hits at
-    # least one product line, do not call a paid model.  The model is strictly
-    # the fallback for answers whose brands are all unknown to the vocabulary.
-    if historical_products:
-        debug_log(
-            "AI product review skipped; brand_lexicon_match count="
-            + str(len(historical_products))
-        )
-        return historical_products, "ai_verified", "brand_lexicon_match", ""
 
     debug_log(
         "AI product review start; answer_len=" + str(len(text))

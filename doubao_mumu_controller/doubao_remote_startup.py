@@ -65,6 +65,7 @@ def environment_check() -> dict[str, object]:
     import lxml  # noqa: F401
     import openpyxl  # noqa: F401
     import requests  # noqa: F401
+    import scrapling  # noqa: F401
     import websocket  # noqa: F401
 
     from doubao_mumu_web_pipeline import (

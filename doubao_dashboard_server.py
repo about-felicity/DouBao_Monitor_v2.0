@@ -163,6 +163,47 @@ def owned_source_products(href, title, content_index=None):
     return matches, scope
 
 
+def owned_source_brands(href, title, content_index=None):
+    configured = brand_settings.load_settings()
+    owned_names = sorted({
+        canonical_brand_name(item["name"])
+        for item in brand_settings.vocabulary(configured)
+        if item.get("group") == "owned" and item.get("name")
+    })
+    title_matches = {
+        brand for brand in owned_names
+        if title_mentions_brand(title, brand)
+    }
+    entries = (
+        content_index.get("entries", {})
+        if isinstance(content_index, dict) and isinstance(content_index.get("entries"), dict)
+        else {}
+    )
+    raw_href = str(href or "").strip()
+    entry = entries.get(raw_href) or entries.get(canonical_source_url(raw_href)) or {}
+    body_matches = set()
+    if (
+        isinstance(entry, dict)
+        and entry.get("status") == "ok"
+        and entry.get("extraction_quality") in ("high", "medium")
+    ):
+        body_matches.update(
+            canonical_brand_name(value)
+            for value in entry.get("owned_brand_mentions") or []
+            if value
+        )
+    matches = sorted(title_matches | body_matches)
+    if title_matches and body_matches:
+        scope = "标题+正文"
+    elif body_matches:
+        scope = "正文"
+    elif title_matches:
+        scope = "标题"
+    else:
+        scope = ""
+    return matches, scope
+
+
 def read_json(path):
     if not os.path.exists(path):
         return {}
@@ -620,6 +661,9 @@ def daily_question_source_breakdown(
     def owned_products_for(href, title):
         return owned_source_products(href, title, content_index)
 
+    def owned_brands_for(href, title):
+        return owned_source_brands(href, title, content_index)
+
     buckets = {}
     all_dates = set()
 
@@ -703,10 +747,12 @@ def daily_question_source_breakdown(
             for h, c in video_counter.most_common(10):
                 title = bucket["href_titles"].get(h, "")
                 own_products, own_scope = owned_products_for(h, title)
+                own_brands, own_brand_scope = owned_brands_for(h, title)
                 top_links_by_date[day].append(
                     {
                         "href": h, "count": c, "title": title, "type": "\u89c6\u9891",
                         "own_products": own_products, "own_match_scope": own_scope,
+                        "own_brands": own_brands, "own_brand_match_scope": own_brand_scope,
                     })
                 seen.add(h)
 
@@ -715,10 +761,12 @@ def daily_question_source_breakdown(
             for h, c in article_counter.most_common(10):
                 title = bucket["href_titles"].get(h, "")
                 own_products, own_scope = owned_products_for(h, title)
+                own_brands, own_brand_scope = owned_brands_for(h, title)
                 top_links_by_date[day].append(
                     {
                         "href": h, "count": c, "title": title, "type": "\u6587\u7ae0",
                         "own_products": own_products, "own_match_scope": own_scope,
+                        "own_brands": own_brands, "own_brand_match_scope": own_brand_scope,
                     })
                 seen.add(h)
 
@@ -1186,9 +1234,7 @@ NON_RECOMMEND_QUESTION_HINTS = (
 # product rows were generated before the product extractor stabilized. Exclude
 # only those old product/source-run slices; future clean rounds for the same
 # questions remain visible.
-PRODUCT_STATS_EXCLUDED_QUESTION_MAX_RUN = {
-    "护发素推荐": 4941,
-}
+PRODUCT_STATS_EXCLUDED_QUESTION_MAX_RUN = {}
 
 # Raw capture is preserved for audit, but these source rows belong to a second,
 # unrelated answer that was accidentally concatenated into the same page grab.
@@ -3039,6 +3085,9 @@ def _compute_stats(selected_question=None, selected_device=None):
             own_products, own_match_scope = owned_source_products(
                 row.get("href"), row.get("title"), content_index
             )
+            own_brands, own_brand_match_scope = owned_source_brands(
+                row.get("href"), row.get("title"), content_index
+            )
             latest_items.append({
                 "run_no": row.get("run_no", ""),
                 "question": question_for(row),
@@ -3051,6 +3100,8 @@ def _compute_stats(selected_question=None, selected_device=None):
                 "note": note,
                 "own_products": own_products,
                 "own_match_scope": own_match_scope,
+                "own_brands": own_brands,
+                "own_brand_match_scope": own_brand_match_scope,
             })
 
         latest_row = latest_rows[0] if latest_rows else {}
@@ -5692,9 +5743,12 @@ function renderDaily(items){
     const topHtml=dates.filter(d=>topLinks[d]?.length).map(d=>{
       const links=topLinks[d]||[],vid=links.filter(l=>l.type==="视频"),art=links.filter(l=>l.type==="文章");
       function tagList(list,cls){return list.map(l=>{
-        const products=l.own_products||[],owned=products.length>0;
-        const ownTitle=owned?` · 我的产品：${products.join("、")} · 命中位置：${l.own_match_scope||"标题/正文"}`:"";
-        return`<a class="top-link-tag ${cls}${owned?" own-source":""}" href="${esc(l.href)}" target="_blank" title="${esc((l.title||l.href)+ownTitle)}"><span class="tag-count">${esc(l.count)}次</span>${owned?`<span class="own-content-mark">自有 · ${esc(products.join("、"))}<em class="own-match-scope">${esc(l.own_match_scope||"标题/正文")}</em></span>`:""} ${esc(l.title||l.href)}</a>`;
+        const products=l.own_products||[],brands=l.own_brands||[];
+        const owned=products.length>0||brands.length>0;
+        const labels=products.length?products:brands;
+        const scope=products.length?(l.own_match_scope||"标题/正文"):(l.own_brand_match_scope||"标题/正文");
+        const ownTitle=owned?` · 自有品牌：${labels.join("、")} · 命中位置：${scope}`:"";
+        return`<a class="top-link-tag ${cls}${owned?" own-source":""}" href="${esc(l.href)}" target="_blank" title="${esc((l.title||l.href)+ownTitle)}"><span class="tag-count">${esc(l.count)}次</span>${owned?`<span class="own-content-mark">自有品牌 · ${esc(labels.join("、"))}<em class="own-match-scope">${esc(scope)}</em></span>`:""} ${esc(l.title||l.href)}</a>`;
       }).join("")}
       return`<div class="top-links-row"><span class="top-links-day-label">${esc(d)}</span>${vid.length?`<span class="type-badge type-badge-video">视频</span>`:""}${tagList(vid,"tag-video")}${art.length?`<span class="type-badge type-badge-article">文章</span>`:""}${tagList(art,"tag-article")}</div>`;
     }).join("");
@@ -5784,9 +5838,12 @@ function renderLatest(items){
   $("latestRows").innerHTML=items.map(it=>{
     const t=String(it.source_type||"");
     const cls=t.includes("视频")?"video":(t.includes("商品")?"product":(t.includes("文章")?"article":""));
-    const products=it.own_products||[],owned=products.length>0;
-    return`<tr class="${owned?"own-source-row":""}" data-filter-text="${esc(it.title)} ${esc(it.source_type)} ${esc(it.media)} ${esc(it.domain)} ${esc(it.href)} ${esc(products.join(" "))}">
-      <td data-label="序号">${esc(it.index)}</td><td data-label="标题" title="${esc(it.title)}">${owned?`<span class="own-content-mark">自有 · ${esc(products.join("、"))}</span><br>`:""}${esc(it.title)}${owned?`<span class="daily-abs"> · ${esc(it.own_match_scope||"标题/正文")}命中</span>`:""}</td><td data-label="类型"><span class="source-badge ${cls}">${esc(it.source_type)}</span></td><td data-label="媒体">${esc(it.media)}</td><td data-label="域名">${esc(it.domain)}</td><td data-label="链接"><a href="${esc(it.href)}" target="_blank" aria-label="打开信源：${esc(it.title)}">打开</a></td>
+    const products=it.own_products||[],brands=it.own_brands||[];
+    const owned=products.length>0||brands.length>0;
+    const labels=products.length?products:brands;
+    const scope=products.length?(it.own_match_scope||"标题/正文"):(it.own_brand_match_scope||"标题/正文");
+    return`<tr class="${owned?"own-source-row":""}" data-filter-text="${esc(it.title)} ${esc(it.source_type)} ${esc(it.media)} ${esc(it.domain)} ${esc(it.href)} ${esc(labels.join(" "))}">
+      <td data-label="序号">${esc(it.index)}</td><td data-label="标题" title="${esc(it.title)}">${owned?`<span class="own-content-mark">自有品牌 · ${esc(labels.join("、"))}</span><br>`:""}${esc(it.title)}${owned?`<span class="daily-abs"> · ${esc(scope)}命中</span>`:""}</td><td data-label="类型"><span class="source-badge ${cls}">${esc(it.source_type)}</span></td><td data-label="媒体">${esc(it.media)}</td><td data-label="域名">${esc(it.domain)}</td><td data-label="链接"><a href="${esc(it.href)}" target="_blank" aria-label="打开信源：${esc(it.title)}">打开</a></td>
     </tr>`;
   }).join("");
 }
@@ -6051,10 +6108,18 @@ def start_content_worker():
         return None
     if not os.path.exists(CONTENT_WORKER_PATH):
         return None
+    portable_python = os.path.join(
+        BASE_DIR,
+        "doubao_mumu_controller",
+        "portable_runtime",
+        "Python",
+        "python.exe",
+    )
+    worker_python = portable_python if os.path.exists(portable_python) else sys.executable
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.Popen(
-            [sys.executable, CONTENT_WORKER_PATH],
+            [worker_python, CONTENT_WORKER_PATH],
             cwd=BASE_DIR,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -6064,6 +6129,18 @@ def start_content_worker():
     except Exception as exc:
         print("Doubao content worker failed to start:", exc)
         return None
+
+
+def supervise_content_worker():
+    """Restart the incremental source-page archiver if it exits."""
+    while True:
+        process = start_content_worker()
+        if process is None:
+            time.sleep(30)
+            continue
+        return_code = process.wait()
+        print("Doubao content worker exited (%s); restarting shortly." % return_code)
+        time.sleep(5)
 
 
 def main():
@@ -6080,7 +6157,11 @@ def main():
         except Exception as exc:
             print("Doubao initial dashboard cache failed:", exc)
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
-    start_content_worker()
+    threading.Thread(
+        target=supervise_content_worker,
+        name="doubao-content-worker-supervisor",
+        daemon=True,
+    ).start()
     print("Doubao dashboard:", "http://%s:%s" % (HOST, PORT))
     server.serve_forever()
 

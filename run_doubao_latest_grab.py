@@ -970,7 +970,12 @@ def parse_plugin_value(value):
 def grab_with_retry(ws_url, latest_href=""):
     last_payload = None
     reload_count = 0
-    max_reload_count = int(os.environ.get("DOUBAO_GRAB_RELOAD_RETRY", "3") or "3")
+    # The reference header can render well before its anchors. Keep a real
+    # hydration budget even when an older launcher still exports "2".
+    max_reload_count = max(
+        5,
+        int(os.environ.get("DOUBAO_GRAB_RELOAD_RETRY", "5") or "5"),
+    )
     accept_partial_missing = int(os.environ.get("DOUBAO_ACCEPT_PARTIAL_MISSING", "1") or "1")
     no_reference_answer_min_length = int(os.environ.get("DOUBAO_NO_REFERENCE_ANSWER_MIN_LENGTH", "500") or "500")
     attempts = [
@@ -1095,25 +1100,6 @@ def grab_with_retry(ws_url, latest_href=""):
             print("accept partial grab: count=%s expected=%s missing=%s" % (count, expected_count, missing_count))
             return payload
         if (
-            count == 0
-            and expected_count > 0
-            and reload_count >= max_reload_count
-            and len(answer_text.strip()) >= no_reference_answer_min_length
-        ):
-            payload["status"] = "no_references"
-            payload["complete"] = True
-            payload["expectedCount"] = 0
-            payload["noReferences"] = True
-            payload["items"] = []
-            print("no references after configured reloads; skip links and save answer/products:", json.dumps({
-                "url": payload.get("url"),
-                "answerTextLength": len(answer_text),
-                "originalExpectedCount": expected_count,
-                "reloadCount": reload_count,
-            }, ensure_ascii=False))
-            return payload
-
-        if (
             reload_count < max_reload_count
             and count == 0
             and expected_count > 0
@@ -1132,27 +1118,6 @@ def grab_with_retry(ws_url, latest_href=""):
                 print("reload recover failed %s/%s:" % (reload_count, max_reload_count), repr(exc))
 
         time.sleep(3)
-
-    if last_payload:
-        answer_text = str(last_payload.get("answerText") or last_payload.get("answer_text") or "")
-        count = int(last_payload.get("count") or 0)
-        expected_count = int(last_payload.get("expectedCount") or 0)
-        # Some Doubao answers simply do not render a reference section. After all
-        # retry/reload attempts are exhausted, do not fail the ShadowBot flow if
-        # the assistant answer is already present; save product extraction and
-        # skip source links for this round instead.
-        if count == 0 and expected_count > 0 and len(answer_text.strip()) >= no_reference_answer_min_length:
-            last_payload["status"] = "no_references"
-            last_payload["complete"] = True
-            last_payload["expectedCount"] = 0
-            last_payload["noReferences"] = True
-            last_payload["items"] = []
-            print("no references after retries; skip links and save answer/products:", json.dumps({
-                "url": last_payload.get("url"),
-                "answerTextLength": len(answer_text),
-                "originalExpectedCount": expected_count,
-            }, ensure_ascii=False))
-            return last_payload
 
     raise RuntimeError("抓取未完整：" + json.dumps(last_payload, ensure_ascii=False))
 

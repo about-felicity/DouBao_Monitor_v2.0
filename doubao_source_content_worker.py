@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,7 @@ import doubao_brand_settings as brand_settings
 
 
 BASE_DIR = Path(__file__).resolve().parent
+SCRAPLING_DIR = BASE_DIR / "Scrapling"
 REFS_CSV = BASE_DIR / "doubao_refs_result.csv"
 PRODUCTS_CSV = BASE_DIR / "doubao_products_result.csv"
 INDEX_PATH = BASE_DIR / "doubao_source_content_index.json"
@@ -493,8 +495,67 @@ def retry_delay_seconds(attempts, blocked=False):
 
 
 def is_skipped_source_url(url):
-    host = (urlparse(str(url or "")).hostname or "").casefold()
-    return host == "smzdm.com" or host.endswith(".smzdm.com")
+    # The old requests-only worker skipped smzdm entirely. Scrapling can fetch
+    # it with a browser TLS fingerprint, so article sources are no longer
+    # silently omitted from owned-brand analysis.
+    return False
+
+
+def fetch_http_with_scrapling(url):
+    """Return a lightweight HTTP response tuple using the bundled Scrapling."""
+    if SCRAPLING_DIR.exists() and str(SCRAPLING_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRAPLING_DIR))
+    from scrapling.fetchers import Fetcher
+
+    page = Fetcher.get(
+        url,
+        impersonate="chrome",
+        stealthy_headers=True,
+        follow_redirects="safe",
+        timeout=REQUEST_TIMEOUT,
+        retries=2,
+    )
+    raw = page.body
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="ignore")
+    raw = bytes(raw or b"")[:MAX_BYTES]
+    headers = page.headers
+    content_type = str(
+        headers.get("Content-Type")
+        or headers.get("content-type")
+        or ""
+    )
+    return {
+        "status_code": int(page.status),
+        "final_url": str(page.url or url),
+        "content_type": content_type,
+        "raw": raw,
+        "transport": "scrapling",
+    }
+
+
+def fetch_http_with_requests(url):
+    response = requests.get(
+        url, headers=HEADERS, timeout=(6, REQUEST_TIMEOUT), stream=True,
+        allow_redirects=True,
+    )
+    raw_parts = []
+    total = 0
+    for chunk in response.iter_content(65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_BYTES:
+            raw_parts.append(chunk[: max(0, MAX_BYTES - (total - len(chunk)))])
+            break
+        raw_parts.append(chunk)
+    return {
+        "status_code": int(response.status_code),
+        "final_url": str(response.url),
+        "content_type": str(response.headers.get("Content-Type") or ""),
+        "raw": b"".join(raw_parts),
+        "transport": "requests",
+    }
 
 
 def iso_after(seconds):
@@ -528,41 +589,36 @@ def fetch_one(url, previous_attempts=0):
         host_lock = HOST_LOCKS.setdefault(host, threading.Lock())
     try:
         with host_lock:
-            response = requests.get(
-                url, headers=HEADERS, timeout=(6, REQUEST_TIMEOUT), stream=True,
-                allow_redirects=True,
-            )
-            final_safe, final_reason = safe_public_url(response.url)
+            try:
+                response = fetch_http_with_scrapling(url)
+            except Exception as scrapling_exc:
+                log("Scrapling fallback for %s: %s" % (
+                    url, repr(scrapling_exc)[:240],
+                ))
+                response = fetch_http_with_requests(url)
+            final_url = response["final_url"]
+            final_safe, final_reason = safe_public_url(final_url)
             if not final_safe:
                 raise ValueError("unsafe redirect: " + final_reason)
-            raw_parts = []
-            total = 0
-            for chunk in response.iter_content(65536):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_BYTES:
-                    raw_parts.append(chunk[: max(0, MAX_BYTES - (total - len(chunk)))])
-                    break
-                raw_parts.append(chunk)
-            raw = b"".join(raw_parts)
+            raw = response["raw"]
             if HOST_DELAY:
                 time.sleep(HOST_DELAY)
-        content_type = str(response.headers.get("Content-Type") or "")
-        status_code = int(response.status_code)
+        content_type = response["content_type"]
+        status_code = response["status_code"]
+        transport = response["transport"]
         if status_code >= 400:
             blocked = status_code in (401, 403, 407, 409, 429) or status_code >= 500
             return {
                 "status": "blocked" if blocked else "error", "fetched_at": fetched_at,
                 "attempts": attempts, "http_status": status_code, "content_type": content_type,
-                "final_url": response.url, "error": "HTTP %s" % status_code,
+                "final_url": final_url, "error": "HTTP %s" % status_code,
                 "next_retry_at": iso_after(retry_delay_seconds(attempts, blocked)),
                 "content_text": "", "text_length": 0,
             }
-        if "pdf" in content_type.casefold() or response.url.casefold().endswith(".pdf"):
+        if "pdf" in content_type.casefold() or final_url.casefold().endswith(".pdf"):
             return {
                 "status": "unsupported", "fetched_at": fetched_at, "attempts": attempts,
-                "http_status": status_code, "content_type": content_type, "final_url": response.url,
+                "http_status": status_code, "content_type": content_type, "final_url": final_url,
                 "error": "PDF正文解析器暂不可用", "next_retry_at": iso_after(7 * 86400),
                 "content_text": "", "text_length": 0,
             }
@@ -571,15 +627,17 @@ def fetch_one(url, previous_attempts=0):
         if len(content_text) < MIN_CONTENT_CHARS:
             return {
                 "status": "empty", "fetched_at": fetched_at, "attempts": attempts,
-                "http_status": status_code, "content_type": content_type, "final_url": response.url,
-                "title": title, "extraction_method": method, "extraction_quality": quality,
+                "http_status": status_code, "content_type": content_type, "final_url": final_url,
+                "title": title, "extraction_method": transport + "_" + method,
+                "extraction_quality": quality,
                 "error": "正文过短或页面仅有脚本壳", "next_retry_at": iso_after(retry_delay_seconds(attempts)),
                 "content_text": content_text, "text_length": len(content_text),
             }
         return {
             "status": "ok", "fetched_at": fetched_at, "attempts": attempts,
-            "http_status": status_code, "content_type": content_type, "final_url": response.url,
-            "title": title, "extraction_method": method, "extraction_quality": quality,
+            "http_status": status_code, "content_type": content_type, "final_url": final_url,
+            "title": title, "extraction_method": transport + "_" + method,
+            "extraction_quality": quality,
             "content_text": content_text, "text_length": len(content_text),
             "content_hash": hashlib.sha256(content_text.encode("utf-8")).hexdigest(),
             "error": "", "next_retry_at": "",
@@ -620,6 +678,16 @@ def collect_urls():
     return value
 
 
+def article_urls(urls):
+    selected = []
+    for item in urls:
+        row = {"href": item["url"], "title": item.get("title", "")}
+        source_type, _media, _host, _note = dashboard.source_for(row, {}, {})
+        if "文章" in source_type:
+            selected.append(item)
+    return selected
+
+
 def due(entry, vocab_hash):
     if not entry:
         return True
@@ -628,7 +696,7 @@ def due(entry, vocab_hash):
     if entry.get("status") == "ok":
         return False
     if entry.get("status") == "skipped":
-        return False
+        return True
     next_retry = str(entry.get("next_retry_at") or "")
     if not next_retry:
         return True
@@ -868,6 +936,11 @@ def main():
     parser = argparse.ArgumentParser(description="Incrementally archive public source-page content.")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--limit", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--articles-only",
+        action="store_true",
+        help="Prioritize public article pages for owned-brand body analysis.",
+    )
     args = parser.parse_args()
     if not acquire_lock():
         log("skip: worker already running")
@@ -881,6 +954,8 @@ def main():
             heartbeat()
             brands, vocab_hash = brand_vocabulary()
             urls = collect_urls()
+            if args.articles_only:
+                urls = article_urls(urls)
             processed, remaining = process_batch(
                 index, connection, urls, brands, vocab_hash, max(1, args.limit)
             )

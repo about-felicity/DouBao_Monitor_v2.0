@@ -1202,6 +1202,18 @@ def read_web_answer(grabber: Any, ws_url: str, question: str) -> str:
     ).strip()
 
 
+def is_doubao_error_answer(answer: str) -> bool:
+    text = re.sub(r"\s+", "", str(answer or ""))
+    return text in {
+        "出了点问题，请稍后重试。",
+        "出了点问题请稍后重试",
+        "网络异常，请稍后重试。",
+        "网络异常请稍后重试",
+        "服务异常，请稍后重试。",
+        "服务异常请稍后重试",
+    }
+
+
 def wait_for_web_answer_stable(
     logger: logging.Logger,
     grabber: Any,
@@ -1226,6 +1238,22 @@ def wait_for_web_answer_stable(
         answer = str(answer_state.get("answer") or "").strip()
         generating = bool(answer_state.get("generating"))
         elapsed = time.monotonic() - started
+        if is_doubao_error_answer(answer):
+            logger.warning("豆包返回临时错误文案，刷新页面等待正常回答：%s", answer)
+            try:
+                grabber.cdp_call(
+                    ws_url,
+                    "Page.reload",
+                    {"ignoreCache": True},
+                    timeout=8,
+                )
+            except Exception as exc:
+                logger.debug("临时错误文案恢复刷新失败：%s", exc)
+            last_answer = ""
+            stable_since = None
+            last_reload = elapsed
+            time.sleep(2)
+            continue
         effective_min_wait = min(4.0, max(1.5, min_wait * 0.4))
         dynamic_stable_seconds = min(
             stable_seconds,
@@ -1328,7 +1356,10 @@ def grab_and_save(
                     or payload.get("answer_text")
                     or ""
                 ).strip()
-                if payload_answer or clean_answer:
+                if (
+                    (payload_answer or clean_answer)
+                    and not is_doubao_error_answer(payload_answer or clean_answer)
+                ):
                     break
                 raise PipelineError("插件返回的回答正文为空。")
             except Exception as exc:

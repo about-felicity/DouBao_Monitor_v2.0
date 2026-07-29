@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="maximum answers to process")
     parser.add_argument("--question", default="", help="only re-review this exact question")
     parser.add_argument("--run-no", default="", help="only re-review this exact run number")
+    parser.add_argument("--date", default="", help="only re-review run_time starting with YYYY-MM-DD")
     parser.add_argument("--shard-count", type=int, default=1, help="number of parallel review shards")
     parser.add_argument("--shard-index", type=int, default=0, help="zero-based shard handled by this process")
     args = parser.parse_args()
@@ -57,6 +58,11 @@ def main():
         selected = [
             r for r in selected
             if str(r.get("run_no") or "").strip() == str(args.run_no).strip()
+        ]
+    if args.date:
+        selected = [
+            r for r in selected
+            if str(r.get("run_time") or "").startswith(args.date.strip())
         ]
     # The foreground collector may have submitted the same archived answer
     # twice. Review each run/body only once so a rebuild cannot recreate two
