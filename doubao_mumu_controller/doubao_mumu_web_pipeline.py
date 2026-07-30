@@ -261,18 +261,76 @@ def resolve_chrome() -> Path | None:
     )
 
 
+def parse_mumu_adb_devices(
+    output: str,
+    requested_index: str | None,
+) -> list[dict[str, Any]]:
+    """Build MuMu instance records from adb when MuMuManager is unavailable."""
+    instances: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        fields = line.strip().split()
+        if len(fields) < 2 or fields[1] != "device":
+            continue
+        match = re.fullmatch(r"127\.0\.0\.1:(\d+)", fields[0])
+        if not match:
+            continue
+        port = int(match.group(1))
+        offset = port - 16384
+        if offset < 0 or offset % 32:
+            continue
+        index = str(offset // 32)
+        if requested_index is not None and index != str(requested_index):
+            continue
+        instances.append(
+            {
+                "index": index,
+                "name": "MuMu安卓设备" + (f"-{index}" if index != "0" else ""),
+                "serial": fields[0],
+                "pid": None,
+            }
+        )
+    instances.sort(key=lambda item: int(item["index"]))
+    return instances
+
+
+def discover_mumu_instances_via_adb(
+    logger: logging.Logger,
+    requested_index: str | None,
+    reason: Exception | str,
+) -> list[dict[str, Any]]:
+    adb = resolve_adb()
+    result = run_text([str(adb), "devices"], timeout=10, check=False)
+    instances = parse_mumu_adb_devices(result.stdout, requested_index)
+    if not instances:
+        raise PipelineError(
+            f"MuMuManager 不可用，ADB 也没有发现在线 MuMu 实例：{reason}"
+        )
+    logger.warning(
+        "MuMuManager 设备查询异常，已自动改用 ADB 在线设备继续：%s",
+        reason,
+    )
+    return instances
+
+
 def discover_mumu_instances(
     logger: logging.Logger,
     requested_index: str | None,
 ) -> list[dict[str, Any]]:
     manager = resolve_mumu_manager()
     if manager is None:
-        raise PipelineError("找不到 MuMuManager.exe，请先安装或启动 MuMu 模拟器。")
-    result = run_text([str(manager), "info", "-v", "all"], timeout=15)
+        return discover_mumu_instances_via_adb(
+            logger,
+            requested_index,
+            "找不到 MuMuManager.exe",
+        )
+    try:
+        result = run_text([str(manager), "info", "-v", "all"], timeout=15)
+    except Exception as exc:
+        return discover_mumu_instances_via_adb(logger, requested_index, exc)
     try:
         raw = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise PipelineError("MuMuManager 返回的设备信息不是有效 JSON。") from exc
+        return discover_mumu_instances_via_adb(logger, requested_index, exc)
     values = list(raw.values()) if isinstance(raw, dict) else list(raw)
     instances: list[dict[str, Any]] = []
     for item in values:
@@ -294,12 +352,11 @@ def discover_mumu_instances(
             }
         )
     if not instances:
-        suffix = (
-            f"（指定实例 {requested_index}）"
-            if requested_index is not None
-            else ""
+        return discover_mumu_instances_via_adb(
+            logger,
+            requested_index,
+            "MuMuManager 没有返回已启动实例",
         )
-        raise PipelineError(f"没有发现已启动的 MuMu 实例{suffix}。")
     instances.sort(key=lambda item: int(item["index"] or 0))
     logger.info(
         "发现 %s 台已启动的 MuMu：%s",
@@ -901,21 +958,23 @@ def ensure_matching_browser(
         time.sleep(2)
 
 
-def cleanup_stale_appium_sessions(
-    logger: logging.Logger,
-    appium_url: str,
+def stale_appium_sessions_for_cleanup(
+    sessions: list[dict[str, Any]],
     serial: str,
     system_port: int,
-) -> None:
-    base_url = appium_url.rstrip("/")
-    try:
-        response = mumu.requests.get(f"{base_url}/sessions", timeout=8)
-        response.raise_for_status()
-        sessions = response.json().get("value") or []
-    except Exception as exc:
-        logger.debug("读取 Appium 旧会话失败，将由控制器自行恢复：%s", exc)
-        return
-    removed = 0
+    *,
+    limit: int = 12,
+) -> tuple[list[dict[str, Any]], int]:
+    """Select only sessions that can conflict with this UiAutomator2 port.
+
+    Appium can retain hundreds of dead sessions in its in-memory session list.
+    Deleting every historical session for the same emulator made one device
+    appear frozen for several minutes at task startup.  A session on another
+    systemPort cannot conflict with this pipeline, so leave it alone.  Process
+    newest entries first because the current port owner is normally the most
+    recent one.
+    """
+    conflicts: list[dict[str, Any]] = []
     for entry in sessions:
         capabilities = entry.get("capabilities") or {}
         desired = capabilities.get("desired") or {}
@@ -932,21 +991,61 @@ def cleanup_stale_appium_sessions(
             same_port = int(session_port) == int(system_port)
         except (TypeError, ValueError):
             same_port = False
-        if session_serial != serial and not same_port:
+        missing_port_for_same_device = session_port in (None, "") and session_serial == serial
+        if not same_port and not missing_port_for_same_device:
             continue
         session_id = entry.get("id") or entry.get("sessionId")
         if not session_id:
             continue
+        conflicts.append(entry)
+    selected = list(reversed(conflicts))[: max(1, int(limit))]
+    return selected, max(0, len(conflicts) - len(selected))
+
+
+def cleanup_stale_appium_sessions(
+    logger: logging.Logger,
+    appium_url: str,
+    serial: str,
+    system_port: int,
+) -> None:
+    base_url = appium_url.rstrip("/")
+    try:
+        response = mumu.requests.get(f"{base_url}/sessions", timeout=8)
+        response.raise_for_status()
+        sessions = response.json().get("value") or []
+    except Exception as exc:
+        logger.debug("读取 Appium 旧会话失败，将由控制器自行恢复：%s", exc)
+        return
+    cleanup_limit = max(
+        1,
+        int(os.environ.get("DOUBAO_APPIUM_CLEANUP_LIMIT", "12") or "12"),
+    )
+    selected, skipped = stale_appium_sessions_for_cleanup(
+        sessions,
+        serial,
+        system_port,
+        limit=cleanup_limit,
+    )
+    removed = 0
+    for entry in selected:
+        session_id = entry.get("id") or entry.get("sessionId")
         try:
             mumu.requests.delete(
                 f"{base_url}/session/{session_id}",
-                timeout=8,
+                timeout=3,
             )
             removed += 1
         except Exception as exc:
             logger.debug("清理 Appium 会话 %s 失败：%s", session_id, exc)
     if removed:
         logger.info("已清理 %s 个本设备/本端口的旧 Appium 会话。", removed)
+    if skipped:
+        logger.warning(
+            "Appium 端口 %s 仍登记 %s 个更早的历史会话；"
+            "已跳过逐个清理，避免设备启动长时间无响应。",
+            system_port,
+            skipped,
+        )
 
 
 def normalize_text(value: str) -> str:
