@@ -894,6 +894,7 @@ def build_product_prompt(answer_text):
             "Normalize known formatting variants: DS 实验室=>DS实验室, Spēs=>Spes, vsve=>VSVE, +OKSS+/OKSS+=>OKSS. Decorative plus signs are not part of the master brand.",
             "Do not use a product line or duplicated prefix as brand. Examples: 仁和匠心=>仁和, 章华汉草=>章华, 甘椰植萃=>甘椰, 因士柔酸=>因士.",
             "Do not output the same recommendation twice under brand aliases. Deduplicate by normalized brand + normalized product identity.",
+            "If one recommendation names a generic product and explicitly lists multiple recommended/mainstream brands for it (for example: 5% 米诺地尔酊（主流品牌：达霏欣、蔓迪）), output one product item for each named brand. Do not replace those named brands with one brandless generic row.",
             "If the answer only evaluates one named product and does not recommend a list, return an empty products array.",
             "Each item must have rank, brand, sub_brand, product_name, evidence.",
         ],

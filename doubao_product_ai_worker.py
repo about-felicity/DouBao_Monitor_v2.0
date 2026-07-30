@@ -102,12 +102,19 @@ def pending_payload_archived(payload):
     extracted_at = str(payload.get("extractedAt") or "").strip()
     if not page_url or not extracted_at or not os.path.exists(saver.OUT_ANSWERS_CSV):
         return False
+    # Saved rows normalize ISO timestamps such as
+    # ``2026-07-28T20:57:52+08:00`` to a space-separated Beijing timestamp.
+    # Compare the normalized value so a successfully archived capture is not
+    # retried forever merely because the pending payload kept its ISO spelling.
+    normalized_extracted_at = saver.beijing_time_str(extracted_at)
     try:
         with open(saver.OUT_ANSWERS_CSV, "r", encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
                 if (
                     str(row.get("page_url") or "").rstrip("/") == page_url
-                    and str(row.get("extracted_at") or "").strip() == extracted_at
+                    and saver.beijing_time_str(
+                        str(row.get("extracted_at") or "").strip()
+                    ) == normalized_extracted_at
                     and str(row.get("answer_text") or "").strip()
                 ):
                     return True
