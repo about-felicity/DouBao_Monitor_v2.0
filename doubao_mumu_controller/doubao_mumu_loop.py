@@ -92,6 +92,7 @@ INPUT_TOGGLE_ID = "com.larus.nova:id/action_input"
 SEND_ID = "com.larus.nova:id/action_send"
 BACK_ID = "com.larus.nova:id/back_icon"
 NEW_CHAT_ID = "com.larus.nova:id/right_img"
+SIDEBAR_NEW_CHAT_ID = "com.larus.nova:id/side_bar_create_conversation"
 MESSAGE_LIST_ID = "com.larus.nova:id/message_list"
 CREATE_NEW_CHAT_TEXT = "创建新对话"
 NEW_CHAT_DESCRIPTIONS = ("创建新对话", "新建对话", "开始新对话")
@@ -804,9 +805,10 @@ def find_node_by_id(root: ET.Element, resource_id: str) -> ET.Element | None:
 
 
 def find_new_chat_node(root: ET.Element) -> ET.Element | None:
-    direct = find_node_by_id(root, NEW_CHAT_ID)
-    if direct is not None:
-        return direct
+    for resource_id in (NEW_CHAT_ID, SIDEBAR_NEW_CHAT_ID):
+        direct = find_node_by_id(root, resource_id)
+        if direct is not None:
+            return direct
     for node in root.iter():
         description = (node.attrib.get("content-desc") or "").strip()
         text = (node.attrib.get("text") or "").strip()
@@ -893,6 +895,11 @@ def fingerprint_difference(previous: bytes, current: bytes) -> float:
 def page_name(root: ET.Element) -> str:
     if any(has_id(root, marker) for marker in LOGIN_MARKERS):
         return "login"
+    # The newer Doubao layout opens a conversation drawer over the current
+    # chat.  CHAT_ROOT_ID remains in the XML underneath the drawer, so this
+    # check must precede the normal chat-page check.
+    if has_id(root, SIDEBAR_NEW_CHAT_ID):
+        return "sidebar"
     if has_id(root, CHAT_ROOT_ID):
         return "chat"
     if has_id(root, LIST_ID):
@@ -946,6 +953,7 @@ class DoubaoAutomation:
             lambda item: page_name(item) in {
                 "chat",
                 "list",
+                "sidebar",
                 "new_chat_menu",
                 "login",
             },
@@ -985,6 +993,45 @@ class DoubaoAutomation:
                     return
                 except AutomationError as exc:
                     self.logger.warning("点击“创建新对话”失败：%s", exc)
+                    self.appium.back()
+                    continue
+            if state == "sidebar":
+                new_chat = find_new_chat_node(root)
+                if new_chat is None:
+                    self.logger.warning("侧栏已打开，但没有识别到新建对话入口。")
+                    self.appium.back()
+                    continue
+                try:
+                    if new_chat.attrib.get("resource-id"):
+                        self.appium.click_id(
+                            new_chat.attrib["resource-id"],
+                            timeout=8,
+                        )
+                    else:
+                        bounds = node_bounds(new_chat)
+                        if bounds is None:
+                            raise AutomationError("侧栏新建入口没有可点击坐标。")
+                        left, top, right, bottom = bounds
+                        self.adb.shell(
+                            "input",
+                            "tap",
+                            str((left + right) // 2),
+                            str((top + bottom) // 2),
+                            timeout=10,
+                            check=False,
+                        )
+                    self.wait_until(
+                        lambda item: (
+                            page_name(item) == "chat"
+                            and has_text_input_control(item)
+                        ),
+                        timeout=12,
+                        description="侧栏新建对话聊天页",
+                    )
+                    self.logger.info("已通过聊天侧栏创建新对话")
+                    return
+                except AutomationError as exc:
+                    self.logger.warning("点击侧栏新建对话失败：%s", exc)
                     self.appium.back()
                     continue
             if state == "chat":
@@ -1058,7 +1105,7 @@ class DoubaoAutomation:
 
         self.adb.force_stop_and_restart()
         self.wait_until(
-            lambda item: page_name(item) in {"chat", "list"},
+            lambda item: page_name(item) in {"chat", "list", "sidebar"},
             timeout=18,
             description="豆包恢复页面",
         )
