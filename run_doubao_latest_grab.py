@@ -1299,7 +1299,8 @@ def start_source_ai_worker():
     env = os.environ.copy()
     env.setdefault("DOUBAO_AI_TIMEOUT", "12")
     env.setdefault("DOUBAO_META_TIMEOUT", "3")
-    env.setdefault("DOUBAO_AI_WORKER_MAX_HOSTS", "20")
+    env.setdefault("DOUBAO_AI_WORKER_MAX_HOSTS", "5")
+    env.setdefault("DOUBAO_SOURCE_AI_MAX_RETRIES", "2")
     log_path = os.path.join(BASE_DIR, "doubao_source_ai_worker.launch.log")
     try:
         with open(log_path, "ab") as log:
@@ -1326,7 +1327,8 @@ def start_product_ai_worker():
     env.setdefault("DOUBAO_PRODUCT_AI_MODEL", "deepseek-v4-flash")
     # Commit in small batches so solved rounds appear on the dashboard quickly
     # and foreground capture never competes with a long CSV transaction.
-    env.setdefault("DOUBAO_PRODUCT_AI_RETRY_BATCH", "5")
+    env.setdefault("DOUBAO_PRODUCT_AI_RETRY_BATCH", "2")
+    env.setdefault("DOUBAO_PRODUCT_AI_MAX_RETRIES", "2")
     log_path = os.path.join(BASE_DIR, "doubao_product_ai_worker.launch.log")
     try:
         with open(log_path, "ab") as log:

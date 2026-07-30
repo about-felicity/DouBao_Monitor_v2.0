@@ -23,6 +23,9 @@ doubao_mumu_controller/portable_runtime/
 /doubao_capture_skips.csv
 /doubao_capture_runtime_errors.csv
 /doubao_source_ai_cache.json
+/doubao_product_ai_cache.json
+/doubao_product_ai_retry_state.json
+/doubao_source_ai_retry_state.json
 /doubao_source_cache.json
 /doubao_brand_ai_cache.json
 /doubao_source_content_index.json

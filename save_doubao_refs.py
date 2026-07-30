@@ -171,6 +171,16 @@ OFFICIAL_HINTS = (
 )
 SOURCE_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_cache.json")
 SOURCE_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_ai_cache.json")
+PRODUCT_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_product_ai_cache.json")
+PRODUCT_AI_ANALYZER_VERSION = "compact-grounded-v1"
+DEEPSEEK_THINKING_MODE = {"type": "disabled"}
+
+
+def deepseek_thinking_options(base_url):
+    """Only send DeepSeek's thinking switch to compatible endpoints."""
+    if "deepseek.com" in str(base_url or "").lower():
+        return {"thinking": DEEPSEEK_THINKING_MODE}
+    return {}
 SOURCE_CONTENT_DB = os.path.join(BASE_DIR, "doubao_source_content.db")
 DEBUG_LOG = os.path.join(BASE_DIR, "doubao_run_debug.log")
 DEBUG_LOG_MAX_BYTES = 20 * 1024 * 1024
@@ -880,38 +890,89 @@ def strip_reference_prefix(text):
 def build_product_prompt(answer_text):
     cleaned = strip_reference_prefix(answer_text)
     return {
-        "task": "Extract products explicitly recommended by an AI answer.",
+        "task": "提取回答正文中明确推荐的全部产品，禁止补充正文外信息。",
         "rules": [
-            "Return strict JSON only.",
-            "Read the complete answer body, including all paragraphs and list items. Extract every real product explicitly recommended by the assistant.",
-            "A product may be named by a nickname or a full name; preserve the most specific brand + product name present in the body. Never invent or expand a name using outside knowledge.",
-            "Do not extract reference titles, web page titles, article/video titles, category words, warnings, feature bullets, price/image/brand search titles, or general advice.",
-            "Keep the rank from the answer. Use rank_type=explicit_rank only when the body gives a numeric/ordinal rank; otherwise use rank_type=appearance_order and rank by first recommendation appearance.",
-            "For dashboard aggregation, brand must be the stable master brand, not a concatenated master-brand + sub-brand/product-line name. Keep the sub-brand or series in product_name and sub_brand. Example: 花王莉婕泡沫染发剂 => brand=花王, sub_brand=莉婕, product_name=花王莉婕泡沫染发剂.",
-            "If the answer only gives a sub-brand, you may use stable brand ownership knowledge to normalize brand, but never invent or expand product_name beyond the answer text.",
-            "Within one answer, the same brand must always use exactly one normalized brand string. Merge casing, spacing, decorative-symbol, Chinese/English co-name, and common typo variants instead of returning separate brands.",
-            "Prefer the stable Chinese consumer-facing master brand when Chinese and English names refer to the same brand. Examples: Fresh/馥蕾诗=>馥蕾诗, Freiol/福来=>福来, Moroccanoil/摩洛哥油=>摩洛哥油, Cavilla/CAVILLA/卡薇拉=>卡维拉.",
-            "Normalize known formatting variants: DS 实验室=>DS实验室, Spēs=>Spes, vsve=>VSVE, +OKSS+/OKSS+=>OKSS. Decorative plus signs are not part of the master brand.",
-            "Do not use a product line or duplicated prefix as brand. Examples: 仁和匠心=>仁和, 章华汉草=>章华, 甘椰植萃=>甘椰, 因士柔酸=>因士.",
-            "Do not output the same recommendation twice under brand aliases. Deduplicate by normalized brand + normalized product identity.",
-            "If one recommendation names a generic product and explicitly lists multiple recommended/mainstream brands for it (for example: 5% 米诺地尔酊（主流品牌：达霏欣、蔓迪）), output one product item for each named brand. Do not replace those named brands with one brandless generic row.",
-            "If the answer only evaluates one named product and does not recommend a list, return an empty products array.",
-            "Each item must have rank, brand, sub_brand, product_name, evidence.",
+            "忽略参考标题、相关文章、提示和泛品类；同一产品去重，按首次出现排序。",
+            "brand用稳定主品牌；系列/子品牌留在product_name。仅在正文明确列出多个品牌时拆成多项。",
+            "evidence必须逐字复制正文中的最短推荐证据；没有原文证据就不要输出。",
+            "有数字名次才用explicit_rank，否则用appearance_order。只返回JSON。",
         ],
-        "output_schema": {
-            "products": [
-                {
-                    "rank": 1,
-                    "rank_type": "explicit_rank or appearance_order",
-                    "brand": "用于面板聚合的主品牌名",
-                    "sub_brand": "子品牌或产品系列名；没有则为空字符串",
-                    "product_name": "品牌 + 产品名",
-                    "evidence": "原文中证明它被推荐的短句",
-                }
-            ]
+        "schema": {
+            "products": [{
+                "rank": 1,
+                "rank_type": "appearance_order|explicit_rank",
+                "brand": "主品牌",
+                "product_name": "原文产品名",
+                "evidence": "原文短句",
+            }]
         },
-        "answer_text": cleaned[:6000],
+        "text": cleaned[:4000],
     }
+
+
+def product_ai_max_tokens(answer_text):
+    """Bound model output to the size of the actual recommendation list."""
+    cleaned = strip_reference_prefix(answer_text)
+    claimed = declared_recommendation_count(cleaned)
+    rule_count = len(extract_products(cleaned))
+    numbered = {
+        int(value)
+        for value in re.findall(r"(?m)^\s*(\d{1,2})\s*[.、）)]", cleaned)
+        if 0 < int(value) <= 20
+    }
+    numbered_count = max(numbered) if numbered else 0
+    expected = min(20, max(4, claimed, rule_count, numbered_count))
+    return min(1200, max(320, 120 + expected * 90))
+
+
+def product_ai_cache_key(answer_text):
+    cleaned = strip_reference_prefix(answer_text)
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+    return PRODUCT_AI_ANALYZER_VERSION + ":" + digest
+
+
+def cached_product_ai_result(answer_text):
+    cache = load_json_cache(PRODUCT_AI_CACHE_JSON)
+    entry = cache.get(product_ai_cache_key(answer_text))
+    if not isinstance(entry, dict) or not isinstance(entry.get("products"), list):
+        return None
+    try:
+        validate_grounded_ai_products(answer_text, entry["products"])
+    except ValueError:
+        return None
+    return entry
+
+
+def save_product_ai_result(answer_text, products, method, model):
+    # Several browser slots can finish together. Serialize the tiny
+    # read-modify-write section so one process cannot overwrite another's hit.
+    with product_data_write_lock(timeout_seconds=20):
+        cache = load_json_cache(PRODUCT_AI_CACHE_JSON)
+        cache[product_ai_cache_key(answer_text)] = {
+            "products": products,
+            "method": method,
+            "model": model,
+            "analyzer_version": PRODUCT_AI_ANALYZER_VERSION,
+            "saved_at": now_str(),
+        }
+        save_json_cache(PRODUCT_AI_CACHE_JSON, cache)
+
+
+def _grounding_text(value):
+    return re.sub(r"[\s\W_]+", "", str(value or ""), flags=re.UNICODE).casefold()
+
+
+def validate_grounded_ai_products(answer_text, products):
+    """Reject model output whose quoted evidence is not in the captured answer."""
+    answer = _grounding_text(strip_reference_prefix(answer_text))
+    for item in products or []:
+        evidence = _grounding_text(item.get("evidence"))
+        if len(evidence) < 2 or evidence not in answer:
+            raise ValueError(
+                "product evidence is not grounded in answer: "
+                + str(item.get("product_name") or "")[:80]
+            )
+    return products
 
 
 def model_response_text(data):
@@ -942,8 +1003,7 @@ def call_anthropic_product_extractor(answer_text):
     for attempt in range(1, attempts + 1):
         body = {
             "model": model,
-            # Keep enough room for every recommendation and its evidence.
-            "max_tokens": 3000,
+            "max_tokens": product_ai_max_tokens(answer_text),
             "temperature": 0,
             "system": "Return one valid JSON object only. Do not use markdown or commentary.",
             "messages": [
@@ -953,6 +1013,7 @@ def call_anthropic_product_extractor(answer_text):
                 }
             ],
         }
+        body.update(deepseek_thinking_options(base_url))
         try:
             req = urllib.request.Request(
                 base_url + "/v1/messages",
@@ -966,12 +1027,21 @@ def call_anthropic_product_extractor(answer_text):
             )
             with urllib.request.urlopen(req, timeout=env_int("DOUBAO_AI_PRODUCT_TIMEOUT", 45)) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            usage = data.get("usage") or {}
+            debug_log(
+                "AI product usage: input=%s output=%s"
+                % (
+                    usage.get("input_tokens", ""),
+                    usage.get("output_tokens", ""),
+                )
+            )
             content = model_response_text(data)
             if not content.strip():
                 raise ValueError("empty model response")
             parsed = parse_product_json(content)
             products = normalize_ai_products(parsed)
-            return ensure_complete_ai_products(answer_text, parsed, products)
+            products = ensure_complete_ai_products(answer_text, parsed, products)
+            return validate_grounded_ai_products(answer_text, products)
         except Exception as exc:
             debug_log(
                 "AI product extractor attempt %d/%d failed: %r"
@@ -987,6 +1057,7 @@ def call_openai_product_extractor(answer_text):
     if not api_key:
         return None
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
     body = {
         "model": model,
         "messages": [
@@ -994,9 +1065,10 @@ def call_openai_product_extractor(answer_text):
             {"role": "user", "content": json.dumps(build_product_prompt(answer_text), ensure_ascii=False)},
         ],
         "temperature": 0,
+        "max_tokens": product_ai_max_tokens(answer_text),
     }
+    body.update(deepseek_thinking_options(base_url))
     try:
-        base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
         endpoint = base_url + ("/chat/completions" if base_url.endswith("/v1") else "/v1/chat/completions")
         req = urllib.request.Request(
             endpoint,
@@ -1009,9 +1081,18 @@ def call_openai_product_extractor(answer_text):
         )
         with urllib.request.urlopen(req, timeout=env_int("DOUBAO_AI_PRODUCT_TIMEOUT", 45)) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        usage = data.get("usage") or {}
+        debug_log(
+            "OpenAI product usage: input=%s output=%s"
+            % (
+                usage.get("prompt_tokens", ""),
+                usage.get("completion_tokens", ""),
+            )
+        )
         parsed = parse_json_object(data["choices"][0]["message"]["content"])
         products = normalize_ai_products(parsed)
-        return ensure_complete_ai_products(answer_text, parsed, products)
+        products = ensure_complete_ai_products(answer_text, parsed, products)
+        return validate_grounded_ai_products(answer_text, products)
     except Exception as exc:
         debug_log("OpenAI product extractor failed: " + repr(exc))
         return None
@@ -1059,6 +1140,16 @@ def review_products_with_ai(answer_text):
         products = historical_products if historical_products else rule_products
         return products, "rule_unverified", "rule", ""
 
+    cached = cached_product_ai_result(text)
+    if cached is not None:
+        debug_log("AI product cache hit: " + product_ai_cache_key(text))
+        return (
+            cached["products"],
+            "ai_verified",
+            str(cached.get("method") or "cache"),
+            str(cached.get("model") or product_ai_model_label()),
+        )
+
     debug_log(
         "AI product review start; answer_len=" + str(len(text))
         + " rule_count=" + str(len(rule_products))
@@ -1096,6 +1187,7 @@ def review_products_with_ai(answer_text):
                     item["brand_name"] = canonical
         except Exception:
             pass
+        save_product_ai_result(text, result, method, product_ai_model_label())
         debug_log("AI product review completed; ai_count=" + str(len(result)))
         return result, "ai_verified", method, product_ai_model_label()
 
@@ -2108,7 +2200,7 @@ def call_anthropic_source_classifier(href, meta):
 
     body = {
         "model": model,
-        "max_tokens": 600,
+        "max_tokens": 180,
         "temperature": 0,
         "messages": [
             {
@@ -2117,6 +2209,7 @@ def call_anthropic_source_classifier(href, meta):
             }
         ],
     }
+    body.update(deepseek_thinking_options(base_url))
 
     try:
         req = urllib.request.Request(
@@ -2131,6 +2224,11 @@ def call_anthropic_source_classifier(href, meta):
         )
         with urllib.request.urlopen(req, timeout=env_int("DOUBAO_AI_TIMEOUT", 3)) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        usage = data.get("usage") or {}
+        debug_log(
+            "AI source usage: domain=%s input=%s output=%s"
+            % (domain, usage.get("input_tokens", ""), usage.get("output_tokens", ""))
+        )
         parts = data.get("content") or []
         content = ""
         for part in parts:
@@ -2165,6 +2263,7 @@ def call_openai_source_classifier(href, meta):
             },
         ],
         "temperature": 0,
+        "max_tokens": 180,
     }
 
     try:
@@ -2288,42 +2387,21 @@ def parse_product_json(text):
 
 
 def build_source_prompt(href, meta):
-    examples = [
-        DOUYIN,
-        u(0x4ec0, 0x4e48, 0x503c, 0x5f97, 0x4e70),
-        XN_DAILY,
-        CHINA_NEWS,
-        u(0x767e, 0x5bb6, 0x53f7),
-        u(0x4eca, 0x65e5, 0x5934, 0x6761),
-        u(0x5b98, 0x7f51),
-    ]
     return {
-        "task": "Classify one unique source domain for a Chinese spreadsheet.",
-        "important": [
-            "Input is one deduplicated domain plus one sample URL/page metadata.",
-            "Return JSON only.",
-            "media must be a human-readable Chinese source/platform/official organization name whenever inferable, not merely the raw domain.",
-            "Never use raw domain labels or short technical names as media, for example hfg386, dianlinet, hzpwjc, ifeng, smzdm. Infer a readable Chinese media/platform/shop/organization name from title, site name, domain meaning, and page context.",
-            "If the page is a small ecommerce shop with no public media brand, return the shop/site display name in Chinese when possible, otherwise return a readable label such as 独立商城 or 品牌商城, not the bare domain.",
-            "Examples of media names: " + ", ".join(examples),
-            "For news/article sites, identify the news organization, newspaper, Baijiahao/Toutiao account, official organization, or website name.",
-            "For video platforms, source_type must be the Chinese value for video and media should be platform/source name.",
-            "For ecommerce product pages, source_type must be the Chinese value for product page and media should be ecommerce platform/store/site name.",
-        ],
-        "allowed_source_type": [VIDEO, ARTICLE, PRODUCT_PAGE, OTHER],
-        "input": {
-            "sample_href": href,
-            "domain": urlparse(href or "").netloc,
-            "page_site_name": meta.get("site_name", ""),
-            "page_title": meta.get("title", ""),
-            "og_type": meta.get("og_type", ""),
+        "task": "识别网页信源。media用可读的媒体/平台/机构/商城名称，禁止裸域名；只返回JSON。",
+        "types": [VIDEO, ARTICLE, PRODUCT_PAGE, OTHER],
+        "in": {
+            "url": href,
+            "site": meta.get("site_name", ""),
+            "title": meta.get("title", ""),
+            "og": meta.get("og_type", ""),
             "content_type": meta.get("content_type", ""),
-            "page_content_excerpt": meta.get("content_text", ""),
+            "excerpt": str(meta.get("content_text", ""))[:600],
         },
-        "output_schema": {
+        "out": {
             "source_type": "|".join([VIDEO, ARTICLE, PRODUCT_PAGE, OTHER]),
-            "media": "source/media/platform/official organization name",
-            "note": "short Chinese reason",
+            "media": "中文可读名称",
+            "note": "10字内依据",
         },
     }
 
@@ -2363,11 +2441,25 @@ def load_json_cache(path):
 
 
 def save_json_cache(path, cache):
+    temp_path = ""
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".",
+            suffix=".tmp",
+            dir=os.path.dirname(path) or BASE_DIR,
+        )
+        os.close(fd)
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
     except Exception:
         pass
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
 
 def get_source_content_text(href, max_chars=3000):
