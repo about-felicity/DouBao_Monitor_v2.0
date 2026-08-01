@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { MODEL_REGISTRY, RESERVED_MODEL_SLOTS, modelById, type ModelId } from "./modelRegistry";
 
 type CountItem = { name: string; count: number };
 type YuanbaoSource = { title: string; url: string; canonical_url: string; domain: string; media: string; type: string };
@@ -47,8 +48,8 @@ type DoubaoStats = {
   daily_question_sources: DoubaoDailySeries[]; daily_question_products: DoubaoDailySeries[];
 };
 type ControlModel = { running: boolean; pid?: number | null; started_at?: string; last_exit_code?: number | null; ready: boolean; log?: string };
-type ControlData = { ok: boolean; generated_at: string; models: { doubao: ControlModel; yuanbao: ControlModel } };
-type Platform = "all" | "doubao" | "yuanbao";
+type ControlData = { ok: boolean; generated_at: string; models: Record<ModelId, ControlModel> };
+type Platform = "all" | ModelId;
 type View = "overview" | "daily" | "sources" | "products" | "runs" | "control";
 
 const emptyYuanbao: YuanbaoData = {
@@ -148,8 +149,8 @@ export function Dashboard() {
       const base = apiBase();
       const doubaoParams = new URLSearchParams({ question: selectedQuestion, device: "all", _: String(Date.now()) });
       const [d, y, c] = await Promise.all([
-        fetch(`${base}/api/stats?${doubaoParams}`, { cache: "no-store" }),
-        fetch(`${base}/api/yuanbao/stats?_=${Date.now()}`, { cache: "no-store" }),
+        fetch(`${base}${modelById("doubao").statsEndpoint}?${doubaoParams}`, { cache: "no-store" }),
+        fetch(`${base}${modelById("yuanbao").statsEndpoint}?_=${Date.now()}`, { cache: "no-store" }),
         fetch(`${base}/api/control/status?_=${Date.now()}`, { cache: "no-store" }),
       ]);
       if (!d.ok || !y.ok || !c.ok) throw new Error("本地数据服务暂不可用");
@@ -217,7 +218,7 @@ export function Dashboard() {
   ])].filter(Boolean).sort().reverse(), [yuanbao.daily, doubao.daily_question_sources]);
   const questions = useMemo(() => [...new Set([...doubao.questions.map((item) => item.question), ...yuanbao.questions.map((item) => item.question)])], [doubao.questions, yuanbao.questions]);
 
-  const controlAction = async (model: "doubao" | "yuanbao", action: "start" | "stop") => {
+  const controlAction = async (model: ModelId, action: "start" | "stop") => {
     setActionMessage("正在处理…");
     try {
       const response = await fetch(`${apiBase()}/api/control/${model}/${action}`, {
@@ -237,9 +238,11 @@ export function Dashboard() {
 
   return <main className="app-shell">
     <aside className="sidebar">
-      <div className="identity"><div className="logo">AI</div><div><b>双模型监控台</b><span><i className={error ? "off" : ""} />{error || "本地数据在线"}</span></div></div>
+      <div className="identity"><div className="logo">AI</div><div><b>多模型监控台</b><span><i className={error ? "off" : ""} />{error || "本地数据在线"}</span></div></div>
       <div className="platform-switch" role="tablist" aria-label="模型范围">
-        {(["all", "doubao", "yuanbao"] as Platform[]).map((item) => <button key={item} className={platform === item ? "active" : ""} onClick={() => setPlatform(item)}>{item === "all" ? "综合" : item === "doubao" ? "豆包" : "元宝"}</button>)}
+        <button className={platform === "all" ? "active" : ""} onClick={() => setPlatform("all")}>综合</button>
+        {MODEL_REGISTRY.map((model) => <button key={model.id} className={platform === model.id ? "active" : ""} onClick={() => setPlatform(model.id)}>{model.name}</button>)}
+        <button className="reserved" disabled title="在模型注册表中增加适配器后自动启用">＋ 接入位</button>
       </div>
       <section className="filters">
         <label>问题范围<select value={question} onChange={(event) => changeQuestion(event.target.value)}><option>全部问题</option>{questions.map((item) => <option key={item}>{item}</option>)}</select></label>
@@ -247,11 +250,11 @@ export function Dashboard() {
         {platform === "yuanbao" && <label>元宝设备<select value={device} onChange={(event) => setDevice(event.target.value)}><option value="all">全部设备</option>{yuanbao.devices.map((item) => <option value={item.serial} key={item.serial}>{item.serial}</option>)}</select></label>}
       </section>
       <nav>{nav.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => setView(item.id)}><span>{item.symbol}</span>{item.label}</button>)}</nav>
-      <div className="side-status"><span>豆包 <i className={control?.models.doubao.running ? "live" : ""} />{control?.models.doubao.running ? "运行中" : "已停止"}</span><span>元宝 <i className={control?.models.yuanbao.running ? "live" : ""} />{control?.models.yuanbao.running ? "运行中" : "已停止"}</span><small>10 秒自动刷新 · {lastRefresh || "等待"}</small></div>
+      <div className="side-status">{MODEL_REGISTRY.map((model) => <span key={model.id}>{model.name} <i className={control?.models[model.id]?.running ? "live" : ""} />{control?.models[model.id]?.running ? "运行中" : "已停止"}</span>)}<small>10 秒自动刷新 · {lastRefresh || "等待"}</small></div>
     </aside>
 
     <section className="workspace">
-      <header className="topbar"><div><p>DOUBAO × YUANBAO INTELLIGENCE</p><h1>{nav.find((item) => item.id === view)?.label}</h1><span>{question} · {date === "all" ? "全部日期" : date}</span></div><button onClick={() => load()} disabled={loading}>{loading ? "读取中" : "刷新数据"}</button></header>
+      <header className="topbar"><div><p>MULTI-MODEL INTELLIGENCE</p><h1>{nav.find((item) => item.id === view)?.label}</h1><span>{question} · {date === "all" ? "全部日期" : date}</span></div><button onClick={() => load()} disabled={loading}>{loading ? "读取中" : "刷新数据"}</button></header>
       <div className="content">
         {view !== "control" && <section className="kpi-grid">
           <Kpi label="有效回答轮次" value={fmt(totalRuns)} note={`${visibleDoubao ? `豆包 ${fmt(doubaoRuns)}` : ""}${platform === "all" ? " · " : ""}${visibleYuanbao ? `元宝 ${fmt(yuanbaoRuns.length)}` : ""}`} />
@@ -265,6 +268,7 @@ export function Dashboard() {
             <div className="model-cards">
               {visibleDoubao && <article className="model-card doubao"><div><span>豆包</span><em>{control?.models.doubao.running ? "采集中" : "已就绪"}</em></div><strong>{fmt(doubaoRuns)}<small>轮回答</small></strong><ul><li><b>{fmt(doubaoRefs)}</b> 信源引用</li><li><b>{date === "all" ? fmt(doubao.unique_links) : "按日"}</b> 唯一链接</li><li><b>{fmt(doubaoProductMentions)}</b> 产品提及</li></ul></article>}
               {visibleYuanbao && <article className="model-card yuanbao"><div><span>元宝</span><em>{control?.models.yuanbao.running ? "采集中" : "已就绪"}</em></div><strong>{fmt(yuanbaoRuns.length)}<small>轮回答</small></strong><ul><li><b>{fmt(yuanbaoSources.length)}</b> 信源引用</li><li><b>{fmt(new Set(yuanbaoSources.map((item) => item.canonical_url)).size)}</b> 唯一链接</li><li><b>{fmt(yuanbaoRuns.reduce((sum, run) => sum + run.products.length, 0))}</b> 产品提及</li></ul></article>}
+              {platform === "all" && Array.from({ length: RESERVED_MODEL_SLOTS }, (_, index) => <article className="model-card reserved-card" key={`reserved-${index}`}><div><span>新模型接入位 {index + 1}</span><em>已预留</em></div><strong>＋<small>等待数据适配器</small></strong><p>注册模型后自动加入切换、对比、状态和采集控制。</p></article>)}
             </div>
           </section>
           <section className="two-col">
@@ -321,7 +325,8 @@ export function Dashboard() {
 
         {view === "control" && <section className="control-grid">
           <article className="panel launch-intro"><PanelTitle eyebrow="ONE CONTROL CENTER" title="一个面板启动两套采集" /><p>启动任务会沿用各自已有的问题计划、账号会话和断点。停止任务只结束本次进程，已经成功保存的数据不会丢失。</p><div className="round-control"><label>元宝本次轮数<input type="number" min="1" max="10000" value={rounds} onChange={(event) => setRounds(Math.max(1, Number(event.target.value) || 1))} /></label><span>豆包轮数读取现有豆包配置</span></div>{actionMessage && <div className="action-message">{actionMessage}</div>}</article>
-          {(["doubao", "yuanbao"] as const).map((model) => { const state = control?.models[model]; return <article className={`panel job-card ${state?.running ? "running" : ""}`} key={model}><div className="job-head"><div className={`model-icon ${model}`}>{model === "doubao" ? "豆" : "元"}</div><div><h2>{model === "doubao" ? "豆包采集" : "元宝采集"}</h2><span><i />{state?.running ? `运行中 · PID ${state.pid}` : state?.ready ? "配置就绪" : "缺少运行配置"}</span></div></div><dl><div><dt>启动时间</dt><dd>{state?.started_at ? shortTime(state.started_at) : "—"}</dd></div><div><dt>上次退出码</dt><dd>{state?.last_exit_code ?? "—"}</dd></div></dl><div className="job-actions"><button className="start" disabled={state?.running || !state?.ready} onClick={() => controlAction(model, "start")}>启动采集</button><button className="stop" disabled={!state?.running} onClick={() => controlAction(model, "stop")}>停止任务</button></div><small className="log-path">运行日志：{state?.log || "启动后生成"}</small></article>; })}
+          {MODEL_REGISTRY.filter((model) => model.supportsControl).map((model) => { const state = control?.models[model.id]; return <article className={`panel job-card ${state?.running ? "running" : ""}`} key={model.id}><div className="job-head"><div className={`model-icon ${model.tone}`}>{model.shortName}</div><div><h2>{model.name}采集</h2><span><i />{state?.running ? `运行中 · PID ${state.pid}` : state?.ready ? "配置就绪" : "缺少运行配置"}</span></div></div><dl><div><dt>启动时间</dt><dd>{state?.started_at ? shortTime(state.started_at) : "—"}</dd></div><div><dt>上次退出码</dt><dd>{state?.last_exit_code ?? "—"}</dd></div></dl><div className="job-actions"><button className="start" disabled={state?.running || !state?.ready} onClick={() => controlAction(model.id, "start")}>启动采集</button><button className="stop" disabled={!state?.running} onClick={() => controlAction(model.id, "stop")}>停止任务</button></div><small className="log-path">运行日志：{state?.log || "启动后生成"}</small></article>; })}
+          {Array.from({ length: RESERVED_MODEL_SLOTS }, (_, index) => <article className="panel job-card reserved-job" key={`control-reserved-${index}`}><div className="job-head"><div className="model-icon reserved">＋</div><div><h2>新模型采集位 {index + 1}</h2><span><i />等待接入</span></div></div><p>实现数据适配器和启动器后，这里会自动出现状态与控制按钮。</p></article>)}
         </section>}
       </div>
     </section>

@@ -1,6 +1,8 @@
-# 豆包 × 元宝双模型监控系统
+# 多模型监控系统（豆包 × 元宝）
 
 豆包与腾讯元宝 MuMu 多设备循环提问、网页端同账号抓取、北京时间归档、品牌与竞品分析及统一 React 实时面板。
+
+系统使用模型注册表和统一 `/api/models/<model-id>/stats` 路由，已在总览、模型切换和采集控制区域预留后续大模型接入位。接入约定见 `yuanbao_monitor/dashboard/MODEL_INTEGRATION.md`。
 
 ## 统一面板
 

@@ -54,6 +54,20 @@ YUANBAO_QUESTIONS = YUANBAO_DIR / "product.txt"
 HOST = os.environ.get("DOUBAO_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DOUBAO_DASHBOARD_PORT", "8765"))
 
+# 新模型在这里登记。前端通过 /api/models 读取目录；每个模型的数据适配器
+# 统一暴露为 /api/models/<id>/stats，控制能力则复用 /api/control/<id>/*。
+MODEL_REGISTRY = {
+    "doubao": {
+        "id": "doubao", "name": "豆包", "short_name": "豆",
+        "stats_endpoint": "/api/models/doubao/stats", "supports_control": True,
+    },
+    "yuanbao": {
+        "id": "yuanbao", "name": "元宝", "short_name": "元",
+        "stats_endpoint": "/api/models/yuanbao/stats", "supports_control": True,
+    },
+}
+RESERVED_MODEL_SLOTS = 2
+
 _CONTROL_LOCK = threading.Lock()
 _CONTROL_PROCESSES = {}
 
@@ -65,7 +79,7 @@ def _process_alive(process):
 def _control_status():
     result = {}
     with _CONTROL_LOCK:
-        for model in ("doubao", "yuanbao"):
+        for model, definition in MODEL_REGISTRY.items():
             item = _CONTROL_PROCESSES.get(model) or {}
             process = item.get("process")
             running = _process_alive(process)
@@ -76,13 +90,14 @@ def _control_status():
                 "last_exit_code": None if running or process is None else process.returncode,
                 "log": str(item.get("log", "")),
                 "ready": (DOUBAO_JOB_CONFIG.exists() if model == "doubao" else YUANBAO_QUESTIONS.exists()),
+                "name": definition["name"],
             }
     return {"ok": True, "generated_at": beijing_now(), "models": result}
 
 
 def _start_controlled_job(model, options=None):
     options = options if isinstance(options, dict) else {}
-    if model not in ("doubao", "yuanbao"):
+    if model not in MODEL_REGISTRY or not MODEL_REGISTRY[model]["supports_control"]:
         raise ValueError("未知模型")
     with _CONTROL_LOCK:
         current = (_CONTROL_PROCESSES.get(model) or {}).get("process")
@@ -6252,7 +6267,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "forbidden origin"}, 403)
             return
         path = self.path.split("?", 1)[0]
-        match = re.fullmatch(r"/api/control/(doubao|yuanbao)/(start|stop)", path)
+        match = re.fullmatch(r"/api/control/([a-z0-9_-]+)/(start|stop)", path)
         if not match:
             self.send_json({"ok": False, "error": "not found"}, 404)
             return
@@ -6270,6 +6285,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, 400)
 
     def do_GET(self):
+        if self.path.split("?", 1)[0] == "/api/models":
+            self.send_json({
+                "ok": True,
+                "models": list(MODEL_REGISTRY.values()),
+                "reserved_slots": RESERVED_MODEL_SLOTS,
+            })
+            return
         if self.path.startswith("/api/control/status"):
             self.send_json(_control_status())
             return
@@ -6278,6 +6300,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json(_yuanbao_stats())
             except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        if self.path.startswith("/api/models/yuanbao/stats"):
+            try:
+                self.send_json(_yuanbao_stats())
+            except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        if self.path.startswith("/api/models/doubao/stats"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            question = (params.get("question") or [""])[0]
+            device = (params.get("device") or [ALL_DEVICES])[0]
+            self.send_json(build_stats(question, device))
             return
         if self.path.startswith("/api/version"):
             parsed = urlparse(self.path)
