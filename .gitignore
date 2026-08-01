@@ -31,6 +31,18 @@ doubao_mumu_controller/portable_runtime/
 /doubao_source_content_index.json
 /doubao_source_content.db
 /doubao_run_counter.txt
+/yuanbao_monitor/yuanbao_results.jsonl
+/yuanbao_monitor/yuanbao_state/
+/yuanbao_monitor/yuanbao_diagnostics/
+/yuanbao_monitor/web_results/
+/yuanbao_monitor/dashboard/public/data/dashboard.json
+/yuanbao_monitor/dashboard/.next/
+/yuanbao_monitor/dashboard/dist/
+/yuanbao_monitor/dashboard/.wrangler/
+/yuanbao_monitor/snapshot_*.html
+/yuanbao_monitor/create_bat.py
+/yuanbao_monitor/find_drawer*.py
+/yuanbao_monitor/fix_bat*.py
 
 # Generated deploy bundles and dependency trees
 doubao_standalone_deploy/

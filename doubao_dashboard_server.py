@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
@@ -41,8 +42,132 @@ QUESTION_ALIASES_PATH = os.path.join(BASE_DIR, "doubao_question_aliases.py")
 BRAND_SETTINGS_PATH = str(brand_settings.SETTINGS_PATH)
 DEBUG_LOG_PATH = os.path.join(BASE_DIR, "doubao_run_debug.log")
 RAG_ML_LAB_PATH = os.path.join(BASE_DIR, "doubao_rag_ml_lab.html")
+YUANBAO_DIR = Path(BASE_DIR) / "yuanbao_monitor"
+YUANBAO_DASHBOARD_DATA = YUANBAO_DIR / "dashboard" / "public" / "data" / "dashboard.json"
+YUANBAO_RESULTS = YUANBAO_DIR / "yuanbao_results.jsonl"
+YUANBAO_BUILDER = YUANBAO_DIR / "build_dashboard_data.py"
+CONTROL_RUNTIME_DIR = Path(BASE_DIR) / "runtime" / "unified_control"
+DOUBAO_JOB_RUNNER = Path(BASE_DIR) / "doubao_mumu_controller" / "doubao_mumu_scheduled_job.py"
+DOUBAO_JOB_CONFIG = Path(BASE_DIR) / "doubao_mumu_controller" / "doubao_mumu_panel_config.json"
+YUANBAO_JOB_RUNNER = YUANBAO_DIR / "yuanbao_loop.py"
+YUANBAO_QUESTIONS = YUANBAO_DIR / "product.txt"
 HOST = os.environ.get("DOUBAO_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DOUBAO_DASHBOARD_PORT", "8765"))
+
+_CONTROL_LOCK = threading.Lock()
+_CONTROL_PROCESSES = {}
+
+
+def _process_alive(process):
+    return process is not None and process.poll() is None
+
+
+def _control_status():
+    result = {}
+    with _CONTROL_LOCK:
+        for model in ("doubao", "yuanbao"):
+            item = _CONTROL_PROCESSES.get(model) or {}
+            process = item.get("process")
+            running = _process_alive(process)
+            result[model] = {
+                "running": running,
+                "pid": process.pid if running else None,
+                "started_at": item.get("started_at", ""),
+                "last_exit_code": None if running or process is None else process.returncode,
+                "log": str(item.get("log", "")),
+                "ready": (DOUBAO_JOB_CONFIG.exists() if model == "doubao" else YUANBAO_QUESTIONS.exists()),
+            }
+    return {"ok": True, "generated_at": beijing_now(), "models": result}
+
+
+def _start_controlled_job(model, options=None):
+    options = options if isinstance(options, dict) else {}
+    if model not in ("doubao", "yuanbao"):
+        raise ValueError("未知模型")
+    with _CONTROL_LOCK:
+        current = (_CONTROL_PROCESSES.get(model) or {}).get("process")
+        if _process_alive(current):
+            item = _CONTROL_PROCESSES[model]
+            return {
+                "running": True, "pid": current.pid,
+                "started_at": item.get("started_at", ""), "log": str(item.get("log", "")),
+            }
+        CONTROL_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = CONTROL_RUNTIME_DIR / f"{model}.log"
+        if model == "doubao":
+            if not DOUBAO_JOB_CONFIG.exists():
+                raise FileNotFoundError("豆包运行配置不存在，请先完成一次账号检测和配置保存。")
+            command = [sys.executable, str(DOUBAO_JOB_RUNNER), "--config", str(DOUBAO_JOB_CONFIG)]
+            cwd = DOUBAO_JOB_RUNNER.parent
+        else:
+            if not YUANBAO_QUESTIONS.exists():
+                raise FileNotFoundError("元宝问题文件不存在。")
+            rounds = max(1, min(safe_int(options.get("rounds"), 10), 10000))
+            command = [
+                sys.executable, str(YUANBAO_JOB_RUNNER),
+                "--questions-file", str(YUANBAO_QUESTIONS),
+                "--rounds", str(rounds), "--resume", "--collect-web", "--max-retries", "3",
+            ]
+            cwd = YUANBAO_DIR
+        env = os.environ.copy()
+        env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+        log_handle = open(log_path, "a", encoding="utf-8")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            process = subprocess.Popen(
+                command, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                stdout=log_handle, stderr=subprocess.STDOUT, env=env,
+                creationflags=creationflags,
+            )
+        finally:
+            log_handle.close()
+        _CONTROL_PROCESSES[model] = {
+            "process": process, "started_at": beijing_now(), "log": log_path,
+        }
+        return {
+            "running": True, "pid": process.pid,
+            "started_at": _CONTROL_PROCESSES[model]["started_at"], "log": str(log_path),
+        }
+
+
+def _stop_controlled_job(model):
+    with _CONTROL_LOCK:
+        item = _CONTROL_PROCESSES.get(model) or {}
+        process = item.get("process")
+        if not _process_alive(process):
+            return {"running": False, "message": "当前没有由统一面板启动的任务。"}
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        return {"running": False, "message": "任务已停止，已经保存的轮次不会丢失。"}
+
+
+def _yuanbao_stats():
+    if (
+        YUANBAO_BUILDER.exists()
+        and YUANBAO_RESULTS.exists()
+        and (
+            not YUANBAO_DASHBOARD_DATA.exists()
+            or YUANBAO_RESULTS.stat().st_mtime > YUANBAO_DASHBOARD_DATA.stat().st_mtime
+        )
+    ):
+        subprocess.run(
+            [sys.executable, str(YUANBAO_BUILDER)], cwd=str(YUANBAO_DIR),
+            capture_output=True, timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    if not YUANBAO_DASHBOARD_DATA.exists():
+        return {"generated_at": beijing_now(), "runs": [], "daily": [], "total_runs": 0,
+                "successful_runs": 0, "total_sources": 0, "questions": [], "devices": []}
+    with YUANBAO_DASHBOARD_DATA.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 # User-owned products.  Matching requires the brand plus one distinguishing
 # product phrase so generic category articles are not labelled as owned content.
@@ -6079,10 +6204,81 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        origin = self.headers.get("Origin", "")
+        if origin and self.is_allowed_dashboard_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(content)
 
+    def is_allowed_dashboard_origin(self, origin):
+        try:
+            parsed = urlparse(origin)
+            request_host = (self.headers.get("Host") or "").split(":", 1)[0].strip("[]").casefold()
+            origin_host = (parsed.hostname or "").casefold()
+            return (
+                parsed.scheme in ("http", "https")
+                and parsed.port == 3000
+                and origin_host in {"127.0.0.1", "localhost", "::1", request_host}
+            )
+        except ValueError:
+            return False
+
+    def send_json(self, payload, status=200):
+        self.send_bytes(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8", status,
+        )
+
+    def redirect_to_react_dashboard(self):
+        host = (self.headers.get("Host") or "127.0.0.1").split(":", 1)[0]
+        self.send_response(302)
+        self.send_header("Location", f"http://{host}:3000/")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        origin = self.headers.get("Origin", "")
+        if origin and not self.is_allowed_dashboard_origin(origin):
+            self.send_bytes(b"forbidden", "text/plain; charset=utf-8", 403)
+            return
+        self.send_bytes(b"", "text/plain; charset=utf-8", 204)
+
+    def do_POST(self):
+        origin = self.headers.get("Origin", "")
+        if origin and not self.is_allowed_dashboard_origin(origin):
+            self.send_json({"ok": False, "error": "forbidden origin"}, 403)
+            return
+        path = self.path.split("?", 1)[0]
+        match = re.fullmatch(r"/api/control/(doubao|yuanbao)/(start|stop)", path)
+        if not match:
+            self.send_json({"ok": False, "error": "not found"}, 404)
+            return
+        try:
+            length = min(safe_int(self.headers.get("Content-Length")), 65536)
+            body = self.rfile.read(length) if length else b"{}"
+            options = json.loads(body.decode("utf-8")) if body else {}
+            model, action = match.groups()
+            state = (
+                _start_controlled_job(model, options)
+                if action == "start" else _stop_controlled_job(model)
+            )
+            self.send_json({"ok": True, "model": model, "state": state})
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, 400)
+
     def do_GET(self):
+        if self.path.startswith("/api/control/status"):
+            self.send_json(_control_status())
+            return
+        if self.path.startswith("/api/yuanbao/stats"):
+            try:
+                self.send_json(_yuanbao_stats())
+            except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         if self.path.startswith("/api/version"):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
@@ -6106,7 +6302,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_bytes(content, "application/json; charset=utf-8")
             return
         if self.path.split("?", 1)[0] in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self.redirect_to_react_dashboard()
             return
         if self.path.split("?", 1)[0] in ("/rag-lab", "/rag-lab.html"):
             try:
