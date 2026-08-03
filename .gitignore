@@ -2,6 +2,7 @@
 doubao_mumu_controller/doubao_api_keys.env
 doubao_mumu_controller/doubao_lan_pairing.json
 doubao_mumu_controller/doubao_remote_sync_config.json
+doubao_mumu_controller/doubao_lan_receiver_config.json
 **/.env
 **/*cookie*
 **/*session*
@@ -82,6 +83,17 @@ doubao_source_capture_source_backup_*.rar
 deepseek_db_dump/
 deepseek*
 *deepseek*
+!deepseek_monitor/
+!deepseek_monitor/**
+!model_plugins/
+!model_plugins/*/
+!model_plugins/*/plugin.py
+/deepseek_monitor/deepseek_results.jsonl
+/deepseek_monitor/deepseek_state.json
+/deepseek_monitor/dashboard.json
+/deepseek_monitor/chrome_profile/
+/deepseek_monitor/__pycache__/
+/deepseek_monitor/*.log
 image_pro/
 mumu-python-api/
 outputs/

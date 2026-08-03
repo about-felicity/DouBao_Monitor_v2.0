@@ -4,28 +4,37 @@ import test from "node:test";
 
 const app = new URL("../app/", import.meta.url);
 
-test("统一 React 面板包含双模型、每日分析和采集控制", async () => {
+test("统一面板由后端模型目录驱动并提供五类工作视图", async () => {
   const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
-  assert.match(source, /多模型监控台/);
-  assert.match(source, /综合总览/);
-  assert.match(source, /每日分析/);
+  assert.match(source, /\/api\/models/);
+  assert.match(source, /\/api\/analytics/);
+  assert.match(source, /模型总览/);
+  assert.match(source, /问题对比/);
+  assert.match(source, /信源洞察/);
+  assert.match(source, /回答审计/);
   assert.match(source, /采集控制/);
-  assert.match(source, /modelById\("yuanbao"\)\.statsEndpoint/);
-  assert.match(source, /api\/control\/\$\{model\}/);
-  assert.match(source, /北京时区 UTC\+8/);
-  assert.match(source, /MODEL_REGISTRY\.map/);
-  assert.match(source, /RESERVED_MODEL_SLOTS/);
+  assert.doesNotMatch(source, /modelRegistry/);
 });
 
-test("模型注册表保留统一数据和控制入口", async () => {
-  const registry = await readFile(new URL("modelRegistry.ts", app), "utf8");
-  assert.match(registry, /statsEndpoint:\s*"\/api\/models\/doubao\/stats"/);
-  assert.match(registry, /statsEndpoint:\s*"\/api\/models\/yuanbao\/stats"/);
-  assert.match(registry, /RESERVED_MODEL_SLOTS\s*=\s*2/);
+test("采集控制包含问题计划、账号校验及启停能力", async () => {
+  const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
+  assert.match(source, /每行一个，启动前自动保存/);
+  assert.match(source, /仅保存问题/);
+  assert.match(source, /校验模拟器 \/ 网页账号/);
+  assert.match(source, /account-check/);
+  assert.match(source, /api\/control\/\$\{modelId\}/);
 });
 
-test("页面元数据已经替换为正式产品信息", async () => {
+test("信源分析区区分文章视频并显示每日 Top 10 与关键词", async () => {
+  const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
+  assert.match(source, /当日高频文章 Top 10/);
+  assert.match(source, /当日高频视频 Top 10/);
+  assert.match(source, /文章文案关键词/);
+  assert.match(source, /视频文案关键词/);
+});
+
+test("页面元数据使用通用多模型产品名称", async () => {
   const layout = await readFile(new URL("layout.tsx", app), "utf8");
-  assert.match(layout, /多模型监控台/);
-  assert.doesNotMatch(layout, /Starter Project|codex-preview/);
+  assert.match(layout, /模型情报台/);
+  assert.doesNotMatch(layout, /Starter Project|codex-preview|豆包 × 元宝/);
 });

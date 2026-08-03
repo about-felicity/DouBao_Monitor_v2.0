@@ -20,6 +20,9 @@ from typing import Any
 
 from controller import YuanbaoController
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from monitor_core.quality import invalid_answer_reason
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ADB = Path(r"C:\Program Files\Netease\MuMu\nx_device\15.0\shell\adb.exe")
@@ -177,6 +180,17 @@ def worker(
                 logger.info("[%s] 第 %d 轮，第 %d 次尝试：%s", serial, index + 1, attempt, question)
                 xml = controller.ask(question, save_xml_path=str(xml_path))
                 reply = controller.extract_visible_reply(xml, question)
+                skip_reason = invalid_answer_reason(reply)
+                if skip_reason:
+                    append_jsonl(Path(args.results), {
+                        "status": "skipped", "skip_reason": skip_reason, "serial": serial,
+                        "round": index + 1, "schedule_index": position, "question": question,
+                        "reply": reply, "started_at": started, "finished_at": now(), "xml": str(xml_path),
+                    })
+                    index += 1
+                    save_state(state_path, {"serial": serial, "next_index": index, "updated_at": now()})
+                    logger.warning("[%s] 第 %d 轮回答无效，已直接跳过：%s", serial, index, skip_reason)
+                    break
                 web_result: dict[str, Any] = {}
                 if args.collect_web:
                     # 手机端一旦发送成功，网页抓取失败只重试网页，绝不重发问题。

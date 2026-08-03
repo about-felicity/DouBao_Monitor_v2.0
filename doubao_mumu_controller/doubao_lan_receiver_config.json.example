@@ -2,7 +2,7 @@
   "version": 1,
   "host": "0.0.0.0",
   "port": 8790,
-  "token": "IDx5t9uxdjoEJyH7jBNcZXhnJdaEk8Mhdwop7KF8VAg",
+  "token": "首次启动自动生成",
   "start_dashboard": true,
   "dashboard_port": 8765
 }

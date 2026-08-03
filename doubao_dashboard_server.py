@@ -18,6 +18,8 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import doubao_question_aliases as qa
 import doubao_brand_settings as brand_settings
+from monitor_core.plugins import discover_plugins
+from monitor_core.analytics import build_analytics
 
 # 固定使用中国时区 (UTC+8)，不受系统时区影响
 CST = timezone(timedelta(hours=8))
@@ -42,31 +44,13 @@ QUESTION_ALIASES_PATH = os.path.join(BASE_DIR, "doubao_question_aliases.py")
 BRAND_SETTINGS_PATH = str(brand_settings.SETTINGS_PATH)
 DEBUG_LOG_PATH = os.path.join(BASE_DIR, "doubao_run_debug.log")
 RAG_ML_LAB_PATH = os.path.join(BASE_DIR, "doubao_rag_ml_lab.html")
-YUANBAO_DIR = Path(BASE_DIR) / "yuanbao_monitor"
-YUANBAO_DASHBOARD_DATA = YUANBAO_DIR / "dashboard" / "public" / "data" / "dashboard.json"
-YUANBAO_RESULTS = YUANBAO_DIR / "yuanbao_results.jsonl"
-YUANBAO_BUILDER = YUANBAO_DIR / "build_dashboard_data.py"
 CONTROL_RUNTIME_DIR = Path(BASE_DIR) / "runtime" / "unified_control"
-DOUBAO_JOB_RUNNER = Path(BASE_DIR) / "doubao_mumu_controller" / "doubao_mumu_scheduled_job.py"
-DOUBAO_JOB_CONFIG = Path(BASE_DIR) / "doubao_mumu_controller" / "doubao_mumu_panel_config.json"
-YUANBAO_JOB_RUNNER = YUANBAO_DIR / "yuanbao_loop.py"
-YUANBAO_QUESTIONS = YUANBAO_DIR / "product.txt"
 HOST = os.environ.get("DOUBAO_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DOUBAO_DASHBOARD_PORT", "8765"))
 
-# 新模型在这里登记。前端通过 /api/models 读取目录；每个模型的数据适配器
-# 统一暴露为 /api/models/<id>/stats，控制能力则复用 /api/control/<id>/*。
-MODEL_REGISTRY = {
-    "doubao": {
-        "id": "doubao", "name": "豆包", "short_name": "豆",
-        "stats_endpoint": "/api/models/doubao/stats", "supports_control": True,
-    },
-    "yuanbao": {
-        "id": "yuanbao", "name": "元宝", "short_name": "元",
-        "stats_endpoint": "/api/models/yuanbao/stats", "supports_control": True,
-    },
-}
-RESERVED_MODEL_SLOTS = 2
+MODEL_PLUGINS = discover_plugins()
+MODEL_REGISTRY = {model_id: plugin.metadata() for model_id, plugin in MODEL_PLUGINS.items()}
+RESERVED_MODEL_SLOTS = 1
 
 _CONTROL_LOCK = threading.Lock()
 _CONTROL_PROCESSES = {}
@@ -89,7 +73,7 @@ def _control_status():
                 "started_at": item.get("started_at", ""),
                 "last_exit_code": None if running or process is None else process.returncode,
                 "log": str(item.get("log", "")),
-                "ready": (DOUBAO_JOB_CONFIG.exists() if model == "doubao" else YUANBAO_QUESTIONS.exists()),
+                "ready": MODEL_PLUGINS[model].ready(),
                 "name": definition["name"],
             }
     return {"ok": True, "generated_at": beijing_now(), "models": result}
@@ -109,21 +93,10 @@ def _start_controlled_job(model, options=None):
             }
         CONTROL_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         log_path = CONTROL_RUNTIME_DIR / f"{model}.log"
-        if model == "doubao":
-            if not DOUBAO_JOB_CONFIG.exists():
-                raise FileNotFoundError("豆包运行配置不存在，请先完成一次账号检测和配置保存。")
-            command = [sys.executable, str(DOUBAO_JOB_RUNNER), "--config", str(DOUBAO_JOB_CONFIG)]
-            cwd = DOUBAO_JOB_RUNNER.parent
-        else:
-            if not YUANBAO_QUESTIONS.exists():
-                raise FileNotFoundError("元宝问题文件不存在。")
-            rounds = max(1, min(safe_int(options.get("rounds"), 10), 10000))
-            command = [
-                sys.executable, str(YUANBAO_JOB_RUNNER),
-                "--questions-file", str(YUANBAO_QUESTIONS),
-                "--rounds", str(rounds), "--resume", "--collect-web", "--max-retries", "3",
-            ]
-            cwd = YUANBAO_DIR
+        plugin = MODEL_PLUGINS[model]
+        if not plugin.ready():
+            raise FileNotFoundError(f"{plugin.name} 运行配置不存在。")
+        command, cwd = plugin.command(options)
         env = os.environ.copy()
         env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
         log_handle = open(log_path, "a", encoding="utf-8")
@@ -166,23 +139,18 @@ def _stop_controlled_job(model):
 
 
 def _yuanbao_stats():
-    if (
-        YUANBAO_BUILDER.exists()
-        and YUANBAO_RESULTS.exists()
-        and (
-            not YUANBAO_DASHBOARD_DATA.exists()
-            or YUANBAO_RESULTS.stat().st_mtime > YUANBAO_DASHBOARD_DATA.stat().st_mtime
-        )
-    ):
-        subprocess.run(
-            [sys.executable, str(YUANBAO_BUILDER)], cwd=str(YUANBAO_DIR),
-            capture_output=True, timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    if not YUANBAO_DASHBOARD_DATA.exists():
-        return {"generated_at": beijing_now(), "runs": [], "daily": [], "total_runs": 0,
-                "successful_runs": 0, "total_sources": 0, "questions": [], "devices": []}
-    with YUANBAO_DASHBOARD_DATA.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return MODEL_PLUGINS["yuanbao"].stats()
+
+
+def _unified_analytics(params):
+    runs_by_model = {model_id: plugin.analytics_runs() for model_id, plugin in MODEL_PLUGINS.items()}
+    return build_analytics(
+        MODEL_REGISTRY,
+        runs_by_model,
+        question=(params.get("question") or [""])[0],
+        date=(params.get("date") or [""])[0],
+        model=(params.get("model") or [""])[0],
+    )
 
 # User-owned products.  Matching requires the brand plus one distinguishing
 # product phrase so generic category articles are not labelled as owned content.
@@ -6267,6 +6235,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "forbidden origin"}, 403)
             return
         path = self.path.split("?", 1)[0]
+        model_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/(questions|account-check)", path)
+        if model_route:
+            model, action = model_route.groups()
+            plugin = MODEL_PLUGINS.get(model)
+            if plugin is None:
+                self.send_json({"ok": False, "error": "未知模型"}, 404)
+                return
+            try:
+                if action == "account-check":
+                    self.send_json({"ok": True, "model": model, "account": plugin.account_check()})
+                    return
+                length = min(safe_int(self.headers.get("Content-Length")), 65536)
+                body = self.rfile.read(length) if length else b"{}"
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                raw_questions = payload.get("questions") if isinstance(payload, dict) else None
+                if not isinstance(raw_questions, list):
+                    raise ValueError("questions 必须是数组")
+                questions = []
+                for item in raw_questions[:100]:
+                    text = str(item.get("text") if isinstance(item, dict) else item or "").strip()
+                    if text and text not in questions:
+                        questions.append(text[:500])
+                if not questions:
+                    raise ValueError("至少保留一个有效问题")
+                plugin.save_questions(questions)
+                self.send_json({"ok": True, "model": model, "questions": plugin.load_questions()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
         match = re.fullmatch(r"/api/control/([a-z0-9_-]+)/(start|stop)", path)
         if not match:
             self.send_json({"ok": False, "error": "not found"}, 404)
@@ -6292,8 +6289,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "reserved_slots": RESERVED_MODEL_SLOTS,
             })
             return
+        question_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/questions", self.path.split("?", 1)[0])
+        if question_route:
+            plugin = MODEL_PLUGINS.get(question_route.group(1))
+            if plugin is None:
+                self.send_json({"ok": False, "error": "未知模型"}, 404)
+            else:
+                try:
+                    self.send_json({"ok": True, "model": plugin.id, "questions": plugin.load_questions()})
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         if self.path.startswith("/api/control/status"):
             self.send_json(_control_status())
+            return
+        if self.path.startswith("/api/analytics"):
+            try:
+                self.send_json(_unified_analytics(parse_qs(urlparse(self.path).query)))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
             return
         if self.path.startswith("/api/yuanbao/stats"):
             try:
@@ -6301,18 +6315,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
             return
-        if self.path.startswith("/api/models/yuanbao/stats"):
+        model_stats_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/stats", self.path.split("?", 1)[0])
+        if model_stats_route:
+            model_id = model_stats_route.group(1)
+            plugin = MODEL_PLUGINS.get(model_id)
+            if plugin is None:
+                self.send_json({"ok": False, "error": "未知模型"}, 404)
+                return
             try:
-                self.send_json(_yuanbao_stats())
+                if model_id == "doubao":
+                    parsed = urlparse(self.path)
+                    params = parse_qs(parsed.query)
+                    self.send_json(build_stats((params.get("question") or [""])[0], (params.get("device") or [ALL_DEVICES])[0]))
+                else:
+                    self.send_json(plugin.stats())
             except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
-            return
-        if self.path.startswith("/api/models/doubao/stats"):
-            parsed = urlparse(self.path)
-            params = parse_qs(parsed.query)
-            question = (params.get("question") or [""])[0]
-            device = (params.get("device") or [ALL_DEVICES])[0]
-            self.send_json(build_stats(question, device))
             return
         if self.path.startswith("/api/version"):
             parsed = urlparse(self.path)

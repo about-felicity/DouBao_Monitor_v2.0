@@ -21,6 +21,10 @@ from typing import Any
 import urllib.request
 
 import doubao_mumu_loop as mumu
+try:
+    import doubao_lan_client
+except ImportError:
+    doubao_lan_client = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +86,10 @@ WEB_ID_JS = r"""
 
 class PipelineError(RuntimeError):
     pass
+
+
+class InvalidModelAnswer(PipelineError):
+    """The model answered with an empty/error response; this round must be skipped."""
 
 
 def configure_logging(path: Path, verbose: bool) -> logging.Logger:
@@ -1338,21 +1346,7 @@ def wait_for_web_answer_stable(
         generating = bool(answer_state.get("generating"))
         elapsed = time.monotonic() - started
         if is_doubao_error_answer(answer):
-            logger.warning("豆包返回临时错误文案，刷新页面等待正常回答：%s", answer)
-            try:
-                grabber.cdp_call(
-                    ws_url,
-                    "Page.reload",
-                    {"ignoreCache": True},
-                    timeout=8,
-                )
-            except Exception as exc:
-                logger.debug("临时错误文案恢复刷新失败：%s", exc)
-            last_answer = ""
-            stable_since = None
-            last_reload = elapsed
-            time.sleep(2)
-            continue
+            raise InvalidModelAnswer(f"豆包返回系统异常：{answer}")
         effective_min_wait = min(4.0, max(1.5, min_wait * 0.4))
         dynamic_stable_seconds = min(
             stable_seconds,
@@ -1404,7 +1398,7 @@ def wait_for_web_answer_stable(
                     len(answer),
                 )
                 return answer
-            raise PipelineError(f"等待网页回答超过 {timeout:g} 秒仍没有正文。")
+            raise InvalidModelAnswer(f"等待网页回答超过 {timeout:g} 秒仍没有正文。")
         if elapsed >= next_notice:
             logger.info(
                 "等待网页回答生成（已等待 %.0f 秒，当前 %s 字）",
@@ -1534,10 +1528,14 @@ def grab_and_save(
         source_worker,
         product_worker,
     )
-    sync: dict[str, Any] = {
-        "enabled": False,
-        "status": "standalone",
-    }
+    sync: dict[str, Any] = {"enabled": False, "status": "standalone"}
+    if doubao_lan_client is not None:
+        try:
+            sync = doubao_lan_client.enqueue_and_flush(payload, logger)
+        except Exception as exc:
+            # 本地保存已经成功；主机暂不可达时由客户端离线队列保障，不能丢轮次。
+            sync = {"enabled": True, "status": "queued_offline", "error": str(exc)}
+            logger.warning("远端主面板暂不可达，本轮已保留在离线队列：%s", exc)
     return {"payload": payload, "save": save, "sync": sync}
 
 
@@ -1856,6 +1854,18 @@ def main() -> int:
                         delay = random.uniform(delay_low, delay_high)
                         logger.info("下一轮前冷却 %.1f 秒。", delay)
                         time.sleep(delay)
+                    break
+                except InvalidModelAnswer as exc:
+                    completed += 1
+                    append_result(
+                        Path(args.results),
+                        {"ok": False, "skipped": True, "timestamp": beijing_now(),
+                         "round": completed, "attempt": attempt, "question": question,
+                         "sent": sent, "skip_reason": str(exc), "device_index": device["index"],
+                         "serial": device["serial"], "account_uid_masked": mask_uid(uid),
+                         "question_sent_at": question_sent_at},
+                    )
+                    logger.warning("第 %s 轮回答无效，已直接跳过：%s", completed, exc)
                     break
                 except KeyboardInterrupt:
                     raise

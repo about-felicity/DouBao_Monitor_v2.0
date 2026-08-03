@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "enabled": true,
+  "receiver_url": "http://主面板电脑局域网IP:8790",
+  "receiver_urls": [],
+  "receiver_host": "",
+  "token": "从主面板电脑 doubao_lan_pairing.json 复制",
+  "device_name": "远端豆包电脑",
+  "upload_timeout": 20
+}

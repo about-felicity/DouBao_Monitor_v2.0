@@ -55,6 +55,10 @@ CONTROLLER_FILES = [
     "doubao_mumu_scheduled_job.py",
     "doubao_mumu_control_panel.py",
     "doubao_remote_startup.py",
+    "doubao_lan_client.py",
+    "doubao_remote_sync_config.json.example",
+    "配置远端豆包回传.ps1",
+    "远端豆包一键配置回传.bat",
     "doubao_mumu_panel_config.json",
     "requirements.txt",
     "打开豆包MuMu控制面板.bat",
@@ -143,6 +147,8 @@ def build(
         MONITOR_DIR / "doubao_ref_extension",
         monitor_target / "doubao_ref_extension",
     )
+    shutil.copytree(MONITOR_DIR / "monitor_core", monitor_target / "monitor_core")
+    shutil.copytree(MONITOR_DIR / "model_plugins", monitor_target / "model_plugins")
     for name in CONTROLLER_FILES:
         copy_required(BASE_DIR / name, controller_target / name)
 
@@ -196,9 +202,10 @@ def build(
         "使用控制面板修改并安装定时任务。“实例”留空会并行运行全部"
         "已启动 MuMu，也可填写 0,1,3。问题、运行参数、定时参数、"
         "自有品牌和竞品会自动保存，下次打开无需重新输入。\n"
-        "6. 发送、抓取、保存、分析和数据面板全部在本机独立运行；"
-        "不会连接其他电脑，也不会通过局域网上传数据。"
-        "本机数据面板地址为 http://127.0.0.1:8765/。\n",
+        "6. 若要把豆包结果汇总到主电脑统一面板，请把主电脑生成的"
+        "doubao_lan_pairing.json 拖到 monitor\\doubao_mumu_controller\\"
+        "远端豆包一键配置回传.bat；"
+        "网络中断时结果进入离线队列，恢复后自动续传。未配置时仍可独立运行。\n",
         encoding="utf-8",
     )
 
@@ -216,8 +223,8 @@ def build(
         "zip": zip_path,
         "include_appium": include_appium,
         "include_python": include_python,
-        "mode": "standalone",
-        "data_upload": False,
+        "mode": "remote_capable",
+        "data_upload": True,
     }
 
 

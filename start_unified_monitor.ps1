@@ -10,6 +10,13 @@ function Test-ListeningPort([int]$Port) {
     return [bool](Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
 }
 
+if (-not (Test-ListeningPort 8790)) {
+    $receiverOut = Join-Path $runtimeRoot "doubao_receiver.out.log"
+    $receiverErr = Join-Path $runtimeRoot "doubao_receiver.err.log"
+    Start-Process -FilePath "python" -ArgumentList @("-u", (Join-Path $projectRoot "doubao_mumu_controller\doubao_lan_receiver.py")) `
+        -WorkingDirectory $projectRoot -RedirectStandardOutput $receiverOut -RedirectStandardError $receiverErr -WindowStyle Hidden
+}
+
 if (-not (Test-ListeningPort 8765)) {
     $backendOut = Join-Path $runtimeRoot "dashboard_server.out.log"
     $backendErr = Join-Path $runtimeRoot "dashboard_server.err.log"
@@ -38,4 +45,4 @@ if (-not ((Test-ListeningPort 8765) -and (Test-ListeningPort 3000))) {
     throw "Unified dashboard startup timed out. Check runtime\unified_control logs."
 }
 if (-not $NoOpen) { Start-Process "http://127.0.0.1:3000" }
-Write-Host "Unified Doubao and Yuanbao React dashboard: http://127.0.0.1:3000"
+Write-Host "Unified Doubao, Yuanbao and DeepSeek React dashboard: http://127.0.0.1:3000"

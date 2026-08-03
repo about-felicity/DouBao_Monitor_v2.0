@@ -146,7 +146,14 @@ def start_dashboard() -> None:
 
 
 def check_main_receiver() -> dict[str, object]:
-    return {"ok": True, "disabled": True, "mode": "standalone"}
+    try:
+        import doubao_lan_client
+        config = doubao_lan_client.load_config()
+        if not config.get("enabled"):
+            return {"ok": True, "disabled": True, "mode": "standalone"}
+        return doubao_lan_client.health_check()
+    except Exception as exc:
+        return {"ok": False, "disabled": False, "error": str(exc)}
 
 
 def parse_args() -> argparse.Namespace:
