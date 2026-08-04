@@ -72,6 +72,9 @@ def _control_status():
             running = _process_alive(process)
             result[model] = {
                 "running": running,
+                "starting": bool(item.get("starting")),
+                "phase": str(item.get("phase") or ("运行中" if running else "")),
+                "startup_error": str(item.get("startup_error") or ""),
                 "pid": process.pid if running else None,
                 "started_at": item.get("started_at", ""),
                 "last_exit_code": None if running or process is None else process.returncode,
@@ -82,23 +85,22 @@ def _control_status():
     return {"ok": True, "generated_at": beijing_now(), "models": result}
 
 
-def _start_controlled_job(model, options=None):
-    options = options if isinstance(options, dict) else {}
-    if model not in MODEL_REGISTRY or not MODEL_REGISTRY[model]["supports_control"]:
-        raise ValueError("未知模型")
-    with _CONTROL_LOCK:
-        current = (_CONTROL_PROCESSES.get(model) or {}).get("process")
-        if _process_alive(current):
-            item = _CONTROL_PROCESSES[model]
-            return {
-                "running": True, "pid": current.pid,
-                "started_at": item.get("started_at", ""), "log": str(item.get("log", "")),
-            }
-        CONTROL_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = CONTROL_RUNTIME_DIR / f"{model}.log"
-        plugin = MODEL_PLUGINS[model]
-        if not plugin.ready():
-            raise FileNotFoundError(f"{plugin.name} 运行配置不存在。")
+def _launch_controlled_job(model, options, log_path):
+    plugin = MODEL_PLUGINS[model]
+
+    def progress(message):
+        with _CONTROL_LOCK:
+            item = _CONTROL_PROCESSES.get(model)
+            if item and not item.get("cancel_requested"):
+                item["phase"] = str(message)
+
+    try:
+        plugin.prepare(options, progress)
+        with _CONTROL_LOCK:
+            item = _CONTROL_PROCESSES.get(model) or {}
+            if item.get("cancel_requested"):
+                item.update({"starting": False, "phase": "启动已取消"})
+                return
         command, cwd = plugin.command(options)
         env = os.environ.copy()
         env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
@@ -112,11 +114,52 @@ def _start_controlled_job(model, options=None):
             )
         finally:
             log_handle.close()
+        with _CONTROL_LOCK:
+            item = _CONTROL_PROCESSES.get(model) or {}
+            if item.get("cancel_requested"):
+                process.terminate()
+                item.update({"process": process, "starting": False, "phase": "启动已取消"})
+            else:
+                item.update({"process": process, "starting": False, "phase": "运行中",
+                             "started_at": beijing_now(), "startup_error": ""})
+            _CONTROL_PROCESSES[model] = item
+    except Exception as exc:
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{beijing_now()} 启动失败：{type(exc).__name__}: {exc}\n")
+        with _CONTROL_LOCK:
+            item = _CONTROL_PROCESSES.get(model) or {}
+            item.update({"starting": False, "phase": "启动失败", "startup_error": str(exc)})
+            _CONTROL_PROCESSES[model] = item
+
+
+def _start_controlled_job(model, options=None):
+    options = options if isinstance(options, dict) else {}
+    if model not in MODEL_REGISTRY or not MODEL_REGISTRY[model]["supports_control"]:
+        raise ValueError("未知模型")
+    with _CONTROL_LOCK:
+        existing = _CONTROL_PROCESSES.get(model) or {}
+        current = existing.get("process")
+        if _process_alive(current):
+            return {
+                "running": True, "pid": current.pid,
+                "started_at": existing.get("started_at", ""), "log": str(existing.get("log", "")),
+            }
+        if existing.get("starting"):
+            return {"running": False, "starting": True, "phase": existing.get("phase", "正在启动"),
+                    "started_at": existing.get("started_at", ""), "log": str(existing.get("log", ""))}
+        CONTROL_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = CONTROL_RUNTIME_DIR / f"{model}.log"
+        plugin = MODEL_PLUGINS[model]
+        if not plugin.ready():
+            raise FileNotFoundError(f"{plugin.name} 运行配置不存在。")
         _CONTROL_PROCESSES[model] = {
-            "process": process, "started_at": beijing_now(), "log": log_path,
+            "process": None, "starting": True, "phase": "启动请求已接收",
+            "startup_error": "", "started_at": beijing_now(), "log": log_path,
         }
+        threading.Thread(target=_launch_controlled_job, args=(model, dict(options), log_path),
+                         name=f"{model}-control-launcher", daemon=True).start()
         return {
-            "running": True, "pid": process.pid,
+            "running": False, "starting": True, "phase": "启动请求已接收",
             "started_at": _CONTROL_PROCESSES[model]["started_at"], "log": str(log_path),
         }
 
@@ -125,6 +168,9 @@ def _stop_controlled_job(model):
     with _CONTROL_LOCK:
         item = _CONTROL_PROCESSES.get(model) or {}
         process = item.get("process")
+        if item.get("starting"):
+            item.update({"cancel_requested": True, "starting": False, "phase": "正在取消启动"})
+            return {"running": False, "starting": False, "message": "启动已取消。"}
         if not _process_alive(process):
             return {"running": False, "message": "当前没有由统一面板启动的任务。"}
         if os.name == "nt":
@@ -6356,6 +6402,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try:
                     self.send_json({"ok": True, "model": plugin.id, "questions": plugin.load_questions(),
                                     "question_mode": plugin.load_question_mode()})
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        activity_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/activity", self.path.split("?", 1)[0])
+        if activity_route:
+            plugin = MODEL_PLUGINS.get(activity_route.group(1))
+            if plugin is None:
+                self.send_json({"ok": False, "error": "未知模型"}, 404)
+            else:
+                try:
+                    params = parse_qs(urlparse(self.path).query)
+                    limit = max(1, min(safe_int((params.get("limit") or [40])[0]), 100))
+                    self.send_json(plugin.activity(limit))
                 except Exception as exc:
                     self.send_json({"ok": False, "error": str(exc)}, 500)
             return

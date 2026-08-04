@@ -70,6 +70,9 @@ type Analytics = {
 };
 type ControlState = {
   running: boolean;
+  starting?: boolean;
+  phase?: string;
+  startup_error?: string;
   ready: boolean;
   pid?: number;
   started_at?: string;
@@ -83,6 +86,21 @@ type AccountState = {
   mobile?: { masked?: string };
   web?: { masked?: string };
   location?: string;
+};
+type RemoteEvent = {
+  request_id: string;
+  status: "queued" | "processed" | "error";
+  source_device: string;
+  question: string;
+  received_at: string;
+  processed_at: string;
+  account_uid_masked?: string;
+  rows_written: number;
+  message?: string;
+};
+type RemoteActivity = {
+  queue: { queued: number; processed: number; errors: number };
+  events: RemoteEvent[];
 };
 type View = "overview" | "compare" | "sources" | "runs" | "control";
 type QuestionMode = "interleaved" | "sequential";
@@ -126,6 +144,9 @@ function timeText(value?: string) {
         hour: "2-digit",
         minute: "2-digit",
       });
+}
+function beijingTime(value?: string) {
+  return value ? value.slice(5, 16).replace("T", " ") : "等待接收";
 }
 
 function Empty({ children }: { children: string }) {
@@ -248,6 +269,40 @@ function Keywords({
   );
 }
 
+function RemoteTransferLog({ activity }: { activity?: RemoteActivity }) {
+  const queue = activity?.queue || { queued: 0, processed: 0, errors: 0 };
+  const events = activity?.events || [];
+  return (
+    <section className="remote-transfer">
+      <div className="remote-transfer-head">
+        <div>
+          <span className="live-dot" />
+          <b>实时回传日志</b>
+          <small>每 3 秒刷新 · 北京时间</small>
+        </div>
+        <div className="remote-counters">
+          <span>处理中<b>{queue.queued}</b></span>
+          <span>已入库<b>{queue.processed}</b></span>
+          <span className={queue.errors ? "danger" : ""}>异常<b>{queue.errors}</b></span>
+        </div>
+      </div>
+      <div className="remote-event-list">
+        {events.length ? events.map((event) => (
+          <div className={`remote-event ${event.status}`} key={`${event.status}-${event.request_id}`}>
+            <time>{beijingTime(event.processed_at || event.received_at)}</time>
+            <i>{event.status === "processed" ? "已入库" : event.status === "queued" ? "处理中" : "异常"}</i>
+            <div>
+              <b>{event.question || "未记录问题"}</b>
+              <small>{event.source_device}{event.account_uid_masked ? ` · UID ${event.account_uid_masked}` : ""}</small>
+            </div>
+            <strong>{event.status === "processed" ? `${event.rows_written} 条信源` : event.message || "等待写入正式数据"}</strong>
+          </div>
+        )) : <Empty>等待远端豆包数据回传</Empty>}
+      </div>
+    </section>
+  );
+}
+
 export function Dashboard() {
   const [view, setView] = useState<View>("overview");
   const [model, setModel] = useState("");
@@ -257,6 +312,8 @@ export function Dashboard() {
   const [control, setControl] = useState<Record<string, ControlState>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [accounts, setAccounts] = useState<Record<string, AccountState>>({});
+  const [startingModels, setStartingModels] = useState<Record<string, boolean>>({});
+  const [remoteActivity, setRemoteActivity] = useState<Record<string, RemoteActivity>>({});
   const [rounds, setRounds] = useState<Record<string, number>>({});
   const [questionModes, setQuestionModes] = useState<
     Record<string, QuestionMode>
@@ -344,6 +401,44 @@ export function Dashboard() {
     };
   }, [load]);
 
+  const remoteModelIds = analytics.model_catalog
+    .filter((item) => item.execution === "remote")
+    .map((item) => item.id)
+    .join(",");
+
+  useEffect(() => {
+    if (!remoteModelIds) return;
+    let active = true;
+    const ids = remoteModelIds.split(",");
+    const refresh = async () => {
+      const rows = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const response = await fetch(
+              `${apiBase()}/api/models/${id}/activity?limit=40&_=${Date.now()}`,
+              { cache: "no-store" },
+            );
+            return [id, response.ok ? await response.json() : undefined] as const;
+          } catch {
+            return [id, undefined] as const;
+          }
+        }),
+      );
+      if (active) {
+        setRemoteActivity((old) => ({
+          ...old,
+          ...Object.fromEntries(rows.filter((row) => row[1])),
+        }));
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [remoteModelIds]);
+
   const selectedModels = analytics.models;
   const totals = useMemo(
     () =>
@@ -400,7 +495,11 @@ export function Dashboard() {
     }
   }
   async function controlAction(modelId: string, action: "start" | "stop") {
-    setMessage(action === "start" ? "正在保存问题并启动…" : "正在停止任务…");
+    if (action === "start") {
+      setStartingModels((old) => ({ ...old, [modelId]: true }));
+      setControl((old) => ({ ...old, [modelId]: { running: false, ready: true, ...old[modelId], starting: true, phase: "正在保存问题并提交启动请求" } }));
+    }
+    setMessage(action === "start" ? "启动请求已接收，正在准备浏览器与账号校验…" : "正在停止任务…");
     try {
       if (action === "start") await saveQuestions(modelId);
       const response = await fetch(
@@ -423,6 +522,8 @@ export function Dashboard() {
       await load();
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "操作失败");
+    } finally {
+      if (action === "start") setStartingModels((old) => ({ ...old, [modelId]: false }));
     }
   }
 
@@ -878,9 +979,10 @@ export function Dashboard() {
                   const state = control[item.id];
                   const account = accounts[item.id];
                   const remote = item.execution === "remote";
+                  const starting = Boolean(state?.starting || startingModels[item.id]);
                   return (
                     <article
-                      className={`panel control-card ${state?.running ? "running" : ""}`}
+                      className={`panel control-card ${state?.running ? "running" : ""} ${starting ? "starting" : ""}`}
                       data-model-id={item.id}
                       key={item.id}
                     >
@@ -891,7 +993,9 @@ export function Dashboard() {
                           <span>
                             {remote
                               ? "● 远端采集 · 本机接收"
-                              : state?.running
+                              : starting
+                                ? `● ${state?.phase || "正在启动"}`
+                                : state?.running
                                 ? `● 运行中 · PID ${state.pid}`
                                 : state?.ready
                                   ? "● 配置就绪"
@@ -899,6 +1003,15 @@ export function Dashboard() {
                           </span>
                         </div>
                       </header>
+                      {!remote && (starting || state?.startup_error) && (
+                        <div className={`startup-feedback ${state?.startup_error ? "failed" : ""}`}>
+                          <span className={starting ? "startup-spinner" : ""} />
+                          <div>
+                            <b>{state?.startup_error || state?.phase || "正在启动"}</b>
+                            <small>{state?.startup_error ? "请修正后重新点击启动" : "Chrome 启动、账号校验完成后会自动运行采集脚本"}</small>
+                          </div>
+                        </div>
+                      )}
                       <label>
                         提问问题{" "}
                         <small>
@@ -1010,14 +1123,14 @@ export function Dashboard() {
                         </button>
                         <button
                           className="start"
-                          disabled={remote || state?.running || !state?.ready}
+                          disabled={remote || starting || state?.running || !state?.ready}
                           onClick={() => controlAction(item.id, "start")}
                         >
-                          {remote ? "请在远端启动" : "启动采集"}
+                          {remote ? "请在远端启动" : starting ? "正在启动…" : "启动采集"}
                         </button>
                         <button
                           className="stop"
-                          disabled={remote || !state?.running}
+                          disabled={remote || (!starting && !state?.running)}
                           onClick={() => controlAction(item.id, "stop")}
                         >
                           停止
@@ -1028,6 +1141,9 @@ export function Dashboard() {
                           ? "远端离线时自动排队，联网后续传"
                           : `日志：${state?.log || "启动后生成"}`}
                       </small>
+                      {remote && (
+                        <RemoteTransferLog activity={remoteActivity[item.id]} />
+                      )}
                     </article>
                   );
                 })}

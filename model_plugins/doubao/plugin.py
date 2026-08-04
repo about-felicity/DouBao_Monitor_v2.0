@@ -14,6 +14,7 @@ from monitor_core.analytics import load_doubao_runs
 REFS = ROOT / "doubao_refs_result.csv"
 ANSWERS = ROOT / "doubao_answers_result.csv"
 RUNS_CACHE_LOCK = threading.Lock()
+RECEIVER_QUEUE = ROOT / "doubao_mumu_controller" / "lan_receiver_queue"
 
 
 def _stamp(path: Path) -> int:
@@ -76,3 +77,48 @@ class Plugin(ModelPlugin):
     def analytics_runs(self) -> list[dict[str, Any]]:
         with RUNS_CACHE_LOCK:
             return _cached_runs(_stamp(REFS), _stamp(ANSWERS))
+
+    def activity(self, limit: int = 40) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 40), 100))
+        folders = {
+            "queued": RECEIVER_QUEUE / "inbox",
+            "processed": RECEIVER_QUEUE / "done",
+            "error": RECEIVER_QUEUE / "errors",
+        }
+        events: list[dict[str, Any]] = []
+        counts = {"queued": 0, "processed": 0, "errors": 0}
+        for status, folder in folders.items():
+            paths = list(folder.glob("*.json")) if folder.exists() else []
+            counts["errors" if status == "error" else status] = len(paths)
+            for path in sorted(paths, key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]:
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
+                save = value.get("save") if isinstance(value.get("save"), dict) else {}
+                events.append({
+                    "request_id": str(value.get("request_id") or path.stem),
+                    "status": status,
+                    "source_device": str(value.get("source_device") or payload.get("source_device") or "远端设备"),
+                    "question": str(value.get("question") or payload.get("question") or ""),
+                    "received_at": str(value.get("received_at") or ""),
+                    "processed_at": str(value.get("processed_at") or ""),
+                    "account_uid_masked": str(value.get("account_uid_masked") or payload.get("account_uid_masked") or ""),
+                    "rows_written": _saved_rows(save),
+                    "message": str(value.get("last_error") or ""),
+                })
+        events.sort(key=lambda item: item["processed_at"] or item["received_at"], reverse=True)
+        return {"ok": True, "model": self.id, "queue": counts, "events": events[:limit]}
+
+
+def _saved_rows(save: dict[str, Any]) -> int:
+    raw = save.get("output")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            raw = {}
+    if not isinstance(raw, dict):
+        return 0
+    return int(raw.get("rows_written") or raw.get("count") or 0)

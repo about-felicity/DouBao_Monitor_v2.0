@@ -4,14 +4,109 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ctypes
+import os
 import re
+import socket
+import subprocess
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from pathlib import Path
 from typing import Any
 
 import uiautomator2 as u2
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _chrome_executable() -> Path:
+    candidates = (
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise RuntimeError("找不到 Google Chrome，请先安装 Chrome")
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _restore_process_window(process_id: int) -> bool:
+    if os.name != "nt":
+        return False
+    user32 = ctypes.windll.user32
+    handles: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def collect(hwnd, _lparam):
+        owner = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == process_id and user32.IsWindow(hwnd):
+            handles.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(callback_type(collect), 0)
+    if not handles:
+        return False
+    for hwnd in handles:
+        user32.ShowWindowAsync(hwnd, 9)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def ensure_deepseek_chrome(port: int = 9333) -> dict[str, Any]:
+    """Launch the dedicated browser when absent and always restore its visible window."""
+    launched = False
+    chrome = _chrome_executable()
+
+    def launch_window() -> None:
+        chrome = _chrome_executable()
+        subprocess.Popen(
+            [str(chrome), f"--remote-debugging-port={port}", "--remote-allow-origins=*",
+             "--no-first-run", "--no-default-browser-check", f"--user-data-dir={BASE_DIR / 'chrome_profile'}",
+             "--new-window", "https://chat.deepseek.com/"],
+            cwd=str(BASE_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    if not _port_open(port):
+        launch_window()
+        launched = True
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not _port_open(port):
+            time.sleep(0.3)
+        if not _port_open(port):
+            raise RuntimeError("DeepSeek 专用 Chrome 启动超时")
+    collector = DeepSeekWebCollector(port)
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            collector._call("Page.bringToFront", timeout=10)
+            processes = collector.browser_call("SystemInfo.getProcessInfo", timeout=10).get("processInfo") or []
+            browser_pid = next((int(item.get("id")) for item in processes if item.get("type") == "browser"), 0)
+            if not browser_pid or not _restore_process_window(browser_pid):
+                raise RuntimeError("没有找到 DeepSeek Chrome 可见窗口")
+            collector._call("Page.bringToFront", timeout=10)
+            return {"launched": launched, "port": port}
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                launch_window()
+                launched = True
+                time.sleep(2)
+                collector = DeepSeekWebCollector(port)
+    raise RuntimeError(f"DeepSeek Chrome 已启动，但无法唤醒窗口：{last_error}") from last_error
 
 
 SNAPSHOT_JS = r"""
@@ -20,14 +115,17 @@ SNAPSHOT_JS = r"""
   const body=clean(document.body?.innerText||"");
   const links=[...document.querySelectorAll("a[href]")].filter(a=>/^https?:\/\//.test(a.href)&&!a.href.includes("chat.deepseek.com/a/chat/s/"));
   const busy=!!document.querySelector('[aria-label*="停止"],[data-testid*="stop"],.ds-icon-button--rotating');
-  return {url:location.href,title:document.title,body,linkCount:new Set(links.map(a=>a.href)).size,busy,hasTextarea:!!document.querySelector("textarea")};
+  return {url:location.href,title:document.title,body,linkCount:new Set(links.map(a=>a.href)).size,busy,hasTextarea:!!document.querySelector("textarea"),readyState:document.readyState};
 })()
 """
 
 COLLECT_JS = r"""
 (async () => {
   const sleep=(ms)=>new Promise(r=>setTimeout(r,ms)); const clean=(s)=>String(s||"").replace(/\s+/g," ").trim(); const seen=new Map();
-  const add=()=>{for(const a of document.querySelectorAll("a[href]")){const url=a.href||"";if(!/^https?:\/\//.test(url)||url.includes("chat.deepseek.com/a/chat/s/"))continue;if(!seen.has(url))seen.set(url,{title:clean(a.innerText||a.textContent||a.title||a.getAttribute("aria-label"))||"DeepSeek citation",url});}};
+  const titleOf=(a)=>{const lines=String(a.innerText||a.textContent||a.title||a.getAttribute("aria-label")||"").split(/\n+/).map(clean).filter(Boolean);const n=lines.findIndex((line,i)=>/^\d+$/.test(line)&&i+1<lines.length);return (n>=0?lines[n+1]:clean(lines.join(" ")))||"DeepSeek citation";};
+  const add=()=>{for(const a of document.querySelectorAll("a[href]")){const url=a.href||"";if(!/^https?:\/\//.test(url)||url.includes("chat.deepseek.com/a/chat/s/"))continue;const item={title:titleOf(a),url};const old=seen.get(url);if(!old||item.title.length>old.title.length)seen.set(url,item);}};
+  const sourceSummary=[...document.querySelectorAll("span")].find(el=>/^\s*\d+\s*个网页\s*$/.test(el.textContent||""));
+  if(sourceSummary){sourceSummary.click();await sleep(1000);}
   window.scrollTo(0,0); await sleep(250); add();
   for(let i=0;i<18;i++){window.scrollBy(0,Math.max(450,Math.floor(innerHeight*.7)));await sleep(180);add();}
   window.scrollTo(0,document.body.scrollHeight);await sleep(300);add();
@@ -55,6 +153,7 @@ class DeepSeekAppController:
     NEW_CHAT = "开启新对话"
     SEND = "发送"
     INPUT_HINTS = ("发消息或按住说话", "发消息")
+    BUSY_HINTS = ("停止生成", "停止回答", "正在生成", "思考中", "搜索中")
 
     def __init__(self, serial: str = "127.0.0.1:16384", connect_timeout: int = 15):
         self.serial = serial
@@ -127,6 +226,69 @@ class DeepSeekAppController:
             raise RuntimeError("问题已写入，但没有找到 DeepSeek App 发送按钮")
         send.click()
 
+    def wait_for_answer(self, question: str, timeout: int = 180, stable_seconds: int = 4) -> dict[str, Any]:
+        """Wait until the App has displayed this question and returned to an idle, stable state."""
+        deadline = time.time() + timeout
+        stable_since: float | None = None
+        previous_signature = ""
+        saw_question = False
+        last: dict[str, Any] = {}
+        ignored = {"快速模式", "深度思考", "智能搜索", "上传文件", "切换至语音", "转至底部"}
+        compact_question = re.sub(r"\s+", "", question)
+        topic = re.sub(r"^(请|麻烦|帮我|给我|推荐|介绍|想要|需要)+", "", compact_question)
+        topic = re.sub(r"^(一款|一个|一种)", "", topic)
+
+        while time.time() < deadline:
+            root = ET.fromstring(self.d.dump_hierarchy(compressed=False))
+            texts: list[str] = []
+            descriptions: list[str] = []
+            for node in root.iter():
+                resource_id = str(node.attrib.get("resource-id") or "")
+                if resource_id.startswith("com.android.systemui:"):
+                    continue
+                text = str(node.attrib.get("text") or "").strip()
+                description = str(node.attrib.get("content-desc") or "").strip()
+                if text:
+                    texts.append(text)
+                if description:
+                    descriptions.append(description)
+
+            combined = "\n".join(texts + descriptions)
+            compact_combined = re.sub(r"\s+", "", combined)
+            saw_question = saw_question or compact_question in compact_combined or (
+                len(topic) >= 2 and topic in compact_combined
+            )
+            busy = any(hint in combined for hint in self.BUSY_HINTS)
+            input_ready = any(hint in combined for hint in self.INPUT_HINTS)
+            content = [item for item in texts if item not in ignored and item not in self.INPUT_HINTS]
+            signature = "\n".join(content)
+            has_answer = any(
+                len(item) >= 20 and item != question and not item.startswith("已阅读")
+                for item in content
+            )
+            last = {
+                "busy": busy,
+                "input_ready": input_ready,
+                "saw_question": saw_question,
+                "has_answer": has_answer,
+                "text_length": len(signature),
+            }
+
+            if saw_question and has_answer and input_ready and not busy:
+                if signature == previous_signature:
+                    stable_since = stable_since or time.time()
+                    if time.time() - stable_since >= stable_seconds:
+                        return last
+                else:
+                    previous_signature = signature
+                    stable_since = None
+            else:
+                previous_signature = signature
+                stable_since = None
+            time.sleep(1)
+
+        raise TimeoutError("等待 DeepSeek App 回答完成超时：" + json.dumps(last, ensure_ascii=False))
+
     def account_identity(self) -> dict[str, str]:
         self.d.app_start(self.PACKAGE, stop=False)
         time.sleep(0.8)
@@ -198,6 +360,27 @@ class DeepSeekWebCollector:
         finally:
             ws.close()
 
+    def browser_call(self, method: str, params: dict | None = None, timeout: int = 30) -> dict:
+        try:
+            import websocket
+        except ImportError as exc:
+            raise RuntimeError("缺少 websocket-client，请运行 pip install -r requirements.txt") from exc
+        url = str(self._json("/json/version").get("webSocketDebuggerUrl") or "")
+        if not url:
+            raise RuntimeError("DeepSeek Chrome 没有浏览器级调试连接")
+        ws = websocket.create_connection(url, timeout=timeout)
+        try:
+            ws.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+            while True:
+                message = json.loads(ws.recv())
+                if message.get("id") != 1:
+                    continue
+                if message.get("error"):
+                    raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
+                return message.get("result") or {}
+        finally:
+            ws.close()
+
     def evaluate(self, expression: str, timeout: int = 30) -> Any:
         result = self._call("Runtime.evaluate", {"expression": expression, "awaitPromise": True, "returnByValue": True}, timeout)
         return (result.get("result") or {}).get("value")
@@ -205,23 +388,43 @@ class DeepSeekWebCollector:
     def _navigate(self, url: str) -> None:
         self._call("Page.navigate", {"url": url})
 
-    def collect_latest(self, question: str, timeout: int = 180, stable_seconds: int = 8) -> dict:
-        """等待 App 会话同步到网页，打开最新会话后只做读取。"""
+    def latest_chat(self, timeout: int = 20) -> dict[str, Any]:
+        """Return the first conversation in today's sidebar without opening it."""
+        self._navigate("https://chat.deepseek.com/")
         deadline = time.time() + timeout
         last: Any = None
         while time.time() < deadline:
-            self._navigate("https://chat.deepseek.com/")
-            time.sleep(3)
-            latest = self.evaluate(LATEST_CHAT_JS)
+            time.sleep(1)
+            last = self.evaluate(LATEST_CHAT_JS)
+            if isinstance(last, dict) and last.get("ok") and last.get("href"):
+                return last
+        if isinstance(last, dict) and not last.get("ok"):
+            return last
+        raise TimeoutError("读取 DeepSeek 网页最新会话超时：" + json.dumps(last, ensure_ascii=False)[:500])
+
+    def collect_latest(self, question: str, timeout: int = 180, stable_seconds: int = 8,
+                       previous_chat_url: str = "") -> dict:
+        """等待 App 会话同步到网页，打开最新会话后只做读取。"""
+        deadline = time.time() + timeout
+        last: Any = None
+        previous_chat_url = str(previous_chat_url or "").split("?", 1)[0].rstrip("/")
+        while time.time() < deadline:
+            latest = self.latest_chat(timeout=min(20, max(3, int(deadline - time.time()))))
             last = latest
             if isinstance(latest, dict) and latest.get("ok") and latest.get("href"):
-                self._navigate(str(latest["href"]))
+                latest_url = str(latest["href"]).split("?", 1)[0].rstrip("/")
+                if previous_chat_url and latest_url == previous_chat_url:
+                    time.sleep(2)
+                    continue
+                self._navigate(latest_url)
                 time.sleep(2)
                 snapshot = self.evaluate(SNAPSHOT_JS)
                 last = snapshot
                 if isinstance(snapshot, dict) and question in str(snapshot.get("body") or ""):
-                    return self.wait_and_collect(timeout=max(10, int(deadline - time.time())), stable_seconds=stable_seconds, expected_question=question)
-            time.sleep(3)
+                    result = self.wait_and_collect(timeout=max(10, int(deadline - time.time())), stable_seconds=stable_seconds, expected_question=question)
+                    result["conversation_url"] = latest_url
+                    return result
+            time.sleep(2)
         raise TimeoutError("等待 DeepSeek App 会话同步到网页超时：" + json.dumps(last, ensure_ascii=False)[:500])
 
     def account_identity(self) -> dict[str, str]:
@@ -247,7 +450,7 @@ class DeepSeekWebCollector:
     def wait_and_collect(self, timeout: int = 180, stable_seconds: int = 8, expected_question: str = "") -> dict:
         deadline = time.time() + timeout
         stable_since = None
-        previous = ""
+        previous: tuple[str, int] = ("", -1)
         last = None
         while time.time() < deadline:
             time.sleep(2)
@@ -257,9 +460,10 @@ class DeepSeekWebCollector:
             body = str(last.get("body") or "")
             if expected_question and expected_question not in body:
                 stable_since = None
-                previous = body
+                previous = (body, int(last.get("linkCount") or 0))
                 continue
-            if body and body == previous and not last.get("busy"):
+            fingerprint = (body, int(last.get("linkCount") or 0))
+            if body and fingerprint == previous and not last.get("busy") and last.get("readyState") == "complete":
                 stable_since = stable_since or time.time()
                 if time.time() - stable_since >= stable_seconds:
                     result = self.evaluate(COLLECT_JS, timeout=60)
@@ -267,5 +471,5 @@ class DeepSeekWebCollector:
                         return result
             else:
                 stable_since = None
-                previous = body
+                previous = fingerprint
         raise TimeoutError("等待 DeepSeek 回答完成超时：" + json.dumps(last, ensure_ascii=False)[:500])

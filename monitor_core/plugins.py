@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +33,10 @@ class ModelPlugin:
 
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         raise NotImplementedError
+
+    def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
+        if progress:
+            progress("正在准备运行环境")
 
     def load_questions(self) -> list[str]:
         raise NotImplementedError
@@ -64,6 +68,10 @@ class ModelPlugin:
     def analytics_runs(self) -> list[dict[str, Any]]:
         from monitor_core.analytics import load_generic_runs
         return load_generic_runs(self.id, self.stats())
+
+    def activity(self, limit: int = 40) -> dict[str, Any]:
+        return {"ok": True, "model": self.id,
+                "queue": {"queued": 0, "processed": 0, "errors": 0}, "events": []}
 
 
 def _load_plugin(path: Path) -> ModelPlugin:

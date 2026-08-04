@@ -23,6 +23,12 @@ test("采集控制包含问题计划、账号校验及启停能力", async () =>
   assert.match(source, /校验模拟器 \/ 网页账号/);
   assert.match(source, /account-check/);
   assert.match(source, /api\/control\/\$\{modelId\}/);
+  assert.match(source, /实时回传日志/);
+  assert.match(source, /api\/models\/\$\{id\}\/activity/);
+  assert.match(source, /每 3 秒刷新/);
+  assert.match(source, /启动请求已接收/);
+  assert.match(source, /正在启动…/);
+  assert.match(source, /Chrome 启动、账号校验完成后会自动运行采集脚本/);
 });
 
 test("信源分析区区分文章视频并显示每日 Top 10 与关键词", async () => {

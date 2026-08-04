@@ -3,6 +3,9 @@ doubao_mumu_controller/doubao_api_keys.env
 doubao_mumu_controller/doubao_lan_pairing.json
 doubao_mumu_controller/doubao_remote_sync_config.json
 doubao_mumu_controller/doubao_lan_receiver_config.json
+doubao_mumu_controller/lan_receiver_queue/
+doubao_mumu_controller/lan_upload_outbox/
+doubao_mumu_controller/lan_upload_sent/
 **/.env
 **/*cookie*
 **/*session*
@@ -85,6 +88,7 @@ deepseek*
 *deepseek*
 !deepseek_monitor/
 !deepseek_monitor/**
+!/test_deepseek_pipeline.py
 !model_plugins/
 !model_plugins/*/
 !model_plugins/*/plugin.py

@@ -132,6 +132,10 @@ def main() -> int:
         started = now()
         sent = False
         try:
+            # 发送前记住网页当前第一条会话。采集时必须等到一个新的会话出现，
+            # 这样即使连续询问同一个问题，也不会误抓上一次的旧回答。
+            baseline = web.latest_chat(timeout=min(30, args.timeout))
+            previous_chat_url = str(baseline.get("href") or "")
             # 唯一允许发送问题的入口是 MuMu DeepSeek App；网页端只读取同步结果。
             app.send(question)
             sent = True
@@ -140,24 +144,39 @@ def main() -> int:
             state.update({"last_sent_at": sent_at, "next_send_at": sent_at + delay, "next_index": index})
             save_state(state_path, state)
             logger.info("第 %d 轮已发送；下次随机间隔 %.1f 分钟", index + 1, delay / 60)
+            logger.info("第 %d 轮正在等待模拟器端回答加载完成", index + 1)
+            app_completion: dict = {}
+            app_error = ""
+            try:
+                app_completion = app.wait_for_answer(question, args.timeout, min(5, args.stable_seconds))
+                logger.info("第 %d 轮模拟器端回答已完成，正在等待网页端同步最新会话并采集信源", index + 1)
+            except Exception as exc:
+                app_error = str(exc)
+                logger.warning("第 %d 轮模拟器端回答异常，直接跳过网页采集：%s", index + 1, exc)
             result: dict = {}
-            web_error = ""
-            for web_attempt in range(1, args.max_web_retries + 1):
-                try:
-                    result = web.collect_latest(question, args.timeout, args.stable_seconds)
-                    web_error = ""
-                    break
-                except Exception as exc:
-                    web_error = str(exc)
-                    logger.warning("第 %d 轮网页抓取第 %d/%d 次失败：%s", index + 1, web_attempt, args.max_web_retries, exc)
-                    if web_attempt < args.max_web_retries:
-                        wait_until(time.time() + max(30.0, args.retry_wait), logger)
+            web_error = app_error
+            if not app_error:
+                for web_attempt in range(1, args.max_web_retries + 1):
+                    try:
+                        result = web.collect_latest(
+                            question, args.timeout, args.stable_seconds,
+                            previous_chat_url=previous_chat_url,
+                        )
+                        web_error = ""
+                        break
+                    except Exception as exc:
+                        web_error = str(exc)
+                        logger.warning("第 %d 轮网页抓取第 %d/%d 次失败：%s", index + 1, web_attempt, args.max_web_retries, exc)
+                        if web_attempt < args.max_web_retries:
+                            wait_until(time.time() + max(30.0, args.retry_wait), logger)
             answer = answer_from_page(str(result.get("body") or ""), question)
             skip_reason = web_error or invalid_answer_reason(answer)
             append_jsonl(Path(args.results), {"status": "skipped" if skip_reason else "success", "skip_reason": skip_reason,
                 "round": index + 1, "serial": args.serial, "question": question, "reply": answer,
                 "web_body": result.get("body", ""), "sources": [] if skip_reason else result.get("sources", []),
-                "page_url": result.get("url", ""), "web_error": web_error, "started_at": started, "finished_at": now()})
+                "page_url": result.get("conversation_url") or result.get("url", ""), "web_error": web_error,
+                "app_error": app_error, "app_completion": app_completion,
+                "started_at": started, "finished_at": now()})
             if skip_reason:
                 logger.warning("第 %d 轮模型回答无效，已直接跳过：%s", index + 1, skip_reason)
             index += 1
