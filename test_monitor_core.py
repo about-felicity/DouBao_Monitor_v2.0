@@ -70,6 +70,15 @@ class PluginCommandTests(unittest.TestCase):
         command, _ = plugin.command({"rounds": 2, "question_mode": "interleaved"})
         self.assertEqual(command[command.index("--rounds-per-question") + 1], "2")
         self.assertEqual(command[command.index("--question-mode") + 1], "interleaved")
+        self.assertEqual(command[command.index("--min-interval") + 1], "60")
+        self.assertEqual(command[command.index("--max-interval") + 1], "600")
+
+    def test_yuanbao_command_uses_a_humanized_random_interval(self):
+        command, _ = discover_plugins()["yuanbao"].command(
+            {"rounds": 2, "question_mode": "interleaved"}
+        )
+        self.assertEqual(command[command.index("--wait") + 1], "30")
+        self.assertEqual(command[command.index("--random-wait") + 1], "90")
 
 
 if __name__ == "__main__":

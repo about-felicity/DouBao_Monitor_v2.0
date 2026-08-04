@@ -125,7 +125,7 @@ def main() -> int:
 
     completed = 0
     while not STOP and completed < target_rounds:
-        question = schedule[completed % len(schedule)]
+        question = schedule[index % len(schedule)]
         wait_until(float(state.get("next_send_at") or 0), logger)
         if STOP:
             break

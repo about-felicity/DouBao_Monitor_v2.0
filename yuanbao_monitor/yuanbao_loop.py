@@ -168,7 +168,7 @@ def worker(
     index = start_index
     end_index = start_index + len(schedule)
     while not STOP_EVENT.is_set() and (args.forever or index < end_index):
-        position = (index - start_index) % len(schedule)
+        position = index % len(schedule)
         question = schedule[position]
         attempt = 0
         while not STOP_EVENT.is_set():
@@ -177,6 +177,15 @@ def worker(
             try:
                 if controller is None:
                     controller = YuanbaoController(serial=serial, connect_timeout=args.connect_timeout)
+                previous_conversation = ""
+                if args.collect_web:
+                    from collector import YuanbaoSourceCollector
+                    if collector is None:
+                        device_number = args.device_order.get(serial, 0)
+                        port = args.chrome_port + device_number
+                        profile = BASE_DIR / "chrome_profile_auto" if len(args.device_order) == 1 else BASE_DIR / "chrome_profiles" / tag
+                        collector = YuanbaoSourceCollector(debug_port=port, user_data_dir=str(profile))
+                    previous_conversation = collector.latest_conversation_reference(refresh=True)
                 xml_path = diagnostic_dir / f"reply_{index + 1:06d}.xml"
                 xml_path.parent.mkdir(parents=True, exist_ok=True)
                 logger.info("[%s] 第 %d 轮，第 %d 次尝试：%s", serial, index + 1, attempt, question)
@@ -218,6 +227,7 @@ def worker(
                                 question, output_path=str(web_path),
                                 wait_reply_timeout=args.web_timeout,
                                 extra={"serial": serial, "round": index + 1},
+                                previous_conversation=previous_conversation,
                             )
                             if not web_result.get("error"):
                                 break
@@ -229,13 +239,17 @@ def worker(
                                 web_result = {"error": str(web_exc)}
                                 break
                             STOP_EVENT.wait(args.retry_wait)
+                web_skip_reason = str(web_result.get("error") or "") if args.collect_web else ""
+                if args.collect_web and not web_skip_reason:
+                    web_skip_reason = invalid_answer_reason(str(web_result.get("body") or ""))
                 record = {
-                    "status": "success", "serial": serial, "round": index + 1,
+                    "status": "skipped" if web_skip_reason else "success", "skip_reason": web_skip_reason,
+                    "serial": serial, "round": index + 1,
                     "schedule_index": position, "question": question, "reply": reply,
                     "reply_length": len(reply), "attempt": attempt,
                     "started_at": started, "finished_at": now(), "xml": str(xml_path),
                     "web_body": web_result.get("body", ""),
-                    "sources": web_result.get("sources", []),
+                    "sources": [] if web_skip_reason else web_result.get("sources", []),
                     "web_error": web_result.get("error"),
                 }
                 append_jsonl(Path(args.results), record)

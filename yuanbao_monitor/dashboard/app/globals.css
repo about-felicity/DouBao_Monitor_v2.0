@@ -892,6 +892,35 @@ button {
 .startup-feedback > div small {
   display: block;
 }
+.runtime-feedback {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 11px;
+  border-radius: 9px;
+  background: #eef9f5;
+  color: #176a50;
+}
+.runtime-feedback > div b,
+.runtime-feedback > div small {
+  display: block;
+}
+.runtime-feedback > div b {
+  font-size: 10px;
+}
+.runtime-feedback > div small {
+  margin-top: 3px;
+  font-size: 8px;
+}
+.runtime-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #28a77b;
+  box-shadow: 0 0 0 4px #28a77b1f;
+}
 .startup-feedback > div b {
   font-size: 10px;
 }

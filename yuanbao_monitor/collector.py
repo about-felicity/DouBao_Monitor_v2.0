@@ -126,6 +126,45 @@ class YuanbaoSourceCollector:
         print("未能点击最新对话")
         return False
 
+    @staticmethod
+    def _conversation_reference(element: WebElement) -> str:
+        return str(
+            element.get_attribute("dt-cid")
+            or element.get_attribute("data-item-id")
+            or element.get_attribute("id")
+            or element.text
+            or ""
+        ).strip()
+
+    def latest_conversation_reference(self, refresh: bool = False, timeout: int = 20) -> str:
+        if refresh:
+            self.ensure_chat_page()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            items = self._safe_finds(By.CSS_SELECTOR, ".yb-recent-conv-list__item")
+            if items:
+                return self._conversation_reference(items[0])
+            time.sleep(1)
+        return ""
+
+    def click_new_conversation(self, previous_reference: str, timeout: int = 90) -> str:
+        """Wait for a newly synced first conversation and click only that item."""
+        deadline = time.time() + timeout
+        last_refresh = 0.0
+        while time.time() < deadline:
+            items = self._safe_finds(By.CSS_SELECTOR, ".yb-recent-conv-list__item")
+            if items:
+                reference = self._conversation_reference(items[0])
+                if reference and (not previous_reference or reference != previous_reference):
+                    items[0].click()
+                    time.sleep(2)
+                    return reference
+            if time.time() - last_refresh >= 4:
+                self.driver.refresh()
+                last_refresh = time.time()
+            time.sleep(1)
+        return ""
+
     def wait_for_chat_loaded(self, timeout: int = 60) -> bool:
         print("等待右侧聊天内容加载...")
         start = time.time()
@@ -424,6 +463,7 @@ class YuanbaoSourceCollector:
         output_path: str = "result.json",
         wait_reply_timeout: int = 120,
         extra: Optional[Dict] = None,
+        previous_conversation: str = "",
     ) -> Dict:
         collect_start = datetime.now().astimezone().isoformat()
         result = {
@@ -441,7 +481,12 @@ class YuanbaoSourceCollector:
         result.update(extra or {})
 
         self.ensure_chat_page()
-        self.click_latest_conversation(timeout=20)
+        conversation_reference = self.click_new_conversation(previous_conversation, timeout=wait_reply_timeout)
+        if not conversation_reference:
+            result["error"] = "new_conversation_sync_timeout"
+            self._save(result, output_path)
+            return result
+        result["conversation_reference"] = conversation_reference
 
         if not self.wait_for_chat_loaded(timeout=60):
             print("未能在 Chrome 中加载聊天内容，保存空结果")
@@ -459,6 +504,14 @@ class YuanbaoSourceCollector:
             return result
 
         result["body"] = self.extract_body(last_msg)
+        try:
+            chat_text = self.driver.find_element(By.CSS_SELECTOR, "#chat-content").text
+        except Exception:
+            chat_text = result["body"]
+        if question and question not in chat_text:
+            result["error"] = "conversation_question_mismatch"
+            self._save(result, output_path)
+            return result
         print(f"正文长度: {len(result['body'])} 字符")
 
         print("收集信源...")

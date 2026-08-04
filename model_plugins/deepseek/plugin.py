@@ -27,9 +27,7 @@ class Plugin(ModelPlugin):
         return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "60", "--max-interval", "600"], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
-        if str(ROOT / "deepseek_monitor") not in sys.path:
-            sys.path.insert(0, str(ROOT / "deepseek_monitor"))
-        from controller import ensure_deepseek_chrome
+        from deepseek_monitor.controller import ensure_deepseek_chrome
         if progress:
             progress("正在启动或唤醒 DeepSeek 专用 Chrome")
         ensure_deepseek_chrome(9333)
@@ -48,9 +46,7 @@ class Plugin(ModelPlugin):
         self.questions.write_text("\n".join(questions) + "\n", encoding="utf-8")
 
     def account_check(self) -> dict[str, Any]:
-        if str(ROOT / "deepseek_monitor") not in sys.path:
-            sys.path.insert(0, str(ROOT / "deepseek_monitor"))
-        from controller import DeepSeekAppController, DeepSeekWebCollector, ensure_deepseek_chrome
+        from deepseek_monitor.controller import DeepSeekAppController, DeepSeekWebCollector, ensure_deepseek_chrome
         ensure_deepseek_chrome(9333)
         app = DeepSeekAppController("127.0.0.1:16384")
         web = DeepSeekWebCollector(9333)

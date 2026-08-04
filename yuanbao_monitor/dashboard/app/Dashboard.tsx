@@ -1012,6 +1012,15 @@ export function Dashboard() {
                           </div>
                         </div>
                       )}
+                      {!remote && state?.running && state?.phase && (
+                        <div className="runtime-feedback">
+                          <span className="runtime-dot" />
+                          <div>
+                            <b>{state.phase}</b>
+                            <small>状态每 2 秒从采集日志同步</small>
+                          </div>
+                        </div>
+                      )}
                       <label>
                         提问问题{" "}
                         <small>

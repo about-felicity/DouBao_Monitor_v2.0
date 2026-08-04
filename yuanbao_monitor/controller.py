@@ -1,5 +1,6 @@
 import re
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
@@ -204,6 +205,7 @@ class YuanbaoController:
         """轮询等待回复生成完成，返回最终的xml"""
         print("等待回复生成...")
         last_xml = ""
+        last_reply = ""
         stable_count = 0
         start = time.time()
         loading_markers = (
@@ -218,19 +220,54 @@ class YuanbaoController:
             visible_reply = self.extract_visible_reply(current_xml, question)
             is_loading = any(marker in current_xml for marker in loading_markers)
             has_answer = len(visible_reply) >= 30
+            input_ready = False
+            try:
+                root = ET.fromstring(current_xml)
+                input_ready = any(
+                    node.attrib.get("resource-id") == self.INPUT_ID
+                    and node.attrib.get("enabled", "true") == "true"
+                    for node in root.iter()
+                )
+            except ET.ParseError:
+                pass
 
-            if current_xml == last_xml and has_answer and not is_loading:
+            if visible_reply == last_reply and has_answer and input_ready and not is_loading:
                 stable_count += 1
-                if stable_count >= 2:
+                if stable_count >= 3:
                     print(f"检测到内容已稳定，用时 {time.time()-start:.1f} 秒")
                     return current_xml
             else:
                 stable_count = 0
 
             last_xml = current_xml
+            last_reply = visible_reply
 
         print("等待超时，返回当前状态")
         return last_xml
+
+    def account_identity(self) -> dict[str, str]:
+        """Read the visible Yuanbao nickname from the App's profile page."""
+        self.d.app_start(self.PKG, stop=False)
+        time.sleep(1)
+        profile = self.d(text="我们")
+        if not profile.exists(timeout=3):
+            raise RuntimeError("元宝 App 没有找到“我们”账号页入口")
+        profile.click()
+        time.sleep(1)
+        root = ET.fromstring(self.d.dump_hierarchy(compressed=False))
+        candidates = []
+        for node in root.iter():
+            text = str(node.attrib.get("text") or "").strip()
+            resource_id = str(node.attrib.get("resource-id") or "")
+            bounds = [int(value) for value in re.findall(r"\d+", node.attrib.get("bounds") or "")]
+            if (text and not resource_id.startswith("com.android.systemui:")
+                    and len(bounds) == 4 and bounds[1] < 180 and 2 <= len(text) <= 40):
+                candidates.append(text)
+        self.d.press("back")
+        if not candidates:
+            raise RuntimeError("元宝 App 账号页没有识别到昵称")
+        name = candidates[-1]
+        return {"name": name, "masked": name[:2] + "***"}
 
     def ask(self, question: str, save_xml_path: str = "yuanbao_ui_reply.xml") -> str:
         """

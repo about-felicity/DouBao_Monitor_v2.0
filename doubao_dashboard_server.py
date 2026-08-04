@@ -63,6 +63,22 @@ def _process_alive(process):
     return process is not None and process.poll() is None
 
 
+def _latest_control_log_message(path, offset=0):
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(max(0, int(offset or 0)))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except (OSError, TypeError):
+        return ""
+    for line in reversed(lines[-80:]):
+        text = str(line or "").strip()
+        if not text:
+            continue
+        text = re.sub(r"^\d{4}-\d{2}-\d{2}[^[]*\[(?:INFO|WARNING|ERROR|DEBUG)\]\s*", "", text)
+        return text[:240]
+    return ""
+
+
 def _control_status():
     result = {}
     with _CONTROL_LOCK:
@@ -70,14 +86,27 @@ def _control_status():
             item = _CONTROL_PROCESSES.get(model) or {}
             process = item.get("process")
             running = _process_alive(process)
+            stopped_by_user = bool(item.get("stopped_by_user"))
+            if running:
+                phase = _latest_control_log_message(item.get("log"), item.get("log_offset")) or str(item.get("phase") or "运行中")
+            elif item.get("starting") or item.get("startup_error"):
+                phase = str(item.get("phase") or "")
+            elif stopped_by_user:
+                phase = "已手动停止"
+            elif process is not None and process.returncode == 0:
+                phase = "任务已完成"
+            elif process is not None:
+                phase = f"运行异常退出（退出码 {process.returncode}）"
+            else:
+                phase = str(item.get("phase") or "")
             result[model] = {
                 "running": running,
                 "starting": bool(item.get("starting")),
-                "phase": str(item.get("phase") or ("运行中" if running else "")),
+                "phase": phase,
                 "startup_error": str(item.get("startup_error") or ""),
                 "pid": process.pid if running else None,
                 "started_at": item.get("started_at", ""),
-                "last_exit_code": None if running or process is None else process.returncode,
+                "last_exit_code": None if running or process is None or stopped_by_user else process.returncode,
                 "log": str(item.get("log", "")),
                 "ready": MODEL_PLUGINS[model].ready(),
                 "name": definition["name"],
@@ -149,12 +178,17 @@ def _start_controlled_job(model, options=None):
                     "started_at": existing.get("started_at", ""), "log": str(existing.get("log", ""))}
         CONTROL_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         log_path = CONTROL_RUNTIME_DIR / f"{model}.log"
+        try:
+            log_offset = log_path.stat().st_size
+        except OSError:
+            log_offset = 0
         plugin = MODEL_PLUGINS[model]
         if not plugin.ready():
             raise FileNotFoundError(f"{plugin.name} 运行配置不存在。")
         _CONTROL_PROCESSES[model] = {
             "process": None, "starting": True, "phase": "启动请求已接收",
             "startup_error": "", "started_at": beijing_now(), "log": log_path,
+            "stopped_by_user": False, "log_offset": log_offset,
         }
         threading.Thread(target=_launch_controlled_job, args=(model, dict(options), log_path),
                          name=f"{model}-control-launcher", daemon=True).start()
@@ -169,10 +203,12 @@ def _stop_controlled_job(model):
         item = _CONTROL_PROCESSES.get(model) or {}
         process = item.get("process")
         if item.get("starting"):
-            item.update({"cancel_requested": True, "starting": False, "phase": "正在取消启动"})
+            item.update({"cancel_requested": True, "starting": False, "phase": "正在取消启动",
+                         "stopped_by_user": True})
             return {"running": False, "starting": False, "message": "启动已取消。"}
         if not _process_alive(process):
             return {"running": False, "message": "当前没有由统一面板启动的任务。"}
+        item.update({"stopped_by_user": True, "phase": "正在停止"})
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],

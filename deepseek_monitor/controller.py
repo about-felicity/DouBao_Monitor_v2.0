@@ -53,16 +53,19 @@ def _restore_process_window(process_id: int) -> bool:
         owner = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
         if owner.value == process_id and user32.IsWindow(hwnd):
-            handles.append(int(hwnd))
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, len(class_name))
+            if class_name.value == "Chrome_WidgetWin_1":
+                handles.append(int(hwnd))
         return True
 
     user32.EnumWindows(callback_type(collect), 0)
     if not handles:
         return False
-    for hwnd in handles:
-        user32.ShowWindowAsync(hwnd, 9)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
+    hwnd = handles[0]
+    user32.ShowWindowAsync(hwnd, 9)
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
     return True
 
 

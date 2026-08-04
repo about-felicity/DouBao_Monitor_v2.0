@@ -3,6 +3,8 @@ import socket
 import subprocess
 import sys
 import time
+import json
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +49,56 @@ def connect_chrome(debug_port: int = 9222) -> webdriver.Chrome:
     return driver
 
 
+def ensure_yuanbao_chrome(
+    debug_port: int = 9222,
+    chrome_path: Optional[str] = None,
+    user_data_dir: Optional[str] = None,
+    start_url: str = "https://yuanbao.tencent.com/chat/",
+) -> dict:
+    """Ensure the dedicated Yuanbao Chrome exists without waiting for ChromeDriver."""
+    if _wait_for_port("127.0.0.1", debug_port, timeout=0.5):
+        return {"launched": False, "port": debug_port}
+    exe = chrome_path or _find_chrome_executable()
+    if not exe:
+        raise RuntimeError("找不到 Chrome / Edge 可执行文件")
+    profile = Path(user_data_dir or Path(__file__).resolve().parent / "chrome_profile_auto")
+    profile.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        [exe, f"--remote-debugging-port={debug_port}", "--remote-allow-origins=*",
+         f"--user-data-dir={profile.resolve()}", "--no-first-run", "--no-default-browser-check",
+         "--new-window", start_url],
+        cwd=str(Path(__file__).resolve().parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if not _wait_for_port("127.0.0.1", debug_port, timeout=20):
+        raise RuntimeError(f"元宝 Chrome 调试端口 {debug_port} 启动超时")
+    return {"launched": True, "port": debug_port}
+
+
+def yuanbao_web_identity(debug_port: int = 9222) -> dict[str, str]:
+    """Read the visible signed-in nickname through the Chrome debug page."""
+    try:
+        import websocket
+        pages = json.load(urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=5))
+        page = next(p for p in pages if p.get("type") == "page" and "yuanbao.tencent.com" in p.get("url", ""))
+        ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
+        try:
+            expression = """(()=>{const e=document.querySelector('.yb-nav__user,.yb-common-nav__ft__avatar');return {url:location.href,name:String(e?.innerText||e?.textContent||'').trim(),body:String(document.body?.innerText||'').slice(0,500)}})()"""
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}))
+            while True:
+                message = json.loads(ws.recv())
+                if message.get("id") == 1:
+                    value = (message.get("result", {}).get("result", {}).get("value") or {})
+                    break
+        finally:
+            ws.close()
+    except Exception as exc:
+        raise RuntimeError(f"无法读取元宝网页账号：{exc}") from exc
+    name = str(value.get("name") or "").strip()
+    if not name:
+        raise RuntimeError("元宝网页尚未登录或没有显示账号昵称")
+    return {"name": name, "masked": name[:2] + "***"}
+
+
 def connect_or_launch_chrome(
     debug_port: int = 9222,
     chrome_path: Optional[str] = None,
@@ -62,7 +114,8 @@ def connect_or_launch_chrome(
         user_data_dir: Chrome 用户数据目录，None 则使用临时目录
         start_url: 启动后打开的页面
     """
-    # 1) 先尝试连接已有实例
+    ensure_yuanbao_chrome(debug_port, chrome_path, user_data_dir, start_url)
+    # 1) 连接已存在的专用实例
     try:
         driver = connect_chrome(debug_port)
         print(f"已连接到现有 Chrome（端口 {debug_port}）")
@@ -70,7 +123,7 @@ def connect_or_launch_chrome(
     except Exception as e:
         print(f"未检测到现有 Chrome 调试端口: {e}")
 
-    # 2) 自动查找 Chrome 路径
+    # 2) 自动查找 Chrome 路径（旧环境兜底）
     exe = chrome_path or _find_chrome_executable()
     if not exe:
         raise RuntimeError(

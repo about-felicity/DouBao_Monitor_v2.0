@@ -1,0 +1,1 @@
+"""Tencent Yuanbao collection package."""
