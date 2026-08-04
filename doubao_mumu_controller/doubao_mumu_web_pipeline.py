@@ -1531,7 +1531,7 @@ def grab_and_save(
     sync: dict[str, Any] = {"enabled": False, "status": "standalone"}
     if doubao_lan_client is not None:
         try:
-            sync = doubao_lan_client.enqueue_and_flush(payload, logger)
+            sync = doubao_lan_client.enqueue_for_background_upload(payload, logger)
         except Exception as exc:
             # 本地保存已经成功；主机暂不可达时由客户端离线队列保障，不能丢轮次。
             sync = {"enabled": True, "status": "queued_offline", "error": str(exc)}

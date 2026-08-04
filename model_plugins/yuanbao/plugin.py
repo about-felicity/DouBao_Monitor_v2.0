@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from monitor_core.plugins import ModelPlugin, ROOT
+from monitor_core.scheduling import normalize_question_mode
 
 
 class Plugin(ModelPlugin):
@@ -22,7 +23,9 @@ class Plugin(ModelPlugin):
 
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds", str(rounds), "--resume", "--collect-web", "--max-retries", "3"], self.runner.parent
+        mode = normalize_question_mode(options.get("question_mode"))
+        runner_mode = "cross" if mode == "interleaved" else "sequential"
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "3"], self.runner.parent
 
     def load_questions(self) -> list[str]:
         return [line.strip() for line in self.questions.read_text(encoding="utf-8-sig").splitlines() if line.strip() and not line.lstrip().startswith("#")]

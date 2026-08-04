@@ -6,5 +6,5 @@
   "receiver_host": "",
   "token": "从主面板电脑 doubao_lan_pairing.json 复制",
   "device_name": "远端豆包电脑",
-  "upload_timeout": 20
+  "upload_timeout": 3
 }

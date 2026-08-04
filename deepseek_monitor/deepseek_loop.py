@@ -14,7 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 from controller import DeepSeekAppController, DeepSeekWebCollector
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from monitor_core.quality import invalid_answer_reason
+from monitor_core.scheduling import build_question_schedule
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -73,6 +76,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="DeepSeek 网页监控")
     parser.add_argument("--questions-file", default=str(BASE_DIR / "product.txt"))
     parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--rounds-per-question", type=int, help="每个问题执行的轮数")
+    parser.add_argument("--question-mode", choices=("interleaved", "sequential"), default="interleaved")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--min-interval", type=float, default=60, help="实际发送之间的最短秒数，最低 60")
     parser.add_argument("--max-interval", type=float, default=600, help="实际发送之间的最长秒数")
@@ -86,6 +91,8 @@ def main() -> int:
     parser.add_argument("--state", default=str(BASE_DIR / "deepseek_state.json"))
     parser.add_argument("--log", default=str(BASE_DIR / "deepseek_loop.log"))
     args = parser.parse_args()
+    if args.rounds_per_question is not None and args.rounds_per_question < 1:
+        raise SystemExit("--rounds-per-question 必须大于 0")
     if args.rounds < 1:
         raise SystemExit("--rounds 必须大于 0")
     args.min_interval = max(60.0, args.min_interval)
@@ -96,6 +103,12 @@ def main() -> int:
     questions = load_questions(Path(args.questions_file))
     if not questions:
         raise SystemExit("问题列表为空")
+    schedule = (
+        build_question_schedule(questions, args.rounds_per_question, args.question_mode)
+        if args.rounds_per_question is not None
+        else questions
+    )
+    target_rounds = len(schedule) if args.rounds_per_question is not None else args.rounds
     state_path = Path(args.state)
     state = load_state(state_path) if args.resume else {}
     index = int(state.get("next_index") or 0)
@@ -111,8 +124,8 @@ def main() -> int:
         signal.signal(signal.SIGTERM, stop_handler)
 
     completed = 0
-    while not STOP and completed < args.rounds:
-        question = questions[index % len(questions)]
+    while not STOP and completed < target_rounds:
+        question = schedule[completed % len(schedule)]
         wait_until(float(state.get("next_send_at") or 0), logger)
         if STOP:
             break

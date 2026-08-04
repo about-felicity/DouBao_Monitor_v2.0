@@ -40,6 +40,20 @@ class ModelPlugin:
     def save_questions(self, questions: list[str]) -> None:
         raise NotImplementedError
 
+    def load_question_mode(self) -> str:
+        from monitor_core.scheduling import normalize_question_mode
+        path = ROOT / "runtime" / "unified_control" / f"{self.id}_question_mode.txt"
+        try:
+            return normalize_question_mode(path.read_text(encoding="utf-8"))
+        except OSError:
+            return "interleaved"
+
+    def save_question_mode(self, mode: str) -> None:
+        from monitor_core.scheduling import normalize_question_mode
+        path = ROOT / "runtime" / "unified_control" / f"{self.id}_question_mode.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(normalize_question_mode(mode) + "\n", encoding="utf-8")
+
     def account_check(self) -> dict[str, Any]:
         return {"ok": False, "status": "unsupported", "message": "该模型尚未实现统一账号校验"}
 

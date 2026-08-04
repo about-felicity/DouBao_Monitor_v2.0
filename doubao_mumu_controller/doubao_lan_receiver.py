@@ -73,10 +73,10 @@ def atomic_json(path: Path, value: Any) -> None:
     os.close(fd)
     temporary = Path(temporary_name)
     try:
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -74,6 +74,7 @@ def normalize_source(raw: dict[str, Any]) -> dict[str, str]:
 
 def load_doubao_runs(refs_path: Path, answers_path: Path) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
+    source_urls: dict[str, set[str]] = {}
     if answers_path.exists():
         with answers_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
@@ -82,6 +83,7 @@ def load_doubao_runs(refs_path: Path, answers_path: Path) -> list[dict[str, Any]
                     "question": str(row.get("question") or "未知问题"), "finished_at": str(row.get("captured_at") or row.get("run_time") or row.get("extracted_at") or ""),
                     "day": beijing_day(row.get("captured_at") or row.get("run_time") or ""), "serial": str(row.get("source_device") or row.get("mumu_serial") or "远端豆包"),
                     "answer": str(row.get("answer_text") or ""), "status": "success", "sources": []}
+                source_urls[key] = set()
     if refs_path.exists():
         with refs_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
@@ -91,7 +93,9 @@ def load_doubao_runs(refs_path: Path, answers_path: Path) -> list[dict[str, Any]
                     "day": beijing_day(row.get("captured_at") or row.get("run_time") or ""), "serial": str(row.get("source_device") or row.get("mumu_serial") or "远端豆包"),
                     "answer": "", "status": "success", "sources": []})
                 source = normalize_source(row)
-                if source["canonical_url"] and source["canonical_url"] not in {item["canonical_url"] for item in run["sources"]}:
+                seen = source_urls.setdefault(key, set())
+                if source["canonical_url"] and source["canonical_url"] not in seen:
+                    seen.add(source["canonical_url"])
                     run["sources"].append(source)
     return sorted(grouped.values(), key=lambda item: item["sequence"])
 

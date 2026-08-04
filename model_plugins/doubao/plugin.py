@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from monitor_core.analytics import load_doubao_runs
 
 REFS = ROOT / "doubao_refs_result.csv"
 ANSWERS = ROOT / "doubao_answers_result.csv"
+RUNS_CACHE_LOCK = threading.Lock()
 
 
 def _stamp(path: Path) -> int:
@@ -52,6 +54,16 @@ class Plugin(ModelPlugin):
         value["questions"] = [{"text": question, "repeat": old.get(question, 1)} for question in questions]
         self.config.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def load_question_mode(self) -> str:
+        from monitor_core.scheduling import normalize_question_mode
+        return normalize_question_mode(self._config().get("question_mode"))
+
+    def save_question_mode(self, mode: str) -> None:
+        from monitor_core.scheduling import normalize_question_mode
+        value = self._config()
+        value["question_mode"] = normalize_question_mode(mode)
+        self.config.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def account_check(self) -> dict[str, Any]:
         if not self.readiness_path.exists():
             return {"ok": False, "status": "not_checked", "message": "请先在远端豆包控制端执行账号检测"}
@@ -62,4 +74,5 @@ class Plugin(ModelPlugin):
                 "checked_at": str(value.get("updated_at") or ""), "location": "remote"}
 
     def analytics_runs(self) -> list[dict[str, Any]]:
-        return _cached_runs(_stamp(REFS), _stamp(ANSWERS))
+        with RUNS_CACHE_LOCK:
+            return _cached_runs(_stamp(REFS), _stamp(ANSWERS))

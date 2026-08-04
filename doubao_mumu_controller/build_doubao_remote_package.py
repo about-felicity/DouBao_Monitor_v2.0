@@ -65,6 +65,7 @@ CONTROLLER_FILES = [
     "open_control_panel.cmd",
     "run_scheduled_doubao_job.bat",
     "远端电脑一键启动.bat",
+    "远端豆包采集并回传.bat",
     "remote_one_click.cmd",
     "README.md",
 ]
@@ -187,6 +188,13 @@ def build(
         "call \"open_control_panel.cmd\"\r\n",
         encoding="ascii",
     )
+    capture_launcher = package_root / "一键执行豆包采集并回传.bat"
+    capture_launcher.write_text(
+        "@echo off\r\n"
+        "cd /d \"%~dp0monitor\\doubao_mumu_controller\"\r\n"
+        "call \"remote_one_click.cmd\" --capture-only\r\n",
+        encoding="ascii",
+    )
     readme = package_root / "使用说明.txt"
     readme.write_text(
         "1. 新电脑只需安装 Google Chrome 和 MuMu；包内已带便携 Python、"
@@ -205,6 +213,7 @@ def build(
         "6. 若要把豆包结果汇总到主电脑统一面板，请把主电脑生成的"
         "doubao_lan_pairing.json 拖到 monitor\\doubao_mumu_controller\\"
         "远端豆包一键配置回传.bat；"
+        "配置完成后可双击根目录的‘一键执行豆包采集并回传.bat’立即执行；"
         "网络中断时结果进入离线队列，恢复后自动续传。未配置时仍可独立运行。\n",
         encoding="utf-8",
     )

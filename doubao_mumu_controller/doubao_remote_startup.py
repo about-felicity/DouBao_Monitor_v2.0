@@ -156,11 +156,27 @@ def check_main_receiver() -> dict[str, object]:
         return {"ok": False, "disabled": False, "error": str(exc)}
 
 
+def start_sync_agent() -> bool:
+    try:
+        import doubao_lan_client
+
+        return doubao_lan_client.ensure_sync_agent_running()
+    except Exception as exc:
+        log(f"后台回传代理启动失败，采集数据仍会保留在待传队列：{exc}")
+        return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="远端电脑豆包采集端一键启动。")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--no-open-dashboard", action="store_true")
-    parser.add_argument("--panel-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--panel-only", action="store_true")
+    mode.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="只执行豆包采集并回传，不启动本地面板。",
+    )
     return parser.parse_args()
 
 
@@ -171,6 +187,11 @@ def main() -> int:
     log("环境自检通过：" + json.dumps(environment, ensure_ascii=False))
     receiver = check_main_receiver()
     if receiver.get("disabled"):
+        if args.capture_only:
+            raise RuntimeError(
+                "尚未配置主电脑回传地址。请先把 doubao_lan_pairing.json "
+                "拖到‘远端豆包一键配置回传.bat’。"
+            )
         log("当前为本机模式，结果直接写入本机实时面板。")
     elif receiver.get("ok"):
         log("主机接收接口连通。")
@@ -189,9 +210,14 @@ def main() -> int:
         )
         return 0
 
-    start_dashboard()
-    if not args.no_open_dashboard:
-        webbrowser.open("http://127.0.0.1:8765/")
+    if not receiver.get("disabled"):
+        started = start_sync_agent()
+        log("后台回传代理已启动，每 5 秒检查待传队列。" if started else "后台回传代理已经运行。")
+
+    if not args.capture_only:
+        start_dashboard()
+        if not args.no_open_dashboard:
+            webbrowser.open("http://127.0.0.1:8765/")
     if args.panel_only:
         panel_python = Path(sys.executable).with_name("pythonw.exe")
         if not panel_python.exists():
@@ -208,11 +234,14 @@ def main() -> int:
             "启用绿色开始按钮。"
         )
         return 0
-    log(
-        "开始整批任务。程序将自动识别 MuMu 账号并启动调试 Chrome，"
-        "无需手动安装插件，抓取器会自动注入网页；"
-        "若网页未登录同一账号，请在自动打开的 Chrome 中完成登录。"
-    )
+    if args.capture_only:
+        log("开始仅豆包采集并回传；不启动本地数据面板。")
+    else:
+        log(
+            "开始整批任务。程序将自动识别 MuMu 账号并启动调试 Chrome，"
+            "无需手动安装插件，抓取器会自动注入网页；"
+            "若网页未登录同一账号，请在自动打开的 Chrome 中完成登录。"
+        )
     child_env = os.environ.copy()
     child_env["PYTHONIOENCODING"] = "utf-8"
     child_env["PYTHONUTF8"] = "1"

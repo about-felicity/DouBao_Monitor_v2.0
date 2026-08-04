@@ -146,4 +146,9 @@ python .\doubao_mumu_web_pipeline.py --question "推荐一款染发剂" --rounds
 
 - `lan_upload_outbox`：断网时待续传的数据。
 - `lan_upload_sent`：主机已确认接收的回执。
+- `doubao_lan_sync_agent.log`：每 5 秒后台回传、确认和重试日志。
 - `doubao_remote_startup.log`：一键启动和环境自检日志。
+
+远端完成配对后，也可以直接双击 `远端豆包采集并回传.bat`。该入口只执行
+豆包采集任务并把结果回传主电脑，不启动远端数据面板；主电脑暂时离线时，
+结果保留在 `lan_upload_outbox`，网络恢复后的下一次运行会自动续传。

@@ -22,6 +22,7 @@ from controller import YuanbaoController
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from monitor_core.quality import invalid_answer_reason
+from monitor_core.scheduling import build_question_schedule
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -165,8 +166,9 @@ def worker(
     controller: YuanbaoController | None = None
     collector = None
     index = start_index
-    while not STOP_EVENT.is_set() and (args.forever or index < len(schedule)):
-        position = index % len(schedule)
+    end_index = start_index + len(schedule)
+    while not STOP_EVENT.is_set() and (args.forever or index < end_index):
+        position = (index - start_index) % len(schedule)
         question = schedule[position]
         attempt = 0
         while not STOP_EVENT.is_set():
@@ -276,6 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adb", default=str(DEFAULT_ADB))
     parser.add_argument("--forever", action="store_true")
     parser.add_argument("--rounds", type=int, help="精确运行轮数；问题不足时循环使用")
+    parser.add_argument("--rounds-per-question", type=int, help="每个问题执行的轮数")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--wait", type=float, default=3, help="成功轮次间固定等待秒数")
     parser.add_argument("--random-wait", type=float, default=0, help="额外随机等待上限")
@@ -300,7 +303,15 @@ def main() -> int:
     schedule = build_schedule(plan["questions"], args.mode or plan.get("mode", "cross"))
     if not schedule:
         raise SystemExit("问题列表为空")
-    if args.rounds is not None:
+    if args.rounds_per_question is not None:
+        if args.rounds_per_question < 1:
+            raise SystemExit("--rounds-per-question 必须大于 0")
+        schedule = build_question_schedule(
+            [str(item["text"]) for item in plan["questions"]],
+            args.rounds_per_question,
+            "sequential" if (args.mode or plan.get("mode")) == "sequential" else "interleaved",
+        )
+    elif args.rounds is not None:
         if args.rounds < 1:
             raise SystemExit("--rounds 必须大于 0")
         schedule = [schedule[index % len(schedule)] for index in range(args.rounds)]

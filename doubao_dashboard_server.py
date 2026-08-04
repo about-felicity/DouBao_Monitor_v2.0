@@ -54,6 +54,9 @@ RESERVED_MODEL_SLOTS = 1
 
 _CONTROL_LOCK = threading.Lock()
 _CONTROL_PROCESSES = {}
+_ANALYTICS_LOCK = threading.RLock()
+_ANALYTICS_CACHE = {}
+_ANALYTICS_BUILDING = set()
 
 
 def _process_alive(process):
@@ -142,15 +145,67 @@ def _yuanbao_stats():
     return MODEL_PLUGINS["yuanbao"].stats()
 
 
-def _unified_analytics(params):
+def _analytics_data_version():
+    paths = [Path(CSV_PATH), Path(ANSWER_CSV_PATH)]
+    for plugin in MODEL_PLUGINS.values():
+        for attribute in ("results", "dashboard"):
+            path = getattr(plugin, attribute, None)
+            if path:
+                paths.append(Path(path))
+    version = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            version.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            version.append((str(path), 0, 0))
+    return tuple(version)
+
+
+def _build_unified_analytics(cache_key, version):
     runs_by_model = {model_id: plugin.analytics_runs() for model_id, plugin in MODEL_PLUGINS.items()}
-    return build_analytics(
+    result = build_analytics(
         MODEL_REGISTRY,
         runs_by_model,
-        question=(params.get("question") or [""])[0],
-        date=(params.get("date") or [""])[0],
-        model=(params.get("model") or [""])[0],
+        question=cache_key[0], date=cache_key[1], model=cache_key[2],
     )
+    with _ANALYTICS_LOCK:
+        _ANALYTICS_CACHE[cache_key] = (version, result)
+        _ANALYTICS_BUILDING.discard(cache_key)
+    return result
+
+
+def _refresh_unified_analytics(cache_key, version):
+    try:
+        _build_unified_analytics(cache_key, version)
+    except Exception:
+        with _ANALYTICS_LOCK:
+            _ANALYTICS_BUILDING.discard(cache_key)
+
+
+def _unified_analytics(params):
+    cache_key = (
+        (params.get("question") or [""])[0],
+        (params.get("date") or [""])[0],
+        (params.get("model") or [""])[0],
+    )
+    version = _analytics_data_version()
+    with _ANALYTICS_LOCK:
+        cached = _ANALYTICS_CACHE.get(cache_key)
+        if cached and cached[0] == version:
+            return cached[1]
+        if cached:
+            if cache_key not in _ANALYTICS_BUILDING:
+                _ANALYTICS_BUILDING.add(cache_key)
+                threading.Thread(
+                    target=_refresh_unified_analytics,
+                    args=(cache_key, version),
+                    name="unified-analytics-refresh",
+                    daemon=True,
+                ).start()
+            return cached[1]
+        _ANALYTICS_BUILDING.add(cache_key)
+        return _build_unified_analytics(cache_key, version)
 
 # User-owned products.  Matching requires the brand plus one distinguishing
 # product phrase so generic category articles are not labelled as owned content.
@@ -6260,7 +6315,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not questions:
                     raise ValueError("至少保留一个有效问题")
                 plugin.save_questions(questions)
-                self.send_json({"ok": True, "model": model, "questions": plugin.load_questions()})
+                if "question_mode" in payload:
+                    plugin.save_question_mode(payload.get("question_mode"))
+                self.send_json({"ok": True, "model": model, "questions": plugin.load_questions(),
+                                "question_mode": plugin.load_question_mode()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 400)
             return
@@ -6296,7 +6354,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "未知模型"}, 404)
             else:
                 try:
-                    self.send_json({"ok": True, "model": plugin.id, "questions": plugin.load_questions()})
+                    self.send_json({"ok": True, "model": plugin.id, "questions": plugin.load_questions(),
+                                    "question_mode": plugin.load_question_mode()})
                 except Exception as exc:
                     self.send_json({"ok": False, "error": str(exc)}, 500)
             return

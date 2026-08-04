@@ -13,7 +13,7 @@ $config = [ordered]@{
     receiver_host = [string]$pairing.receiver_host
     token = [string]$pairing.token
     device_name = $env:COMPUTERNAME
-    upload_timeout = 20
+    upload_timeout = 3
 }
 $config | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root "doubao_remote_sync_config.json") -Encoding UTF8
-Write-Host "远端豆包数据回传已配置。下一轮采集会自动上传，离线数据会保留后续续传。"
+Write-Host "远端豆包数据回传已配置。后台每 5 秒检查待传队列，网络异常不会阻塞采集。"

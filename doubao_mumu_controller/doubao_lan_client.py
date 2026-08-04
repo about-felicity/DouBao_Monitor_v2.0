@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import time
 from typing import Any
@@ -21,6 +23,8 @@ CONFIG_PATH = BASE_DIR / "doubao_remote_sync_config.json"
 OUTBOX_DIR = BASE_DIR / "lan_upload_outbox"
 SENT_DIR = BASE_DIR / "lan_upload_sent"
 OUTBOX_LOCK = BASE_DIR / ".lan_upload_outbox.lock"
+SYNC_AGENT_LOG = BASE_DIR / "doubao_lan_sync_agent.log"
+SYNC_AGENT_GUARD_PORT = 18790
 logger = logging.getLogger("doubao_lan_client")
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -40,10 +44,10 @@ def atomic_json(path: Path, value: Any) -> None:
     os.close(fd)
     temporary = Path(temporary_name)
     try:
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -130,7 +134,9 @@ def post_envelope(
         raise ValueError("远端同步密钥无效。")
     data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    timeout = float(config.get("upload_timeout") or 20)
+    # Uploading happens in a background agent. Keep each endpoint attempt
+    # short so a broken network cannot stall the retry queue for long.
+    timeout = min(5.0, max(1.0, float(config.get("upload_timeout") or 3)))
     failures: list[str] = []
     for receiver_url in receiver_urls:
         request = urllib.request.Request(
@@ -150,6 +156,12 @@ def post_envelope(
                 value = json.loads(response.read().decode("utf-8"))
             if not isinstance(value, dict) or not value.get("ok"):
                 raise RuntimeError("主机接收接口未确认数据。")
+            if str(value.get("request_id") or "") != str(
+                envelope.get("request_id") or ""
+            ):
+                raise RuntimeError("主机确认的 request_id 与待传数据不一致。")
+            if value.get("status") not in {"queued", "processed"}:
+                raise RuntimeError("主机没有确认数据已进入可靠队列。")
             return {**value, "receiver_url": receiver_url}
         except Exception as exc:
             failures.append(f"{receiver_url}: {type(exc).__name__}: {exc}")
@@ -168,30 +180,26 @@ def flush_outbox(
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
     SENT_DIR.mkdir(parents=True, exist_ok=True)
     lock_fd = None
-    deadline = time.monotonic() + 30
-    while lock_fd is None:
+    try:
+        lock_fd = os.open(
+            OUTBOX_LOCK,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+    except FileExistsError:
         try:
-            lock_fd = os.open(
-                OUTBOX_LOCK,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            )
-            os.write(lock_fd, str(os.getpid()).encode("ascii"))
-        except FileExistsError:
-            try:
-                if time.time() - OUTBOX_LOCK.stat().st_mtime > 300:
-                    OUTBOX_LOCK.unlink()
-                    continue
-            except FileNotFoundError:
-                continue
-            if time.monotonic() >= deadline:
-                return {
-                    "enabled": True,
-                    "sent": 0,
-                    "pending": len(list(OUTBOX_DIR.glob("*.json"))),
-                    "failures": 0,
-                    "last_error": "另一个账号正在上传队列，本账号数据已安全排队",
-                }
-            time.sleep(0.2)
+            if time.time() - OUTBOX_LOCK.stat().st_mtime > 300:
+                OUTBOX_LOCK.unlink()
+                return flush_outbox(active_logger, max_items=max_items)
+        except FileNotFoundError:
+            return flush_outbox(active_logger, max_items=max_items)
+        return {
+            "enabled": True,
+            "sent": 0,
+            "pending": len(list(OUTBOX_DIR.glob("*.json"))),
+            "failures": 0,
+            "last_error": "同步代理正在上传，当前调用立即返回",
+        }
     sent = 0
     failures = 0
     last_error = ""
@@ -240,19 +248,87 @@ def flush_outbox(
             pass
 
 
-def enqueue_and_flush(
+def sync_agent_running() -> bool:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind(("127.0.0.1", SYNC_AGENT_GUARD_PORT))
+        return False
+    except OSError:
+        return True
+    finally:
+        probe.close()
+
+
+def ensure_sync_agent_running() -> bool:
+    config = load_config()
+    if not config.get("enabled") or sync_agent_running():
+        return False
+    log_handle = SYNC_AGENT_LOG.open("ab")
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--watch", "--interval", "5"],
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
+                else 0
+            ),
+        )
+    finally:
+        log_handle.close()
+    return True
+
+
+def enqueue_for_background_upload(
     payload: dict[str, Any],
     target_logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     path, queued = enqueue(payload)
     if path is None:
         return queued
-    flushed = flush_outbox(target_logger)
+    ensure_sync_agent_running()
     return {
         **queued,
-        "flush": flushed,
-        "status": "sent" if flushed.get("sent") else "queued_offline",
+        "status": "queued_for_background_upload",
     }
+
+
+def enqueue_and_flush(
+    payload: dict[str, Any],
+    target_logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible alias; network I/O is intentionally asynchronous."""
+    return enqueue_for_background_upload(payload, target_logger)
+
+
+def watch_outbox(interval: float = 5.0) -> int:
+    guard = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        guard.bind(("127.0.0.1", SYNC_AGENT_GUARD_PORT))
+    except OSError:
+        logger.info("豆包回传同步代理已经运行，本进程退出。")
+        guard.close()
+        return 0
+    logger.info("豆包回传同步代理已启动，检查间隔 %.1f 秒。", interval)
+    try:
+        while True:
+            result = flush_outbox(max_items=100)
+            if result.get("sent") or result.get("failures"):
+                logger.info(
+                    "回传检查：sent=%s pending=%s failures=%s error=%s",
+                    result.get("sent", 0),
+                    result.get("pending", 0),
+                    result.get("failures", 0),
+                    result.get("last_error", ""),
+                )
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        guard.close()
 
 
 def health_check() -> dict[str, Any]:
@@ -283,6 +359,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="上传远端豆包抓取离线队列。")
     parser.add_argument("--flush", action="store_true")
     parser.add_argument("--health", action="store_true")
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--interval", type=float, default=5.0)
     return parser.parse_args()
 
 
@@ -292,6 +370,8 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args = parse_args()
+    if args.watch:
+        return watch_outbox(min(300.0, max(1.0, args.interval)))
     if args.health:
         value = health_check()
         print(json.dumps(value, ensure_ascii=False, indent=2))
