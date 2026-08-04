@@ -146,6 +146,22 @@ LATEST_CHAT_JS = r"""
 """
 
 
+def _new_chat_point(xml: str, width: int, height: int, description: str = "开启新对话") -> tuple[int, int] | None:
+    """Locate only the top-right new-chat plus, never the upload plus near the composer."""
+    root = ET.fromstring(xml)
+    for node in root.iter():
+        if str(node.attrib.get("content-desc") or "").strip() != description:
+            continue
+        bounds = [int(value) for value in re.findall(r"\d+", node.attrib.get("bounds") or "")]
+        if len(bounds) != 4:
+            continue
+        center_x = (bounds[0] + bounds[2]) // 2
+        center_y = (bounds[1] + bounds[3]) // 2
+        if center_x >= int(width * 0.75) and center_y <= int(height * 0.20):
+            return center_x, center_y
+    return None
+
+
 class DeepSeekAppController:
     """只在 MuMu DeepSeek App 中新建会话和发送问题。"""
 
@@ -195,12 +211,18 @@ class DeepSeekAppController:
         raise RuntimeError("没有找到 DeepSeek App 的“智能搜索”开关")
 
     def new_chat(self) -> None:
-        button = self.d(description=self.NEW_CHAT)
-        if button.exists(timeout=3):
-            button.click()
-            time.sleep(1)
+        width, height = self.d.window_size()
+        point = _new_chat_point(
+            self.d.dump_hierarchy(compressed=False), width, height, self.NEW_CHAT
+        )
+        if point is None:
+            # DeepSeek 偶尔不暴露无障碍节点；右上角位置固定，且与底部上传加号相距很远。
+            point = (width - max(24, int(width * 0.065)), max(48, int(height * 0.075)))
+        self.d.click(*point)
+        time.sleep(1)
+        if any(self.d(text=hint).exists for hint in self.INPUT_HINTS) or self.d(className="android.widget.EditText").exists:
             return
-        raise RuntimeError("没有找到 DeepSeek App 的“开启新对话”按钮")
+        raise RuntimeError("已点击 DeepSeek App 右上角新会话按钮，但没有进入可提问状态")
 
     def send(self, question: str) -> None:
         self.ensure_ready()

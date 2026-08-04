@@ -20,6 +20,13 @@ class _FakeDevice:
 
 
 class DeepSeekAppCompletionTests(unittest.TestCase):
+    def test_new_chat_locator_accepts_top_right_plus_and_rejects_composer_plus(self):
+        xml = """<hierarchy>
+          <node content-desc='上传文件' bounds='[402,889][437,925]' />
+          <node content-desc='开启新对话' bounds='[487,55][520,88]' />
+        </hierarchy>"""
+        self.assertEqual(controller._new_chat_point(xml, 540, 960), (503, 71))
+
     def test_completed_mobile_answer_must_be_idle_stable_and_match_topic(self):
         xml = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
         <hierarchy>
