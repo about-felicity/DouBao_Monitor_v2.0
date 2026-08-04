@@ -633,6 +633,9 @@ button {
   margin-left: 5px;
   color: var(--ink);
 }
+.compare-source-tops { display: grid; gap: 10px; margin-top: 15px; }
+.daily-source-group + .daily-source-group { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+.daily-source-group > h3 { margin: 0 0 10px; font-size: 12px; }
 .source-pair,
 .keyword-pair {
   display: grid;
@@ -720,6 +723,25 @@ button {
   color: var(--muted);
   font-size: 8px;
 }
+.owned-source { display: inline-block; margin-top: 5px; padding: 3px 6px; border-radius: 5px; background: #fff1db; color: #98601d; font-size: 8px; font-style: normal; font-weight: 800; }
+.analysis-note { display: flex; gap: 12px; align-items: baseline; margin-bottom: 16px; background: #eef9f5; }
+.analysis-note b { color: var(--green); font-size: 11px; }
+.analysis-note span { color: var(--muted); font-size: 9px; line-height: 1.7; }
+.brand-section + .brand-section { margin-top: 16px; }
+.brand-kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.brand-kpis span { padding: 11px; border-radius: 9px; background: #f4f7f5; color: var(--muted); font-size: 9px; }
+.brand-kpis b { color: var(--ink); font-size: 15px; }
+.trend-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.trend-block { min-width: 0; margin-top: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: #fbfcfb; }
+.trend-block h3 { margin: 0; font-size: 12px; }
+.trend-block > small { display: block; margin-top: 4px; color: var(--muted); font-size: 8px; }
+.trend-table { overflow: auto; margin-top: 10px; max-height: 410px; }
+.trend-table table { width: 100%; border-collapse: collapse; font-size: 9px; }
+.trend-table th { position: sticky; top: 0; padding: 8px; background: #f1f5f3; color: var(--muted); text-align: left; white-space: nowrap; }
+.trend-table td { padding: 8px; border-bottom: 1px solid #edf1ef; white-space: nowrap; }
+.trend-table td:nth-child(2) { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
+.trend-table .rise { color: var(--green); font-weight: 900; }
+.trend-table .fall { color: var(--danger); font-weight: 900; }
 .keyword-box > div:first-child b,
 .keyword-box > div:first-child small {
   display: block;
@@ -1247,7 +1269,8 @@ button {
     grid-template-columns: repeat(2, 1fr);
   }
   .source-pair,
-  .keyword-pair {
+  .keyword-pair,
+  .trend-grid {
     grid-template-columns: 1fr;
   }
   .control-grid {
@@ -1319,6 +1342,7 @@ button {
   }
 }
 @media (max-width: 480px) {
+  .brand-kpis { grid-template-columns: 1fr; }
   .kpis {
     grid-template-columns: 1fr 1fr;
   }

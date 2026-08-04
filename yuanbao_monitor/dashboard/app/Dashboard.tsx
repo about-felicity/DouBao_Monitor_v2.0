@@ -9,6 +9,10 @@ type Source = {
   media: string;
   type: string;
   count?: number;
+  brand_mentions?: string[];
+  owned_brands?: string[];
+  own_brand?: boolean;
+  brand_match_scope?: string;
 };
 type CountItem = { name: string; count: number };
 type Keyword = { term: string; count: number };
@@ -22,6 +26,9 @@ type Run = {
   status: string;
   sources: Source[];
 };
+type MentionItem = { name: string; mentions: number; mention_rate: number; rank: number; rank_change?: number | null; average_position?: number | null };
+type MentionDay = { date: string; runs: number; items: MentionItem[] };
+type SourceBrandDay = { date: string; runs: number; sources: number; branded_sources: number; branded_source_rate: number; title_branded_sources: number; title_branded_source_rate: number; owned_sources: number; owned_source_rate: number; article_keywords: Keyword[]; video_keywords: Keyword[] };
 type Model = {
   id: string;
   name: string;
@@ -51,6 +58,12 @@ type Model = {
   top_videos: Source[];
   article_keywords: Keyword[];
   video_keywords: Keyword[];
+  brand_daily: MentionDay[];
+  product_daily: MentionDay[];
+  source_brand_daily: SourceBrandDay[];
+  daily_source_top: { date: string; top_articles: Source[]; top_videos: Source[] }[];
+  owned_source_count: number;
+  branded_source_count: number;
   recent_runs: Run[];
 };
 type CatalogModel = {
@@ -67,6 +80,7 @@ type Analytics = {
   model_catalog: CatalogModel[];
   questions: string[];
   dates: string[];
+  analysis_method?: Record<string, string | number>;
 };
 type ControlState = {
   running: boolean;
@@ -102,7 +116,7 @@ type RemoteActivity = {
   queue: { queued: number; processed: number; errors: number };
   events: RemoteEvent[];
 };
-type View = "overview" | "compare" | "sources" | "runs" | "control";
+type View = "overview" | "compare" | "sources" | "brands" | "runs" | "control";
 type QuestionMode = "interleaved" | "sequential";
 
 const emptyAnalytics: Analytics = {
@@ -115,7 +129,8 @@ const emptyAnalytics: Analytics = {
 const views: { id: View; label: string; hint: string; symbol: string }[] = [
   { id: "overview", label: "模型总览", hint: "先看规模与质量", symbol: "◈" },
   { id: "compare", label: "问题对比", hint: "同一问题横向比较", symbol: "⇄" },
-  { id: "sources", label: "信源洞察", hint: "Top 10 与关键词", symbol: "◎" },
+  { id: "sources", label: "信源洞察", hint: "每日 Top 10 与关键词", symbol: "◎" },
+  { id: "brands", label: "品牌与产品", hint: "提及率、排名与自有信源", symbol: "◇" },
   { id: "runs", label: "回答审计", hint: "逐轮查看原始证据", symbol: "≡" },
   { id: "control", label: "采集控制", hint: "问题、账号与任务", symbol: "▶" },
 ];
@@ -225,6 +240,9 @@ function SourceTop({
                 <small>
                   {item.media} · 出现 {item.count || 1} 轮
                 </small>
+                {item.own_brand && (
+                  <em className="owned-source">自有品牌 · {item.owned_brands?.join("、")} · {item.brand_match_scope}</em>
+                )}
               </a>
             </li>
           ))}
@@ -267,6 +285,34 @@ function Keywords({
       )}
     </div>
   );
+}
+
+function MentionTrend({ title, days }: { title: string; days: MentionDay[] }) {
+  const rows = days.slice(-7).reverse().flatMap((day) => day.items.slice(0, 10).map((item) => ({ ...item, date: day.date, runs: day.runs })));
+  return (
+    <article className="trend-block">
+      <h3>{title}</h3>
+      <small>提及率 = 当日提及轮次 ÷ 当日有效运行轮次；排名按提及轮次降序</small>
+      {rows.length ? <div className="trend-table"><table><thead><tr><th>日期</th><th>名称</th><th>提及</th><th>提及率</th><th>名次</th><th>变化</th><th>正文位次</th></tr></thead><tbody>
+        {rows.map((row) => <tr key={`${row.date}-${row.name}`}><td>{row.date}</td><td><b>{row.name}</b></td><td>{row.mentions}/{row.runs}</td><td>{row.mention_rate.toFixed(1)}%</td><td>#{row.rank}</td><td className={(row.rank_change || 0) > 0 ? "rise" : (row.rank_change || 0) < 0 ? "fall" : ""}>{row.rank_change == null ? "新" : row.rank_change > 0 ? `↑${row.rank_change}` : row.rank_change < 0 ? `↓${Math.abs(row.rank_change)}` : "—"}</td><td>{row.average_position ? row.average_position.toFixed(1) : "—"}</td></tr>)}
+      </tbody></table></div> : <Empty>当前范围暂无正文品牌或产品结果</Empty>}
+    </article>
+  );
+}
+
+function SourceBrandTrend({ days }: { days: SourceBrandDay[] }) {
+  return <article className="trend-block"><h3>品牌信源与自有品牌信源变化</h3><small>视频只核验标题；文章核验标题及已归档正文</small>
+    {days.length ? <div className="trend-table"><table><thead><tr><th>日期</th><th>信源</th><th>标题含品牌</th><th>标题品牌率</th><th>标题/正文含品牌</th><th>自有品牌</th><th>自有率</th></tr></thead><tbody>
+      {days.slice(-14).reverse().map((row) => <tr key={row.date}><td>{row.date}</td><td>{row.sources}</td><td>{row.title_branded_sources}</td><td>{row.title_branded_source_rate.toFixed(1)}%</td><td>{row.branded_sources} · {row.branded_source_rate.toFixed(1)}%</td><td>{row.owned_sources}</td><td>{row.owned_source_rate.toFixed(1)}%</td></tr>)}
+    </tbody></table></div> : <Empty>当前范围暂无信源品牌数据</Empty>}
+  </article>;
+}
+
+function KeywordDailyTrend({ title, days, field }: { title: string; days: SourceBrandDay[]; field: "article_keywords" | "video_keywords" }) {
+  const rows = days.slice(-7).reverse().flatMap((day) => day[field].slice(0, 10).map((item, index) => ({ ...item, date: day.date, rank: index + 1 })));
+  return <article className="trend-block"><h3>{title}</h3><small>标题本地分词；显示每日 Top 10，便于观察主题升降</small>
+    {rows.length ? <div className="trend-table keyword-trend"><table><thead><tr><th>日期</th><th>关键词</th><th>标题数</th><th>当日名次</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.date}-${row.term}`}><td>{row.date}</td><td><b>{row.term}</b></td><td>{row.count}</td><td>#{row.rank}</td></tr>)}</tbody></table></div> : <Empty>当前范围标题样本不足</Empty>}
+  </article>;
 }
 
 function RemoteTransferLog({ activity }: { activity?: RemoteActivity }) {
@@ -606,6 +652,7 @@ export function Dashboard() {
             <label>
               问题
               <select
+                data-testid="question-filter"
                 value={question}
                 onChange={(event) => setQuestion(event.target.value)}
               >
@@ -618,6 +665,7 @@ export function Dashboard() {
             <label>
               自然日
               <select
+                data-testid="date-filter"
                 value={date}
                 onChange={(event) => setDate(event.target.value)}
               >
@@ -860,6 +908,10 @@ export function Dashboard() {
                             </span>
                           ))}
                         </div>
+                        <div className="compare-source-tops">
+                          <SourceTop title="文章链接 Top 10" items={item.top_articles} tone="article" />
+                          <SourceTop title="视频链接 Top 10" items={item.top_videos} tone="video" />
+                        </div>
                       </article>
                     ))}
                   </section>
@@ -875,20 +927,17 @@ export function Dashboard() {
                   <SectionTitle
                     eyebrow={item.name.toUpperCase()}
                     title={`${question || "全部问题"} · 信源策略`}
-                    note={date || "全部日期"}
+                    note={date || "逐日展开最近 7 天"}
                   />
-                  <div className="source-pair">
-                    <SourceTop
-                      title="当日高频文章 Top 10"
-                      items={item.top_articles}
-                      tone="article"
-                    />
-                    <SourceTop
-                      title="当日高频视频 Top 10"
-                      items={item.top_videos}
-                      tone="video"
-                    />
-                  </div>
+                  {(date ? [{ date, top_articles: item.top_articles, top_videos: item.top_videos }] : item.daily_source_top.slice(0, 7)).map((day) => (
+                    <div className="daily-source-group" key={`${item.id}-${day.date}`}>
+                      <h3>{day.date} · {item.name}</h3>
+                      <div className="source-pair">
+                        <SourceTop title="高频文章 Top 10" items={day.top_articles} tone="article" />
+                        <SourceTop title="高频视频 Top 10" items={day.top_videos} tone="video" />
+                      </div>
+                    </div>
+                  ))}
                   <div className="keyword-pair">
                     <Keywords
                       title="文章文案关键词"
@@ -900,6 +949,38 @@ export function Dashboard() {
                       items={item.video_keywords}
                       tone="video"
                     />
+                  </div>
+                </section>
+              ))}
+            </>
+          )}
+
+          {view === "brands" && (
+            <>
+              <section className="analysis-note panel">
+                <b>准确性与成本口径</b>
+                <span>正文优先使用采集端结构化品牌/产品结果；未覆盖项只做跨模型词表精确命中。视频仅检查标题，文章检查标题与已归档正文。本页统计不调用大模型，日常 Token 消耗为 0。</span>
+              </section>
+              {selectedModels.map((item) => (
+                <section className="panel brand-section" key={item.id}>
+                  <SectionTitle eyebrow={item.name.toUpperCase()} title={`${question || "全部问题"} · 品牌与产品每日表现`} note={date || "最近 7–14 个自然日"} />
+                  <div className="brand-kpis">
+                    <span><b>{item.branded_source_count}</b> 条含品牌信源</span>
+                    <span><b>{item.owned_source_count}</b> 条自有品牌信源</span>
+                    <span><b>{item.sources ? ((item.owned_source_count * 100) / item.sources).toFixed(1) : "0"}%</b> 自有信源率</span>
+                  </div>
+                  <div className="trend-grid">
+                    <MentionTrend title="正文品牌提及率与每日名次" days={item.brand_daily} />
+                    <MentionTrend title="正文产品提及率与每日名次" days={item.product_daily} />
+                  </div>
+                  <SourceBrandTrend days={item.source_brand_daily} />
+                  <div className="trend-grid">
+                    <KeywordDailyTrend title="文章标题关键词每日变化" days={item.source_brand_daily} field="article_keywords" />
+                    <KeywordDailyTrend title="视频标题关键词每日变化" days={item.source_brand_daily} field="video_keywords" />
+                  </div>
+                  <div className="keyword-pair">
+                    <Keywords title="文章标题关键词（当前范围）" items={item.article_keywords} tone="article" />
+                    <Keywords title="视频标题关键词（当前范围）" items={item.video_keywords} tone="video" />
                   </div>
                 </section>
               ))}
@@ -952,6 +1033,7 @@ export function Dashboard() {
                               <small>
                                 {source.media} · {source.type}
                               </small>
+                              {source.own_brand && <em className="owned-source">自有品牌 · {source.owned_brands?.join("、")} · {source.brand_match_scope}</em>}
                             </li>
                           ))}
                         </ul>

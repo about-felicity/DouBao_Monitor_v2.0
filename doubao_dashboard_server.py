@@ -228,7 +228,8 @@ def _yuanbao_stats():
 
 
 def _analytics_data_version():
-    paths = [Path(CSV_PATH), Path(ANSWER_CSV_PATH)]
+    paths = [Path(CSV_PATH), Path(ANSWER_CSV_PATH), Path(PRODUCT_CSV_PATH),
+             Path(CONTENT_INDEX_PATH), Path(BRAND_SETTINGS_PATH)]
     for plugin in MODEL_PLUGINS.values():
         for attribute in ("results", "dashboard"):
             path = getattr(plugin, attribute, None)

@@ -55,6 +55,18 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(len(model["top_articles"]), 1)
         self.assertEqual(len(model["top_videos"]), 1)
 
+    def test_daily_brand_product_rates_ranks_and_owned_source_marks(self):
+        metadata = {"demo": {"id": "demo", "name": "演示", "short_name": "演", "tone": "demo"}}
+        runs = {"demo": [
+            {"model_id": "demo", "run_id": "d1", "sequence": 1, "question": "染发剂推荐", "finished_at": "2026-08-02T10:00:00+08:00", "day": "2026-08-02", "serial": "local", "answer": "推荐梵玢染发剂", "status": "success", "brands": ["梵玢"], "products": [{"brand": "梵玢", "product_name": "染发剂", "rank": 2}], "sources": [{"title": "梵玢染发剂实测视频", "url": "https://bilibili.com/v/owned", "canonical_url": "https://bilibili.com/v/owned", "domain": "bilibili.com", "media": "哔哩哔哩", "type": "视频"}]},
+            {"model_id": "demo", "run_id": "d2", "sequence": 2, "question": "染发剂推荐", "finished_at": "2026-08-02T11:00:00+08:00", "day": "2026-08-02", "serial": "local", "answer": "其他品牌", "status": "success", "brands": [], "products": [], "sources": []},
+        ]}
+        model = build_analytics(metadata, runs)["models"][0]
+        self.assertEqual(model["brand_daily"][0]["items"][0]["mention_rate"], 50.0)
+        self.assertEqual(model["product_daily"][0]["items"][0]["rank"], 1)
+        self.assertTrue(model["top_videos"][0]["own_brand"])
+        self.assertEqual(model["source_brand_daily"][0]["owned_source_rate"], 100.0)
+
 
 class PluginCommandTests(unittest.TestCase):
     def test_yuanbao_command_receives_per_question_rounds_and_mode(self):

@@ -13,6 +13,7 @@ from monitor_core.analytics import load_doubao_runs
 
 REFS = ROOT / "doubao_refs_result.csv"
 ANSWERS = ROOT / "doubao_answers_result.csv"
+PRODUCTS = ROOT / "doubao_products_result.csv"
 RUNS_CACHE_LOCK = threading.Lock()
 RECEIVER_QUEUE = ROOT / "doubao_mumu_controller" / "lan_receiver_queue"
 
@@ -25,8 +26,8 @@ def _stamp(path: Path) -> int:
 
 
 @lru_cache(maxsize=4)
-def _cached_runs(refs_stamp: int, answers_stamp: int) -> list[dict[str, Any]]:
-    return load_doubao_runs(REFS, ANSWERS)
+def _cached_runs(refs_stamp: int, answers_stamp: int, products_stamp: int) -> list[dict[str, Any]]:
+    return load_doubao_runs(REFS, ANSWERS, PRODUCTS)
 
 
 class Plugin(ModelPlugin):
@@ -76,7 +77,7 @@ class Plugin(ModelPlugin):
 
     def analytics_runs(self) -> list[dict[str, Any]]:
         with RUNS_CACHE_LOCK:
-            return _cached_runs(_stamp(REFS), _stamp(ANSWERS))
+            return _cached_runs(_stamp(REFS), _stamp(ANSWERS), _stamp(PRODUCTS))
 
     def activity(self, limit: int = 40) -> dict[str, Any]:
         limit = max(1, min(int(limit or 40), 100))

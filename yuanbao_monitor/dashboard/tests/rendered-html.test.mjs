@@ -4,13 +4,14 @@ import test from "node:test";
 
 const app = new URL("../app/", import.meta.url);
 
-test("统一面板由后端模型目录驱动并提供五类工作视图", async () => {
+test("统一面板由后端模型目录驱动并提供完整分析工作视图", async () => {
   const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
   assert.match(source, /\/api\/models/);
   assert.match(source, /\/api\/analytics/);
   assert.match(source, /模型总览/);
   assert.match(source, /问题对比/);
   assert.match(source, /信源洞察/);
+  assert.match(source, /品牌与产品/);
   assert.match(source, /回答审计/);
   assert.match(source, /采集控制/);
   assert.doesNotMatch(source, /modelRegistry/);
@@ -34,10 +35,13 @@ test("采集控制包含问题计划、账号校验及启停能力", async () =>
 
 test("信源分析区区分文章视频并显示每日 Top 10 与关键词", async () => {
   const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
-  assert.match(source, /当日高频文章 Top 10/);
-  assert.match(source, /当日高频视频 Top 10/);
+  assert.match(source, /高频文章 Top 10/);
+  assert.match(source, /高频视频 Top 10/);
   assert.match(source, /文章文案关键词/);
   assert.match(source, /视频文案关键词/);
+  assert.match(source, /自有品牌/);
+  assert.match(source, /文章标题关键词每日变化/);
+  assert.match(source, /正文产品提及率与每日名次/);
 });
 
 test("页面元数据使用通用多模型产品名称", async () => {
