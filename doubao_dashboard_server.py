@@ -1,4 +1,5 @@
 import csv
+import gzip
 import html
 import importlib
 import json
@@ -19,7 +20,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 import doubao_question_aliases as qa
 import doubao_brand_settings as brand_settings
 from monitor_core.plugins import discover_plugins
-from monitor_core.analytics import build_analytics
+from monitor_core.analytics import build_analytics, prepare_analytics
 
 # 固定使用中国时区 (UTC+8)，不受系统时区影响
 CST = timezone(timedelta(hours=8))
@@ -57,6 +58,7 @@ _CONTROL_PROCESSES = {}
 _ANALYTICS_LOCK = threading.RLock()
 _ANALYTICS_CACHE = {}
 _ANALYTICS_BUILDING = set()
+_ANALYTICS_SNAPSHOT = None
 
 
 def _process_alive(process):
@@ -245,15 +247,30 @@ def _analytics_data_version():
     return tuple(version)
 
 
+def _analytics_snapshot(version):
+    global _ANALYTICS_SNAPSHOT
+    with _ANALYTICS_LOCK:
+        if _ANALYTICS_SNAPSHOT and _ANALYTICS_SNAPSHOT[0] == version:
+            return _ANALYTICS_SNAPSHOT
+        runs_by_model = {
+            model_id: plugin.analytics_runs()
+            for model_id, plugin in MODEL_PLUGINS.items()
+        }
+        prepared = prepare_analytics(runs_by_model)
+        _ANALYTICS_SNAPSHOT = (version, runs_by_model, prepared)
+        return _ANALYTICS_SNAPSHOT
+
+
 def _build_unified_analytics(cache_key, version):
-    runs_by_model = {model_id: plugin.analytics_runs() for model_id, plugin in MODEL_PLUGINS.items()}
+    snapshot_version, runs_by_model, prepared = _analytics_snapshot(version)
     result = build_analytics(
         MODEL_REGISTRY,
         runs_by_model,
         question=cache_key[0], date=cache_key[1], model=cache_key[2],
+        prepared=prepared,
     )
     with _ANALYTICS_LOCK:
-        _ANALYTICS_CACHE[cache_key] = (version, result)
+        _ANALYTICS_CACHE[cache_key] = (snapshot_version, result)
         _ANALYTICS_BUILDING.discard(cache_key)
     return result
 
@@ -6322,9 +6339,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return
 
     def send_bytes(self, content, content_type, status=200):
+        use_gzip = (
+            len(content) >= 1024
+            and "gzip" in (self.headers.get("Accept-Encoding") or "").casefold()
+            and (
+                content_type.startswith("application/json")
+                or content_type.startswith("text/")
+            )
+        )
+        if use_gzip:
+            content = gzip.compress(content, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(content)))
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         origin = self.headers.get("Origin", "")
         if origin and self.is_allowed_dashboard_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -6576,6 +6607,10 @@ def main():
             _store_view_cache(ALL_QUESTIONS, ALL_DEVICES, initial)
         except Exception as exc:
             print("Doubao initial dashboard cache failed:", exc)
+    try:
+        _build_unified_analytics(("", "", ""), _analytics_data_version())
+    except Exception as exc:
+        print("Unified analytics warm-up failed:", exc)
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     threading.Thread(
         target=supervise_content_worker,

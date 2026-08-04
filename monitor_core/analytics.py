@@ -350,6 +350,20 @@ def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: 
                 source["brand_match_scope"] = "标题+正文" if title_matches and body_matches else "标题" if title_matches else "正文" if body_matches else ""
 
 
+def prepare_analytics(
+    runs_by_model: dict[str, list[dict[str, Any]]],
+) -> tuple[
+    dict[str, set[str]],
+    dict[str, tuple[str, str]],
+    tuple[re.Pattern[str] | None, dict[str, set[str]]],
+]:
+    """Enrich one versioned run snapshot for reuse across dashboard filters."""
+    brand_aliases, product_catalog = _catalogs(runs_by_model)
+    matcher = _brand_matcher(brand_aliases)
+    _enrich_runs(runs_by_model, brand_aliases, product_catalog, matcher)
+    return brand_aliases, product_catalog, matcher
+
+
 def _dense_ranks(counts: Counter[str]) -> dict[str, int]:
     rank_map: dict[str, int] = {}
     previous = None
@@ -424,17 +438,45 @@ def _daily_source_top(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for day in sorted({run.get("day") for run in runs if run.get("day")}, reverse=True)]
 
 
-def build_analytics(model_meta: dict[str, dict[str, Any]], runs_by_model: dict[str, list[dict[str, Any]]], *, question: str = "", date: str = "", model: str = "") -> dict[str, Any]:
-    brand_aliases, product_catalog = _catalogs(runs_by_model)
-    matcher = _brand_matcher(brand_aliases)
+def build_analytics(
+    model_meta: dict[str, dict[str, Any]],
+    runs_by_model: dict[str, list[dict[str, Any]]],
+    *,
+    question: str = "",
+    date: str = "",
+    model: str = "",
+    prepared: tuple[
+        dict[str, set[str]],
+        dict[str, tuple[str, str]],
+        tuple[re.Pattern[str] | None, dict[str, set[str]]],
+    ] | None = None,
+) -> dict[str, Any]:
+    if prepared is None:
+        brand_aliases, product_catalog = _catalogs(runs_by_model)
+        matcher = _brand_matcher(brand_aliases)
+    else:
+        brand_aliases, product_catalog, matcher = prepared
     selected_models = [model] if model and model in runs_by_model else list(model_meta)
-    all_questions = sorted({run["question"] for runs in runs_by_model.values() for run in runs})
-    all_dates = sorted({run["day"] for runs in runs_by_model.values() for run in runs if run["day"]}, reverse=True)
+    scope_runs = [
+        run
+        for model_id in selected_models
+        for run in runs_by_model.get(model_id, [])
+    ]
+    all_questions = sorted({run["question"] for run in scope_runs})
+    date_scope = [
+        run for run in scope_runs
+        if not question or run["question"] == question
+    ]
+    all_dates = sorted(
+        {run["day"] for run in date_scope if run["day"]},
+        reverse=True,
+    )
     models = []
     for model_id in selected_models:
         raw_runs = runs_by_model.get(model_id, [])
         runs = [run for run in raw_runs if (not question or run["question"] == question) and (not date or run["day"] == date)]
-        _enrich_runs({model_id: runs}, brand_aliases, product_catalog, matcher)
+        if prepared is None:
+            _enrich_runs({model_id: runs}, brand_aliases, product_catalog, matcher)
         sources = [source for run in runs for source in run["sources"]]
         article_titles = [source["title"] for source in sources if source["type"] != "视频" and source["title"]]
         video_titles = [source["title"] for source in sources if source["type"] == "视频" and source["title"]]

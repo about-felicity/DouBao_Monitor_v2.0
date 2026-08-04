@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Source = {
   title: string;
@@ -368,6 +368,7 @@ export function Dashboard() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [lastRefresh, setLastRefresh] = useState("");
+  const draftsInitialized = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -389,10 +390,8 @@ export function Dashboard() {
       setControl(controlPayload.models || {});
       setError("");
       setLastRefresh(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
-      if (
-        !Object.keys(drafts).length &&
-        analyticsPayload.model_catalog?.length
-      ) {
+      if (!draftsInitialized.current && analyticsPayload.model_catalog?.length) {
+        draftsInitialized.current = true;
         const questionRows = await Promise.all(
           analyticsPayload.model_catalog.map(async (item: CatalogModel) => {
             const response = await fetch(
@@ -436,16 +435,23 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [model, question, date, drafts]);
+  }, [model, question, date]);
 
   useEffect(() => {
     const initial = window.setTimeout(load, 0);
-    const timer = window.setInterval(load, 5000);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, 5000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
     };
   }, [load]);
+
+  useEffect(() => {
+    if (question && !analytics.questions.includes(question)) setQuestion("");
+    if (date && !analytics.dates.includes(date)) setDate("");
+  }, [analytics.questions, analytics.dates, question, date]);
 
   const remoteModelIds = analytics.model_catalog
     .filter((item) => item.execution === "remote")

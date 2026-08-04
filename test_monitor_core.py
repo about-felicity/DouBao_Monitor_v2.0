@@ -1,6 +1,6 @@
 import unittest
 
-from monitor_core.analytics import build_analytics
+from monitor_core.analytics import build_analytics, prepare_analytics
 from monitor_core.plugins import discover_plugins
 from monitor_core.quality import invalid_answer_reason
 from monitor_core.scheduling import build_question_schedule, normalize_question_mode
@@ -33,6 +33,41 @@ class SchedulingTests(unittest.TestCase):
 
 
 class AnalyticsTests(unittest.TestCase):
+    def test_selected_model_filter_options_do_not_leak_other_model_dates(self):
+        metadata = {
+            "a": {"id": "a", "name": "A", "short_name": "A", "tone": "a"},
+            "b": {"id": "b", "name": "B", "short_name": "B", "tone": "b"},
+        }
+        def run(model, day, question):
+            return {
+                "model_id": model, "run_id": f"{model}-{day}", "sequence": 1,
+                "question": question, "finished_at": day, "day": day,
+                "serial": "local", "answer": "answer", "status": "success",
+                "brands": [], "products": [], "sources": [],
+            }
+        runs = {
+            "a": [run("a", "2026-08-04", "Question A")],
+            "b": [run("b", "2026-07-31", "Question B")],
+        }
+        result = build_analytics(metadata, runs, model="a")
+        self.assertEqual(result["dates"], ["2026-08-04"])
+        self.assertEqual(result["questions"], ["Question A"])
+
+    def test_prepared_snapshot_can_be_reused_across_filters(self):
+        metadata = {"demo": {"id": "demo", "name": "Demo", "short_name": "D", "tone": "demo"}}
+        runs = {"demo": [{
+            "model_id": "demo", "run_id": "demo-1", "sequence": 1,
+            "question": "Question A", "finished_at": "2026-08-03T10:00:00+08:00",
+            "day": "2026-08-03", "serial": "local", "answer": "Brand answer",
+            "status": "success", "brands": ["Brand"], "products": [], "sources": [],
+        }]}
+        prepared = prepare_analytics(runs)
+        result = build_analytics(
+            metadata, runs, model="demo", question="Question A",
+            date="2026-08-03", prepared=prepared,
+        )
+        self.assertEqual(result["models"][0]["runs"], 1)
+
     def test_models_are_discovered_from_isolated_plugin_directories(self):
         plugins = discover_plugins()
         self.assertEqual(set(plugins), {"doubao", "yuanbao", "deepseek"})
