@@ -104,6 +104,7 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
     (package_root / "使用说明.txt").write_text(
         f"本部署包只运行 {model_name}。\n"
         f"主机回传地址已写入：{pairing['receiver_url']}\n"
+        "主机 IP 变化时会通过局域网 UDP 8792 自动发现新地址，并继续补传离线队列。\n"
         f"远端电脑安装 Chrome、MuMu 和 Python 后，双击：{launcher.name}\n"
         "首次打开后先点账号检查，确认 App 与专用 Chrome 登录一致，再点启动采集。\n",
         encoding="utf-8-sig",

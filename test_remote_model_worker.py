@@ -24,9 +24,11 @@ class RemoteModelWorkerTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             config.write_text("{}", encoding="utf-8")
             with mock.patch.object(remote_model_worker, "ROOT", root), \
+                    mock.patch.object(remote_model_worker, "start_result_sync") as start_sync, \
                     mock.patch.object(remote_model_worker, "discover_plugins", return_value={"deepseek": Plugin()}), \
                     mock.patch.object(sys, "argv", ["remote_model_worker.py", "--model", "deepseek", "--rounds", "2"]):
                 self.assertEqual(remote_model_worker.main(), 0)
+                start_sync.assert_called_once_with("deepseek")
 
 
 if __name__ == "__main__":

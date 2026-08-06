@@ -9,6 +9,7 @@ Start-Transcript -Path $logPath -Force | Out-Null
 #   8765 - 本地数据 API (doubao_dashboard_server.py)
 #   8790 - 豆包局域网接收器 (doubao_lan_receiver.py,可选,与 configure_lan_firewall.ps1 重复但幂等)
 #   8791 - 其他模型远端结果接收器 (lan_result_receiver.py)
+#   8792 - 主机 IP 变化后的自动发现服务 (UDP)
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -21,10 +22,11 @@ if (-not $isAdmin) {
 }
 
 $rules = @()
-$rules += @{ Name = "Doubao Dashboard Frontend 3000"; Port = 3000 }
-$rules += @{ Name = "Doubao Dashboard API 8765"; Port = 8765 }
-$rules += @{ Name = "Doubao MuMu LAN Receiver 8790"; Port = 8790 }
-$rules += @{ Name = "Doubao Remote Model Results 8791"; Port = 8791 }
+$rules += @{ Name = "Doubao Dashboard Frontend 3000"; Port = 3000; Protocol = "TCP" }
+$rules += @{ Name = "Doubao Dashboard API 8765"; Port = 8765; Protocol = "TCP" }
+$rules += @{ Name = "Doubao MuMu LAN Receiver 8790"; Port = 8790; Protocol = "TCP" }
+$rules += @{ Name = "Doubao Remote Model Results 8791"; Port = 8791; Protocol = "TCP" }
+$rules += @{ Name = "Doubao Remote Model Discovery 8792"; Port = 8792; Protocol = "UDP" }
 
 # 允许哪个网络配置文件:Private 仅家庭/工作网络,Any 包含公用网络
 $profile = "Private"
@@ -36,7 +38,7 @@ foreach ($rule in $rules) {
             -DisplayName $rule.Name `
             -Direction Inbound `
             -Action Allow `
-            -Protocol TCP `
+            -Protocol $rule.Protocol `
             -LocalPort $rule.Port `
             -Profile $profile | Out-Null
     } else {
@@ -45,11 +47,12 @@ foreach ($rule in $rules) {
             -Enabled True `
             -Direction Inbound `
             -Action Allow `
-            -Protocol TCP `
-            -LocalPort $rule.Port `
             -Profile $profile | Out-Null
+        $existing | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
+            -Protocol $rule.Protocol `
+            -LocalPort $rule.Port | Out-Null
     }
-    Write-Host ("已开放入站 TCP {0} ({1}) - Profile:{2}" -f $rule.Port, $rule.Name, $profile) -ForegroundColor Green
+    Write-Host ("已开放入站 {0} {1} ({2}) - Profile:{3}" -f $rule.Protocol, $rule.Port, $rule.Name, $profile) -ForegroundColor Green
 }
 
 Write-Host "防火墙规则创建完成,验证:"

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
+import select
 import socket
+import secrets
 import tempfile
 import threading
 import time
@@ -18,6 +21,8 @@ import urllib.request
 ROOT = Path(__file__).resolve().parent.parent
 _AGENTS: set[str] = set()
 _AGENT_LOCK = threading.Lock()
+DISCOVERY_PORT = 8792
+DISCOVERY_SERVICE = "monitor-lan-result-v1"
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -62,6 +67,84 @@ def _request_id(model: str, record: dict[str, Any], device: str) -> str:
     return hashlib.sha256(f"{model}\n{device}\n{payload}".encode("utf-8")).hexdigest()
 
 
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def _discovery_signature(token: str, nonce: str, receiver_url: str) -> str:
+    return hmac.new(token.encode("utf-8"), f"{nonce}\n{receiver_url}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _validated_discovery_url(value: dict[str, Any], token: str, nonce: str) -> str:
+    url = str(value.get("receiver_url") or "").rstrip("/")
+    signature = str(value.get("signature") or "")
+    if value.get("service") != DISCOVERY_SERVICE or value.get("nonce") != nonce:
+        return ""
+    if not url.startswith("http://") or not hmac.compare_digest(_discovery_signature(token, nonce, url), signature):
+        return ""
+    return url
+
+
+def _discover(config: dict[str, Any]) -> list[str]:
+    token = str(config.get("token") or "")
+    if len(token) < 24:
+        return []
+    nonce = secrets.token_hex(16)
+    request = json.dumps({"service": DISCOVERY_SERVICE, "nonce": nonce,
+                          "fingerprint": _token_fingerprint(token)}).encode("utf-8")
+    port = int(config.get("discovery_port") or DISCOVERY_PORT)
+    timeout = min(5.0, max(0.5, float(config.get("discovery_timeout") or 2)))
+    addresses = [""]
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM):
+            address = str(item[4][0])
+            if not address.startswith(("127.", "169.254.")) and address not in addresses:
+                addresses.append(address)
+    except OSError:
+        pass
+    clients: list[socket.socket] = []
+    found: list[str] = []
+    try:
+        for address in addresses:
+            client = None
+            try:
+                client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                client.bind((address, 0))
+                client.setblocking(False)
+                client.sendto(request, ("255.255.255.255", port))
+                clients.append(client)
+            except OSError:
+                if client is not None:
+                    client.close()
+        deadline = time.monotonic() + timeout
+        while clients and time.monotonic() < deadline:
+            readable, _, _ = select.select(clients, [], [], min(0.25, max(0, deadline - time.monotonic())))
+            for client in readable:
+                try:
+                    raw, _address = client.recvfrom(4096)
+                    value = json.loads(raw.decode("utf-8"))
+                    url = _validated_discovery_url(value, token, nonce)
+                    if url and url not in found:
+                        found.append(url)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    continue
+    finally:
+        for client in clients:
+            client.close()
+    return found
+
+
+def _remember_receiver(model: str, config: dict[str, Any], receiver_url: str) -> None:
+    updated = dict(config)
+    updated["receiver_url"] = receiver_url
+    updated["receiver_urls"] = [receiver_url] + [url for url in _urls(config) if url != receiver_url]
+    updated["receiver_discovered_at"] = time.time()
+    _atomic_json(_config_path(model), updated)
+    config.clear()
+    config.update(updated)
+
+
 def enqueue(model: str, record: dict[str, Any]) -> dict[str, Any]:
     """Persist an upload before any network attempt; safe to call per result."""
     config = _load_config(model)
@@ -79,29 +162,43 @@ def enqueue(model: str, record: dict[str, Any]) -> dict[str, Any]:
     return {"enabled": True, "status": "queued_for_background_upload", "request_id": request_id}
 
 
+def _post_one(config: dict[str, Any], envelope: dict[str, Any], url: str) -> dict[str, Any]:
+    token = str(config.get("token") or "")
+    data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(
+        f"{url}/api/v1/models/{envelope['model']}/results", data=data, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {token}"},
+    )
+    with opener.open(request, timeout=min(8, max(1, float(config.get("upload_timeout") or 3)))) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if result.get("ok") and result.get("request_id") == envelope["request_id"]:
+        return result
+    raise RuntimeError("receiver did not acknowledge queued result")
+
+
 def _post(config: dict[str, Any], envelope: dict[str, Any]) -> dict[str, Any]:
     token = str(config.get("token") or "")
     if len(token) < 24:
         raise ValueError("remote sync token is missing or too short")
-    urls = _urls(config)
-    if not urls:
-        raise ValueError("receiver_url is not configured")
-    data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     failures = []
+    urls = _urls(config)
     for url in urls:
-        request = urllib.request.Request(
-            f"{url}/api/v1/models/{envelope['model']}/results", data=data, method="POST",
-            headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {token}"},
-        )
         try:
-            with opener.open(request, timeout=min(8, max(1, float(config.get("upload_timeout") or 3)))) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            if result.get("ok") and result.get("request_id") == envelope["request_id"]:
-                return result
-            raise RuntimeError("receiver did not acknowledge queued result")
+            return _post_one(config, envelope, url)
         except Exception as exc:
             failures.append(f"{url}: {type(exc).__name__}: {exc}")
+    for url in _discover(config):
+        if url in urls:
+            continue
+        try:
+            result = _post_one(config, envelope, url)
+            _remember_receiver(str(envelope["model"]), config, url)
+            return result
+        except Exception as exc:
+            failures.append(f"{url}: {type(exc).__name__}: {exc}")
+    if not failures:
+        failures.append("receiver_url is not configured and LAN discovery found no receiver")
     raise RuntimeError("; ".join(failures))
 
 
@@ -139,3 +236,9 @@ def _ensure_agent(model: str) -> None:
         thread = threading.Thread(target=_watch, args=(model,), name=f"{model}-lan-sync", daemon=True)
         thread.start()
         _AGENTS.add(model)
+
+
+def start(model: str) -> None:
+    """Start retrying an existing outbox before the next collector result arrives."""
+    if _load_config(model).get("enabled"):
+        _ensure_agent(model)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -28,6 +29,8 @@ from monitor_core.plugins import ROOT
 CONFIG = ROOT / "runtime" / "lan_result_receiver.json"
 PAIRING = ROOT / "runtime" / "lan_result_pairing.json"
 QUEUE = ROOT / "runtime" / "lan_result_receiver"
+DISCOVERY_PORT = 8792
+DISCOVERY_SERVICE = "monitor-lan-result-v1"
 MODELS = {"deepseek", "yuanbao", "wenxin", "afu"}
 TARGETS = {
     "deepseek": ROOT / "deepseek_monitor" / "deepseek_results.jsonl",
@@ -54,6 +57,7 @@ def load_config() -> dict[str, Any]:
         value = {"host": "0.0.0.0", "port": 8791, "token": os.urandom(24).hex()}
         _atomic_json(CONFIG, value)
     value["port"] = int(value.get("port") or 8791)
+    value["discovery_port"] = int(value.get("discovery_port") or DISCOVERY_PORT)
     return value
 
 
@@ -72,9 +76,63 @@ def preferred_lan_ip() -> str:
 def write_pairing(config: dict[str, Any]) -> None:
     port = int(config["port"])
     ip = preferred_lan_ip()
-    _atomic_json(PAIRING, {"version": 1, "receiver_url": f"http://{ip}:{port}",
+    token = str(config["token"])
+    _atomic_json(PAIRING, {"version": 2, "receiver_url": f"http://{ip}:{port}",
                            "receiver_urls": [f"http://{ip}:{port}", f"http://{socket.gethostname()}:{port}"],
-                           "token": str(config["token"]), "upload_timeout": 5})
+                           "token": token, "upload_timeout": 5,
+                           "discovery_port": int(config.get("discovery_port") or DISCOVERY_PORT),
+                           "discovery_fingerprint": token_fingerprint(token)})
+
+
+def token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def discovery_signature(token: str, nonce: str, receiver_url: str) -> str:
+    return hmac.new(token.encode("utf-8"), f"{nonce}\n{receiver_url}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def discovery_response(request: dict[str, Any], config: dict[str, Any], local_ip: str) -> dict[str, Any] | None:
+    if not isinstance(request, dict):
+        return None
+    token = str(config.get("token") or "")
+    nonce = str(request.get("nonce") or "")
+    if request.get("service") != DISCOVERY_SERVICE or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        return None
+    supplied = str(request.get("fingerprint") or "")
+    if not token or not hmac.compare_digest(token_fingerprint(token), supplied):
+        return None
+    receiver_url = f"http://{local_ip}:{int(config['port'])}"
+    return {"service": DISCOVERY_SERVICE, "nonce": nonce, "receiver_url": receiver_url,
+            "signature": discovery_signature(token, nonce, receiver_url)}
+
+
+def local_ip_for_peer(peer_ip: str) -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((peer_ip, 9))
+        address = str(probe.getsockname()[0])
+        return address if not address.startswith("127.") else preferred_lan_ip()
+    except OSError:
+        return preferred_lan_ip()
+    finally:
+        probe.close()
+
+
+def discovery_server(config: dict[str, Any]) -> None:
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", int(config.get("discovery_port") or DISCOVERY_PORT)))
+    while True:
+        try:
+            raw, address = server.recvfrom(4096)
+            request = json.loads(raw.decode("utf-8"))
+            response = discovery_response(request, config, local_ip_for_peer(address[0]))
+            if response:
+                server.sendto(json.dumps(response).encode("utf-8"), address)
+                write_pairing(config)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            continue
 
 
 def valid_request_id(value: Any) -> str:
@@ -165,8 +223,10 @@ def main() -> int:
     if args.port:
         config["port"] = args.port
     write_pairing(config)
+    threading.Thread(target=discovery_server, args=(config,), name="lan-result-discovery", daemon=True).start()
     server = Server((args.host or str(config.get("host") or "0.0.0.0"), args.port or int(config["port"])), config)
-    print(f"LAN result receiver listening on {server.server_address[0]}:{server.server_address[1]}")
+    print(f"LAN result receiver listening on {server.server_address[0]}:{server.server_address[1]}; "
+          f"discovery UDP {config['discovery_port']}")
     server.serve_forever(poll_interval=0.5)
     return 0
 

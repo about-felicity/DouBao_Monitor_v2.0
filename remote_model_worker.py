@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 from monitor_core.plugins import ROOT, discover_plugins
+from monitor_core.lan_result_sync import start as start_result_sync
 
 
 REMOTE_MODELS = ("deepseek", "yuanbao", "wenxin")
@@ -55,6 +56,7 @@ def main() -> int:
         config = ROOT / "runtime" / "remote_workers" / f"{args.model}_sync.json"
         if not config.exists():
             raise SystemExit("Run once with --pairing <lan_result_pairing.json> before collecting.")
+        start_result_sync(args.model)
         plugin = discover_plugins().get(args.model)
         if plugin is None:
             raise SystemExit(f"unknown model: {args.model}")
