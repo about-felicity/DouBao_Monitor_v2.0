@@ -89,8 +89,8 @@ def main() -> int:
     parser.add_argument("--rounds-per-question", type=int, help="每个问题执行的轮数")
     parser.add_argument("--question-mode", choices=("interleaved", "sequential"), default="interleaved")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--min-interval", type=float, default=60, help="实际发送之间的最短秒数，最低 60")
-    parser.add_argument("--max-interval", type=float, default=600, help="实际发送之间的最长秒数")
+    parser.add_argument("--min-interval", type=float, default=120, help="实际发送之间的最短秒数，最低 120")
+    parser.add_argument("--max-interval", type=float, default=300, help="实际发送之间的最长秒数")
     parser.add_argument("--retry-wait", type=float, default=60)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--stable-seconds", type=int, default=8)
@@ -105,7 +105,7 @@ def main() -> int:
         raise SystemExit("--rounds-per-question 必须大于 0")
     if args.rounds < 1:
         raise SystemExit("--rounds 必须大于 0")
-    args.min_interval = max(60.0, args.min_interval)
+    args.min_interval = max(120.0, args.min_interval)
     args.max_interval = max(args.min_interval, args.max_interval)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler(args.log, encoding="utf-8")])
@@ -122,8 +122,8 @@ def main() -> int:
     state_path = Path(args.state)
     state = load_state(state_path) if args.resume else {}
     index = int(state.get("next_index") or 0)
-    app = DeepSeekAppController(args.serial)
-    web = DeepSeekWebCollector(args.chrome_port)
+    app = None
+    web = None
 
     def stop_handler(*_):
         global STOP
@@ -142,6 +142,10 @@ def main() -> int:
         started = now()
         sent = False
         try:
+            if app is None:
+                app = DeepSeekAppController(args.serial)
+            if web is None:
+                web = DeepSeekWebCollector(args.chrome_port)
             # 发送前记住网页当前第一条会话。采集时必须等到一个新的会话出现，
             # 这样即使连续询问同一个问题，也不会误抓上一次的旧回答。
             app_completion: dict = {}
@@ -183,15 +187,19 @@ def main() -> int:
                             wait_until(time.time() + max(30.0, args.retry_wait), logger)
             answer = str(result.get("answer") or "").strip() or answer_from_page(str(result.get("body") or ""), question)
             skip_reason = web_error or answer_quality_reason(question, answer)
-            append_jsonl(Path(args.results), {"status": "skipped" if skip_reason else "success", "skip_reason": skip_reason,
+            if skip_reason:
+                logger.warning("第 %d 轮模型回答无效，将按安全间隔重试原题：%s", index + 1, skip_reason)
+                app = None
+                web = None
+                wait_until(max(float(state.get("next_send_at") or 0), time.time() + args.retry_wait), logger)
+                continue
+            append_jsonl(Path(args.results), {"status": "success", "skip_reason": "",
                 "round": index + 1, "serial": args.serial, "question": question, "reply": answer,
-                "web_body": result.get("body", ""), "sources": [] if skip_reason else result.get("sources", []),
+                "web_body": result.get("body", ""), "sources": result.get("sources", []),
                 "conversation_question": result.get("currentQuestion", ""),
                 "page_url": result.get("conversation_url") or result.get("url", ""), "web_error": web_error,
                 "app_error": app_error, "app_completion": app_completion,
                 "started_at": started, "finished_at": now()})
-            if skip_reason:
-                logger.warning("第 %d 轮模型回答无效，已直接跳过：%s", index + 1, skip_reason)
             index += 1
             completed += 1
             state["next_index"] = index
@@ -199,10 +207,10 @@ def main() -> int:
             subprocess.run([sys.executable, str(BASE_DIR / "build_dashboard_data.py")], cwd=BASE_DIR, capture_output=True, timeout=60, check=False)
         except Exception as exc:
             logger.exception("第 %d 轮失败：%s", index + 1, exc)
-            append_jsonl(Path(args.results), {"status": "error", "round": index + 1, "question": question, "started_at": started, "finished_at": now(), "sent": sent, "error": str(exc)})
-            # 已经实际发送的问题绝不快速重发；网页失败在上面只重试抓取，不重发 App 问题。
-            if not sent:
-                wait_until(time.time() + max(60.0, args.retry_wait), logger)
+            app = None
+            web = None
+            safe_at = float(state.get("next_send_at") or 0) if sent else 0
+            wait_until(max(safe_at, time.time() + max(60.0, args.retry_wait)), logger)
     return 0
 
 

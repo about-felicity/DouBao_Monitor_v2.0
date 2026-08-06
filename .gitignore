@@ -51,6 +51,7 @@ doubao_mumu_controller/portable_runtime/
 # Generated deploy bundles and dependency trees
 doubao_standalone_deploy/
 doubao_remote_deploy/
+remote_model_deploy/
 node_modules/
 __pycache__/
 *.py[cod]
@@ -89,6 +90,7 @@ deepseek*
 !deepseek_monitor/
 !deepseek_monitor/**
 !/test_deepseek_pipeline.py
+!/打开DeepSeek远端面板.bat
 !model_plugins/
 !model_plugins/*/
 !model_plugins/*/plugin.py
@@ -135,3 +137,7 @@ doubao_api_check.json
 # Local office/export artifacts
 ~$*
 *.xlsx
+
+# Generated packages contain the local callback token
+/remote_model_deploy/
+/remote_model_deploy_three_models/

@@ -26,7 +26,7 @@ class Plugin(ModelPlugin):
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
         mode = normalize_question_mode(options.get("question_mode"))
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "60", "--max-interval", "600"], self.runner.parent
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "120", "--max-interval", "300"], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         from deepseek_monitor.controller import ensure_deepseek_chrome

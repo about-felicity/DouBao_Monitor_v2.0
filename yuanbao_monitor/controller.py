@@ -250,9 +250,12 @@ class YuanbaoController:
         self.d.app_start(self.PKG, stop=False)
         time.sleep(1)
         profile = self.d(text="我们")
-        if not profile.exists(timeout=3):
+        if profile.exists(timeout=5):
+            profile.click()
+        elif "我们" in self.d.dump_hierarchy(compressed=False):
+            self.d.click(434, 920)
+        else:
             raise RuntimeError("元宝 App 没有找到“我们”账号页入口")
-        profile.click()
         time.sleep(1)
         root = ET.fromstring(self.d.dump_hierarchy(compressed=False))
         candidates = []

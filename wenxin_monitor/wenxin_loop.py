@@ -43,6 +43,9 @@ def main() -> int:
     parser.add_argument("--chrome-port", type=int, default=9444)
     parser.add_argument("--wait", type=float, default=30)
     parser.add_argument("--random-wait", type=float, default=90)
+    parser.add_argument("--retry-wait", type=float, default=60)
+    parser.add_argument("--max-retries", type=int, default=0,
+                        help="单题最大重试次数，0 表示持续重试直到成功")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--results", default=str(BASE_DIR / "wenxin_results.jsonl"))
     parser.add_argument("--state", default=str(BASE_DIR / "wenxin_state.json"))
@@ -56,7 +59,8 @@ def main() -> int:
            if line.strip() and not line.lstrip().startswith("#")]
     prompts = validate_prompt_list(raw)
     schedule = build_question_schedule(prompts, max(1, args.rounds_per_question), args.question_mode)
-    app, web = WenxinAppController(args.serial), WenxinWebCollector(args.chrome_port)
+    app = None
+    web = None
     state_path = Path(args.state)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8")) if args.resume else {}
@@ -73,28 +77,44 @@ def main() -> int:
 
     while not STOP and index < len(schedule):
         prompt = schedule[index]
-        started = now()
-        try:
-            with device_session(args.serial, "文心", timeout=args.timeout + 120, on_wait=log.info):
-                previous = web.latest_reference()
-                app.send(prompt)
-                mobile = app.wait_for_mobile_accept(min(60, args.timeout))
-            result = web.collect_latest(previous, args.timeout)
-            answer = str(result.get("body") or "")
-            skip = answer_quality_reason(prompt, answer)
-            row = {"status": "skipped" if skip else "success", "skip_reason": skip,
-                   "round": index + 1, "serial": args.serial, "prompt": prompt,
-                   "question": canonical_recommendation_question(prompt), "reply": answer,
-                   "web_body": answer, "sources": [] if skip else result.get("sources", []),
-                   "page_url": result.get("url"), "mobile": mobile,
-                   "started_at": started, "finished_at": now()}
-            append(Path(args.results), row)
-            log.info("第 %d 轮完成：%s，正文 %d 字，信源 %d 条", index + 1, prompt, len(answer), len(row["sources"]))
-        except Exception as exc:
-            append(Path(args.results), {"status": "error", "round": index + 1, "prompt": prompt,
-                                        "question": canonical_recommendation_question(prompt),
-                                        "error": str(exc), "started_at": started, "finished_at": now()})
-            log.exception("第 %d 轮失败：%s", index + 1, exc)
+        attempts = 0
+        while not STOP:
+            started = now()
+            try:
+                if app is None:
+                    app = WenxinAppController(args.serial)
+                if web is None:
+                    web = WenxinWebCollector(args.chrome_port)
+                with device_session(args.serial, "文心", timeout=args.timeout + 120, on_wait=log.info):
+                    previous = web.latest_reference()
+                    app.send(prompt)
+                    mobile = app.wait_for_mobile_accept(min(60, args.timeout))
+                result = web.collect_latest(previous, args.timeout)
+                answer = str(result.get("body") or "")
+                skip = answer_quality_reason(prompt, answer)
+                if skip:
+                    raise RuntimeError(f"回答质量校验未通过：{skip}")
+                row = {"status": "success", "skip_reason": "",
+                       "round": index + 1, "serial": args.serial, "prompt": prompt,
+                       "question": canonical_recommendation_question(prompt), "reply": answer,
+                       "web_body": answer, "sources": result.get("sources", []),
+                       "page_url": result.get("url"), "mobile": mobile,
+                       "started_at": started, "finished_at": now()}
+                append(Path(args.results), row)
+                log.info("第 %d 轮完成：%s，正文 %d 字，信源 %d 条", index + 1, prompt,
+                         len(answer), len(row["sources"]))
+                break
+            except Exception as exc:
+                attempts += 1
+                log.exception("第 %d 轮第 %d 次尝试失败，将重连后重试同一问题：%s",
+                              index + 1, attempts, exc)
+                if args.max_retries > 0 and attempts >= args.max_retries:
+                    return 1
+                app = None
+                web = None
+                time.sleep(max(1, args.retry_wait))
+        if STOP:
+            break
         index += 1
         state_path.write_text(json.dumps({"next_index": index, "updated_at": now()}, ensure_ascii=False, indent=2), encoding="utf-8")
         subprocess.run([sys.executable, str(BASE_DIR / "build_dashboard_data.py")], cwd=BASE_DIR,

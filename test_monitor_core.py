@@ -31,6 +31,8 @@ class QualityTests(unittest.TestCase):
         from monitor_core.quality import answer_quality_reason
         self.assertTrue(answer_quality_reason("推荐一款眉毛增长液", "这里推荐几款染发剂，适合遮盖白发并且操作方便。"))
         self.assertFalse(answer_quality_reason("推荐一款眉毛增长液", "眉毛增长液可从温和性和成分安全性两个方面选择。"))
+        self.assertFalse(answer_quality_reason("推荐一款控油蓬松洗发水", "针对油头和追求蓬松感的需求，可以选择清爽配方。"))
+        self.assertTrue(answer_quality_reason("推荐一款控油蓬松洗发水", "这几款护发精油适合改善干枯毛躁。"))
         self.assertTrue(invalid_answer_reason("检测到您当前设备环境有风险，请重新尝试请求"))
         self.assertFalse(invalid_answer_reason("这是一个内容完整、可以正常保存并用于信源分析的模型回答。"))
 
@@ -233,6 +235,8 @@ class PluginCommandTests(unittest.TestCase):
         self.assertIn("--rounds-per-question", command)
         self.assertEqual(command[command.index("--rounds-per-question") + 1], "3")
         self.assertEqual(command[command.index("--mode") + 1], "sequential")
+        self.assertEqual(command[command.index("--max-retries") + 1], "0")
+        self.assertEqual(command[command.index("--retry-wait") + 1], "90")
 
     def test_deepseek_command_receives_interleaved_mode(self):
         plugin = discover_plugins()["deepseek"]
@@ -240,9 +244,8 @@ class PluginCommandTests(unittest.TestCase):
         command, _ = plugin.command({"rounds": 2, "question_mode": "interleaved"})
         self.assertEqual(command[command.index("--rounds-per-question") + 1], "2")
         self.assertEqual(command[command.index("--question-mode") + 1], "interleaved")
-        self.assertEqual(command[command.index("--min-interval") + 1], "60")
-        self.assertEqual(command[command.index("--max-interval") + 1], "600")
-
+        self.assertEqual(command[command.index("--min-interval") + 1], "120")
+        self.assertEqual(command[command.index("--max-interval") + 1], "300")
     def test_yuanbao_command_uses_a_humanized_random_interval(self):
         command, _ = discover_plugins()["yuanbao"].command(
             {"rounds": 2, "question_mode": "interleaved"}

@@ -39,6 +39,22 @@ def expected_topic(question: str) -> str:
     text = re.sub(r"推荐$", "", text)
     return text.strip("，。！？?：:")
 
+def topic_matches(topic: str, body: str) -> bool:
+    variants = {topic}
+    if "增长" in topic:
+        variants.add(topic.replace("增长", "生长"))
+    if "生长" in topic:
+        variants.add(topic.replace("生长", "增长"))
+    if any(value in body for value in variants):
+        return True
+    bigrams = {value[index:index + 2] for value in variants for index in range(len(value) - 1)}
+    required = 1 if len(topic) <= 3 else 2
+    aliases = {"控油": ("油头", "去油", "清爽"), "增长": ("生长",), "生长": ("增长",)}
+    matched = sum(
+        1 for value in bigrams
+        if value in body or any(alias in body for alias in aliases.get(value, ()))
+    )
+    return matched >= required
 
 def answer_quality_reason(question: str, answer: str, *, minimum_length: int = 12) -> str:
     """Reject empty/error replies and obvious cross-topic conversation mix-ups."""
@@ -48,11 +64,8 @@ def answer_quality_reason(question: str, answer: str, *, minimum_length: int = 1
     topic = normalize_text(expected_topic(question))
     body = normalize_text(answer)
     if len(topic) >= 2:
-        variants = {topic}
-        if "增长" in topic:
-            variants.add(topic.replace("增长", "生长"))
-        if "生长" in topic:
-            variants.add(topic.replace("生长", "增长"))
-        if not any(value in body for value in variants):
+
+        if not topic_matches(topic, body):
+
             return f"回答主题与问题不一致（未出现“{expected_topic(question)}”）"
     return ""

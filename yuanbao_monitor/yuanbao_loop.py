@@ -197,15 +197,7 @@ def worker(
                 reply = controller.extract_visible_reply(xml, question)
                 skip_reason = answer_quality_reason(question, reply)
                 if skip_reason:
-                    append_jsonl(Path(args.results), {
-                        "status": "skipped", "skip_reason": skip_reason, "serial": serial,
-                        "round": index + 1, "schedule_index": position, "question": question,
-                        "reply": reply, "started_at": started, "finished_at": now(), "xml": str(xml_path),
-                    })
-                    index += 1
-                    save_state(state_path, {"serial": serial, "next_index": index, "updated_at": now()})
-                    logger.warning("[%s] 第 %d 轮回答无效，已直接跳过：%s", serial, index, skip_reason)
-                    break
+                    raise RuntimeError(f"回答质量校验未通过：{skip_reason}")
                 web_result: dict[str, Any] = {}
                 if args.collect_web:
                     # 手机端一旦发送成功，网页抓取失败只重试网页，绝不重发问题。
@@ -244,20 +236,21 @@ def worker(
                                 logger.info("[%s] driver 会话失效，下次将重建 collector", serial)
                                 collector = None
                             if args.max_retries and web_attempt >= args.max_retries:
-                                web_result = {"error": str(web_exc)}
-                                break
+                                raise RuntimeError(f"网页抓取达到最大重试次数：{web_exc}") from web_exc
                             STOP_EVENT.wait(args.retry_wait)
                 web_skip_reason = str(web_result.get("error") or "") if args.collect_web else ""
                 if args.collect_web and not web_skip_reason:
                     web_skip_reason = answer_quality_reason(question, str(web_result.get("body") or ""))
+                if web_skip_reason:
+                    raise RuntimeError(f"网页回答质量校验未通过：{web_skip_reason}")
                 record = {
-                    "status": "skipped" if web_skip_reason else "success", "skip_reason": web_skip_reason,
+                    "status": "success", "skip_reason": "",
                     "serial": serial, "round": index + 1,
                     "schedule_index": position, "question": question, "reply": reply,
                     "reply_length": len(reply), "attempt": attempt,
                     "started_at": started, "finished_at": now(), "xml": str(xml_path),
                     "web_body": web_result.get("body", ""),
-                    "sources": [] if web_skip_reason else web_result.get("sources", []),
+                    "sources": web_result.get("sources", []),
                     "web_error": web_result.get("error"),
                 }
                 append_jsonl(Path(args.results), record)
@@ -274,17 +267,10 @@ def worker(
                 prefix = f"round_{index + 1:06d}_attempt_{attempt:03d}"
                 if controller is not None:
                     controller.save_diagnostics(diagnostic_dir, prefix, str(exc))
-                append_jsonl(Path(args.results), {
-                    "status": "error", "serial": serial, "round": index + 1,
-                    "question": question, "attempt": attempt, "started_at": started,
-                    "finished_at": now(), "error": str(exc),
-                })
                 controller = None
                 if args.max_retries and attempt >= args.max_retries:
-                    logger.error("[%s] 已达到最大重试次数，跳过本轮", serial)
-                    index += 1
-                    save_state(state_path, {"serial": serial, "next_index": index, "updated_at": now()})
-                    break
+                    logger.error("[%s] 已达到最大重试次数，停止当前设备且不跳过本轮", serial)
+                    return
                 STOP_EVENT.wait(args.retry_wait)
 
         if not STOP_EVENT.is_set():

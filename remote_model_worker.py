@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 from monitor_core.plugins import ROOT, discover_plugins
 
 
-REMOTE_MODELS = ("deepseek", "yuanbao", "wenxin", "afu")
+REMOTE_MODELS = ("deepseek", "yuanbao", "wenxin")
 
 
 def atomic_write(path: Path, value: dict[str, Any]) -> None:
@@ -44,16 +45,25 @@ def main() -> int:
         print(f"remote sync configured: {path}")
     if args.configure_only:
         return 0
-    config = ROOT / "runtime" / "remote_workers" / f"{args.model}_sync.json"
-    if not config.exists():
-        raise SystemExit("Run once with --pairing <lan_result_pairing.json> before collecting.")
-    plugin = discover_plugins().get(args.model)
-    if plugin is None:
-        raise SystemExit(f"unknown model: {args.model}")
-    options: dict[str, Any] = {"rounds": max(1, args.rounds), "question_mode": args.question_mode}
-    plugin.prepare(options, print)
-    command, cwd = plugin.command(options)
-    return subprocess.run(command, cwd=cwd, check=False).returncode
+    guard = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        guard.bind(("127.0.0.1", 18800))
+    except OSError as exc:
+        guard.close()
+        raise SystemExit("This computer already has a remote model collector running.") from exc
+    try:
+        config = ROOT / "runtime" / "remote_workers" / f"{args.model}_sync.json"
+        if not config.exists():
+            raise SystemExit("Run once with --pairing <lan_result_pairing.json> before collecting.")
+        plugin = discover_plugins().get(args.model)
+        if plugin is None:
+            raise SystemExit(f"unknown model: {args.model}")
+        options: dict[str, Any] = {"rounds": max(1, args.rounds), "question_mode": args.question_mode}
+        plugin.prepare(options, print)
+        command, cwd = plugin.command(options)
+        return subprocess.run(command, cwd=cwd, check=False).returncode
+    finally:
+        guard.close()
 
 
 if __name__ == "__main__":

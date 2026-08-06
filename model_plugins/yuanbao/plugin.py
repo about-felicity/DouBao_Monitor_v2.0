@@ -27,7 +27,7 @@ class Plugin(ModelPlugin):
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
         mode = normalize_question_mode(options.get("question_mode"))
         runner_mode = "cross" if mode == "interleaved" else "sequential"
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "3", "--wait", "30", "--random-wait", "90"], self.runner.parent
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "0", "--retry-wait", "90", "--wait", "30", "--random-wait", "90"], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         from yuanbao_monitor.bowser import ensure_yuanbao_chrome
