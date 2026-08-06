@@ -8,6 +8,7 @@ Start-Transcript -Path $logPath -Force | Out-Null
 #   3000 - React 前端面板
 #   8765 - 本地数据 API (doubao_dashboard_server.py)
 #   8790 - 豆包局域网接收器 (doubao_lan_receiver.py,可选,与 configure_lan_firewall.ps1 重复但幂等)
+#   8791 - 其他模型远端结果接收器 (lan_result_receiver.py)
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -23,6 +24,7 @@ $rules = @()
 $rules += @{ Name = "Doubao Dashboard Frontend 3000"; Port = 3000 }
 $rules += @{ Name = "Doubao Dashboard API 8765"; Port = 8765 }
 $rules += @{ Name = "Doubao MuMu LAN Receiver 8790"; Port = 8790 }
+$rules += @{ Name = "Doubao Remote Model Results 8791"; Port = 8791 }
 
 # 允许哪个网络配置文件:Private 仅家庭/工作网络,Any 包含公用网络
 $profile = "Private"
