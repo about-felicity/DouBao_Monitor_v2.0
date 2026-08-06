@@ -115,10 +115,15 @@ def ensure_deepseek_chrome(port: int = 9333) -> dict[str, Any]:
 SNAPSHOT_JS = r"""
 (() => {
   const clean=(s)=>String(s||"").replace(/\s+/g," ").trim();
-  const body=clean(document.body?.innerText||"");
+  const chat=document.querySelector('.ds-virtual-list-visible-items');
+  const questions=chat?[...chat.querySelectorAll('._9663006 .ds-message')]:[];
+  const answers=chat?[...chat.querySelectorAll('.ds-assistant-message-main-content')]:[];
+  const currentQuestion=clean(questions.at(-1)?.innerText||questions.at(-1)?.textContent||"");
+  const answer=clean(answers.at(-1)?.innerText||answers.at(-1)?.textContent||"");
+  const body=clean(chat?.innerText||"");
   const links=[...document.querySelectorAll("a[href]")].filter(a=>/^https?:\/\//.test(a.href)&&!a.href.includes("chat.deepseek.com/a/chat/s/"));
   const busy=!!document.querySelector('[aria-label*="停止"],[data-testid*="stop"],.ds-icon-button--rotating');
-  return {url:location.href,title:document.title,body,linkCount:new Set(links.map(a=>a.href)).size,busy,hasTextarea:!!document.querySelector("textarea"),readyState:document.readyState};
+  return {url:location.href,title:document.title,body,currentQuestion,answer,linkCount:new Set(links.map(a=>a.href)).size,busy,hasTextarea:!!document.querySelector("textarea"),readyState:document.readyState};
 })()
 """
 
@@ -132,8 +137,13 @@ COLLECT_JS = r"""
   window.scrollTo(0,0); await sleep(250); add();
   for(let i=0;i<18;i++){window.scrollBy(0,Math.max(450,Math.floor(innerHeight*.7)));await sleep(180);add();}
   window.scrollTo(0,document.body.scrollHeight);await sleep(300);add();
-  const body=clean(document.body?.innerText||"");
-  return {ok:true,url:location.href,title:document.title,body,sources:[...seen.values()]};
+  const chat=document.querySelector('.ds-virtual-list-visible-items');
+  const questions=chat?[...chat.querySelectorAll('._9663006 .ds-message')]:[];
+  const answers=chat?[...chat.querySelectorAll('.ds-assistant-message-main-content')]:[];
+  const currentQuestion=clean(questions.at(-1)?.innerText||questions.at(-1)?.textContent||"");
+  const answer=clean(answers.at(-1)?.innerText||answers.at(-1)?.textContent||"");
+  const body=clean(chat?.innerText||"");
+  return {ok:true,url:location.href,title:document.title,body,currentQuestion,answer,sources:[...seen.values()]};
 })()
 """
 
@@ -142,9 +152,10 @@ LATEST_CHAT_JS = r"""
   const clean=(s)=>String(s||"").replace(/\s+/g," ").trim();
   const links=[...document.querySelectorAll('a[href*="/a/chat/s/"]')].map(a=>({href:a.href,text:clean(a.innerText||a.textContent),top:a.getBoundingClientRect().top,left:a.getBoundingClientRect().left}));
   links.sort((a,b)=>a.top-b.top||a.left-b.left);
-  if(links.length) return {ok:true,...links[0]};
-  if(location.href.includes('/a/chat/s/')) return {ok:true,href:location.href,text:document.title};
-  return {ok:false,url:location.href,title:document.title};
+  // 返回所有链接（不只是第一个），让调用者可以逐个尝试
+  if(links.length) return {ok:true,links:links};
+  if(location.href.includes('/a/chat/s/')) return {ok:true,links:[{href:location.href,text:document.title,top:0,left:0}]};
+  return {ok:false,url:location.href,title:document.title,links:[]};
 })()
 """
 
@@ -188,9 +199,12 @@ class DeepSeekAppController:
 
     def ensure_ready(self) -> None:
         self.d.app_start(self.PACKAGE, stop=False)
-        time.sleep(1)
-        if not any(self.d(text=hint).exists for hint in self.INPUT_HINTS) and not self.d(className="android.widget.EditText").exists:
-            raise RuntimeError("MuMu DeepSeek App 未显示输入区域，请检查登录态和页面")
+        deadline = time.time() + 18
+        while time.time() < deadline:
+            if any(self.d(text=hint).exists for hint in self.INPUT_HINTS) or self.d(className="android.widget.EditText").exists:
+                return
+            time.sleep(0.8)
+        raise RuntimeError("MuMu DeepSeek App 启动后 18 秒仍未显示输入区域，请检查登录态和页面")
 
     def _ensure_smart_search(self) -> None:
         """监控信源需要智能搜索；只在明确识别为关闭时点击。"""
@@ -414,14 +428,14 @@ class DeepSeekWebCollector:
         self._call("Page.navigate", {"url": url})
 
     def latest_chat(self, timeout: int = 20) -> dict[str, Any]:
-        """Return the first conversation in today's sidebar without opening it."""
+        """Return sidebar links from today's conversations."""
         self._navigate("https://chat.deepseek.com/")
         deadline = time.time() + timeout
         last: Any = None
         while time.time() < deadline:
             time.sleep(1)
             last = self.evaluate(LATEST_CHAT_JS)
-            if isinstance(last, dict) and last.get("ok") and last.get("href"):
+            if isinstance(last, dict) and last.get("ok") and last.get("links"):
                 return last
         if isinstance(last, dict) and not last.get("ok"):
             return last
@@ -429,27 +443,46 @@ class DeepSeekWebCollector:
 
     def collect_latest(self, question: str, timeout: int = 180, stable_seconds: int = 8,
                        previous_chat_url: str = "") -> dict:
-        """等待 App 会话同步到网页，打开最新会话后只做读取。"""
+        """等待 App 会话同步到网页，打开最新会话后只做读取。
+
+        关键：不能每轮都调 latest_chat（它会把页面导航回首页，重置 SPA），
+        否则会话正文永远没有时间异步加载，question 永远不在 body 中。
+        正确做法是拿到侧边栏链接列表后逐个尝试，找到包含预期问题的会话。
+        """
         deadline = time.time() + timeout
         last: Any = None
         previous_chat_url = str(previous_chat_url or "").split("?", 1)[0].rstrip("/")
         while time.time() < deadline:
             latest = self.latest_chat(timeout=min(20, max(3, int(deadline - time.time()))))
             last = latest
-            if isinstance(latest, dict) and latest.get("ok") and latest.get("href"):
-                latest_url = str(latest["href"]).split("?", 1)[0].rstrip("/")
-                if previous_chat_url and latest_url == previous_chat_url:
-                    time.sleep(2)
-                    continue
-                self._navigate(latest_url)
+            if not (isinstance(latest, dict) and latest.get("ok") and latest.get("links")):
                 time.sleep(2)
-                snapshot = self.evaluate(SNAPSHOT_JS)
-                last = snapshot
-                if isinstance(snapshot, dict) and question in str(snapshot.get("body") or ""):
+                continue
+            links = latest["links"]
+            # 找到第一个不是 previous_chat_url 的链接
+            candidates = [l for l in links if str(l.get("href", "")).split("?", 1)[0].rstrip("/") != previous_chat_url]
+            if not candidates:
+                time.sleep(2)
+                continue
+            # 逐个尝试侧边栏链接，找到包含预期问题的会话
+            for link in candidates:
+                latest_url = str(link.get("href", "")).split("?", 1)[0].rstrip("/")
+                self._navigate(latest_url)
+                question_deadline = time.time() + min(30, max(8, int(deadline - time.time())))
+                found = False
+                while time.time() < question_deadline:
+                    time.sleep(2)
+                    snapshot = self.evaluate(SNAPSHOT_JS)
+                    last = snapshot
+                    if isinstance(snapshot, dict) and str(snapshot.get("currentQuestion") or "").strip() == question:
+                        found = True
+                        break
+                if found:
                     result = self.wait_and_collect(timeout=max(10, int(deadline - time.time())), stable_seconds=stable_seconds, expected_question=question)
                     result["conversation_url"] = latest_url
                     return result
-            time.sleep(2)
+            # 所有链接都没匹配到预期问题，等待 App 同步新会话
+            time.sleep(3)
         raise TimeoutError("等待 DeepSeek App 会话同步到网页超时：" + json.dumps(last, ensure_ascii=False)[:500])
 
     def account_identity(self) -> dict[str, str]:
@@ -483,7 +516,7 @@ class DeepSeekWebCollector:
             if not isinstance(last, dict):
                 continue
             body = str(last.get("body") or "")
-            if expected_question and expected_question not in body:
+            if expected_question and str(last.get("currentQuestion") or "").strip() != expected_question:
                 stable_since = None
                 previous = (body, int(last.get("linkCount") or 0))
                 continue
@@ -493,6 +526,9 @@ class DeepSeekWebCollector:
                 if time.time() - stable_since >= stable_seconds:
                     result = self.evaluate(COLLECT_JS, timeout=60)
                     if isinstance(result, dict) and result.get("ok"):
+                        if expected_question and str(result.get("currentQuestion") or "").strip() != expected_question:
+                            stable_since = None
+                            continue
                         return result
             else:
                 stable_since = None

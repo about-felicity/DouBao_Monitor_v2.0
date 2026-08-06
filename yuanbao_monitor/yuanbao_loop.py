@@ -21,8 +21,10 @@ from typing import Any
 from controller import YuanbaoController
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from monitor_core.quality import invalid_answer_reason
+from monitor_core.quality import answer_quality_reason
 from monitor_core.scheduling import build_question_schedule
+from monitor_core.device_lock import device_session
+from monitor_core.lan_result_sync import enqueue as enqueue_remote_result
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -116,6 +118,7 @@ def append_jsonl(path: Path, record: dict[str, Any]):
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
+    enqueue_remote_result("yuanbao", record)
 
 
 def save_state(path: Path, state: dict[str, Any]):
@@ -177,21 +180,22 @@ def worker(
             try:
                 if controller is None:
                     controller = YuanbaoController(serial=serial, connect_timeout=args.connect_timeout)
-                previous_conversation = ""
-                if args.collect_web:
-                    from collector import YuanbaoSourceCollector
-                    if collector is None:
-                        device_number = args.device_order.get(serial, 0)
-                        port = args.chrome_port + device_number
-                        profile = BASE_DIR / "chrome_profile_auto" if len(args.device_order) == 1 else BASE_DIR / "chrome_profiles" / tag
-                        collector = YuanbaoSourceCollector(debug_port=port, user_data_dir=str(profile))
-                    previous_conversation = collector.latest_conversation_reference(refresh=True)
                 xml_path = diagnostic_dir / f"reply_{index + 1:06d}.xml"
                 xml_path.parent.mkdir(parents=True, exist_ok=True)
                 logger.info("[%s] 第 %d 轮，第 %d 次尝试：%s", serial, index + 1, attempt, question)
-                xml = controller.ask(question, save_xml_path=str(xml_path))
+                previous_conversation = ""
+                with device_session(serial, "元宝", timeout=args.web_timeout + 240, on_wait=logger.info):
+                    if args.collect_web:
+                        from collector import YuanbaoSourceCollector
+                        if collector is None:
+                            device_number = args.device_order.get(serial, 0)
+                            port = args.chrome_port + device_number
+                            profile = BASE_DIR / "chrome_profile_auto" if len(args.device_order) == 1 else BASE_DIR / "chrome_profiles" / tag
+                            collector = YuanbaoSourceCollector(debug_port=port, user_data_dir=str(profile))
+                        previous_conversation = collector.latest_conversation_reference(refresh=True)
+                    xml = controller.ask(question, save_xml_path=str(xml_path))
                 reply = controller.extract_visible_reply(xml, question)
-                skip_reason = invalid_answer_reason(reply)
+                skip_reason = answer_quality_reason(question, reply)
                 if skip_reason:
                     append_jsonl(Path(args.results), {
                         "status": "skipped", "skip_reason": skip_reason, "serial": serial,
@@ -234,14 +238,18 @@ def worker(
                             raise RuntimeError(str(web_result["error"]))
                         except Exception as web_exc:
                             logger.warning("[%s] 网页抓取第 %d 次失败：%s", serial, web_attempt, web_exc)
-                            collector = None
+                            # 只有当 driver 会话失效时才重建 collector，避免反复弹出 Chrome 窗口
+                            from selenium.common.exceptions import WebDriverException
+                            if isinstance(web_exc, WebDriverException) or "session" in str(web_exc).lower() or "no such" in str(web_exc).lower():
+                                logger.info("[%s] driver 会话失效，下次将重建 collector", serial)
+                                collector = None
                             if args.max_retries and web_attempt >= args.max_retries:
                                 web_result = {"error": str(web_exc)}
                                 break
                             STOP_EVENT.wait(args.retry_wait)
                 web_skip_reason = str(web_result.get("error") or "") if args.collect_web else ""
                 if args.collect_web and not web_skip_reason:
-                    web_skip_reason = invalid_answer_reason(str(web_result.get("body") or ""))
+                    web_skip_reason = answer_quality_reason(question, str(web_result.get("body") or ""))
                 record = {
                     "status": "skipped" if web_skip_reason else "success", "skip_reason": web_skip_reason,
                     "serial": serial, "round": index + 1,

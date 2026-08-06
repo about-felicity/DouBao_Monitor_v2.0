@@ -1,8 +1,17 @@
 import unittest
+from unittest import mock
 
 from monitor_core.analytics import build_analytics, prepare_analytics
+from monitor_core.cdp_chat import external_sources
+from monitor_core.owned_products import OWN_PRODUCT_RULES, own_product_mentions
 from monitor_core.plugins import discover_plugins
 from monitor_core.quality import invalid_answer_reason
+from monitor_core.recommendation_questions import (
+    CANONICAL_QUESTIONS,
+    PROMPTS,
+    canonical_recommendation_question,
+    validate_prompt_list,
+)
 from monitor_core.scheduling import build_question_schedule, normalize_question_mode
 
 
@@ -11,7 +20,24 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(invalid_answer_reason(""))
         self.assertTrue(invalid_answer_reason("好的"))
         self.assertTrue(invalid_answer_reason("系统异常，请稍后重试"))
+
+    def test_product_recommendation_refusal_is_skipped(self):
+        self.assertEqual(
+            invalid_answer_reason("面膜不在我的医疗健康服务范围内，我只能回答健康问题。"),
+            "模型拒绝或无法完成产品推荐",
+        )
+
+    def test_cross_topic_answer_is_skipped(self):
+        from monitor_core.quality import answer_quality_reason
+        self.assertTrue(answer_quality_reason("推荐一款眉毛增长液", "这里推荐几款染发剂，适合遮盖白发并且操作方便。"))
+        self.assertFalse(answer_quality_reason("推荐一款眉毛增长液", "眉毛增长液可从温和性和成分安全性两个方面选择。"))
+        self.assertTrue(invalid_answer_reason("检测到您当前设备环境有风险，请重新尝试请求"))
         self.assertFalse(invalid_answer_reason("这是一个内容完整、可以正常保存并用于信源分析的模型回答。"))
+
+    def test_nested_json_citations_are_extracted(self):
+        nested = '{"references":[{"sourceInfo":[{"referUrl":"https://example.com/a","title":"示例标题"}]}]}'
+        sources = external_sources({"chatContentStr": nested}, ("antafu.com",))
+        self.assertEqual(sources, [{"url": "https://example.com/a", "title": "示例标题"}])
 
 
 class SchedulingTests(unittest.TestCase):
@@ -31,8 +57,105 @@ class SchedulingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_question_mode("unknown")
 
+    def test_new_models_ask_prompts_and_archive_titles_are_strictly_separated(self):
+        self.assertEqual(len(PROMPTS), 13)
+        self.assertTrue(all(item.startswith("推荐一款") for item in PROMPTS))
+        self.assertTrue(all(item.endswith("推荐") for item in CANONICAL_QUESTIONS))
+        self.assertEqual(canonical_recommendation_question("推荐一款染发剂"), "染发剂推荐")
+        self.assertEqual(canonical_recommendation_question("推荐温和不刺激的染发剂与选购建议"), "染发剂推荐")
+        self.assertEqual(canonical_recommendation_question("2026年眉毛精华液怎么选"), "眉毛增长液推荐")
+        self.assertEqual(canonical_recommendation_question("随便聊聊别的问题"), "")
+        with self.assertRaises(ValueError):
+            validate_prompt_list(["天气怎么样"])
+
 
 class AnalyticsTests(unittest.TestCase):
+    def test_all_configured_owned_products_are_present(self):
+        self.assertEqual(len(OWN_PRODUCT_RULES), 24)
+        self.assertIn("姿生怡卸妆油", {rule["name"] for rule in OWN_PRODUCT_RULES})
+        self.assertEqual(
+            own_product_mentions("实测梵玢黑茶色染发剂，显色自然"),
+            ["梵玢染发剂（含黑茶色）"],
+        )
+        self.assertEqual(own_product_mentions("梵玢染发剂后使用普通洗发水"), ["梵玢染发剂（含黑茶色）"])
+
+    def test_article_body_owned_product_is_marked_but_video_body_is_ignored(self):
+        metadata = {"demo": {"id": "demo", "name": "Demo", "short_name": "D", "tone": "demo"}}
+        article_url = "https://example.com/article"
+        video_url = "https://bilibili.com/video/1"
+        runs = {"demo": [{
+            "model_id": "demo", "run_id": "demo-1", "sequence": 1,
+            "question": "护发素推荐", "finished_at": "2026-08-04T10:00:00+08:00",
+            "day": "2026-08-04", "serial": "local", "answer": "answer",
+            "status": "success", "brands": [], "products": [],
+            "sources": [
+                {"title": "护发指南", "url": article_url, "canonical_url": article_url, "domain": "example.com", "media": "示例", "type": "文章"},
+                {"title": "护发视频", "url": video_url, "canonical_url": video_url, "domain": "bilibili.com", "media": "哔哩哔哩", "type": "视频"},
+            ],
+        }]}
+        index = {"entries": {
+            article_url: {"status": "ok", "extraction_quality": "high", "own_product_schema_version": 2, "own_product_mentions": ["科熙本鱼子酱修护柔顺护发素"]},
+            video_url: {"status": "ok", "extraction_quality": "high", "own_product_schema_version": 2, "own_product_mentions": ["科熙本鱼子酱修护柔顺护发素"]},
+        }}
+        with mock.patch("monitor_core.analytics._content_index", return_value=index), \
+                mock.patch("monitor_core.analytics.CONTENT_INDEX_PATH") as path:
+            path.stat.return_value.st_mtime_ns = 1
+            model = build_analytics(metadata, runs)["models"][0]
+        article, video = model["recent_runs"][0]["sources"]
+        self.assertTrue(article["own_brand"])
+        self.assertEqual(article["own_products"], ["科熙本鱼子酱修护柔顺护发素"])
+        self.assertEqual(article["brand_match_scope"], "正文")
+        self.assertFalse(video["own_brand"])
+
+    def test_owned_brand_label_is_applied_to_every_model(self):
+        model_ids = ("deepseek", "yuanbao", "wenxin", "afu")
+        metadata = {model: {"id": model, "name": model, "short_name": model[0], "tone": model}
+                    for model in model_ids}
+        article_url = "https://example.com/owned-article"
+        runs = {}
+        for model in model_ids:
+            runs[model] = [{
+                "model_id": model, "run_id": model + "-1", "sequence": 1,
+                "question": "染发剂推荐", "finished_at": "2026-08-05T10:00:00+08:00",
+                "day": "2026-08-05", "serial": "local", "answer": "染发剂推荐正文",
+                "status": "success", "brands": [], "products": [],
+                "sources": [{"title": "染发文章", "url": article_url,
+                             "canonical_url": article_url, "domain": "example.com",
+                             "media": "示例", "type": "文章"}],
+            }]
+        index = {"entries": {article_url: {"status": "ok", "extraction_quality": "high",
+                                            "owned_brand_mentions": ["梵玢 FBCY"]}}}
+        with mock.patch("monitor_core.analytics._content_index", return_value=index), \
+                mock.patch("monitor_core.analytics.CONTENT_INDEX_PATH") as path:
+            path.stat.return_value.st_mtime_ns = 2
+            result = build_analytics(metadata, runs)
+        for model in result["models"]:
+            source = model["recent_runs"][0]["sources"][0]
+            self.assertTrue(source["own_brand"], model["id"])
+            self.assertIn("梵玢 FBCY", source["owned_brands"])
+            self.assertEqual(source["brand_match_scope"], "正文")
+
+    def test_brand_spacing_and_symbol_variants_merge_into_one_daily_row(self):
+        metadata = {"demo": {"id": "demo", "name": "Demo", "short_name": "D", "tone": "demo"}}
+        runs = {"demo": [{
+            "model_id": "demo", "run_id": "demo-1", "sequence": 1,
+            "question": "护发素推荐", "finished_at": "2026-08-04T10:00:00+08:00",
+            "day": "2026-08-04", "serial": "local", "answer": "Off & Relax 和 Off&Relax",
+            "status": "success", "brands": ["Off & Relax", "Off&Relax"],
+            "products": [
+                {"brand": "Off & Relax", "product_name": "护发素", "rank": 1},
+                {"brand": "Off&Relax", "product_name": "护发素", "rank": 2},
+            ],
+            "sources": [],
+        }]}
+        model = build_analytics(metadata, runs)["models"][0]
+        self.assertEqual(
+            [(item["name"], item["mentions"]) for item in model["brand_daily"][0]["items"]],
+            [("Off&Relax", 1)],
+        )
+        self.assertEqual(len(model["product_daily"][0]["items"]), 1)
+        self.assertEqual(model["product_daily"][0]["items"][0]["mentions"], 1)
+
     def test_selected_model_filter_options_do_not_leak_other_model_dates(self):
         metadata = {
             "a": {"id": "a", "name": "A", "short_name": "A", "tone": "a"},
@@ -70,7 +193,7 @@ class AnalyticsTests(unittest.TestCase):
 
     def test_models_are_discovered_from_isolated_plugin_directories(self):
         plugins = discover_plugins()
-        self.assertEqual(set(plugins), {"doubao", "yuanbao", "deepseek"})
+        self.assertEqual(set(plugins), {"afu", "deepseek", "doubao", "wenxin", "yuanbao"})
         self.assertEqual(plugins["doubao"].execution, "remote")
 
     def test_question_date_filter_and_source_types_are_isolated(self):

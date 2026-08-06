@@ -139,6 +139,13 @@ button {
   font-weight: 900;
   font-size: 11px;
 }
+.model-icon {
+  display: block;
+  border-radius: 8px;
+}
+.model-icon svg {
+  display: block;
+}
 .scope button b {
   font-size: 12px;
 }
@@ -155,6 +162,16 @@ button {
 .model-pill.deepseek {
   background: var(--violet-soft);
   color: var(--violet);
+}
+.scope button > i.wenxin,
+.model-pill.wenxin {
+  background: #e8f2ff;
+  color: #2563c7;
+}
+.scope button > i.afu,
+.model-pill.afu {
+  background: #fff0e8;
+  color: #d85d1f;
 }
 .sidebar nav {
   display: grid;
@@ -396,6 +413,14 @@ button {
   border-color: #e6def6;
   background: linear-gradient(145deg, #fdfcff, #f4effd);
 }
+.model-card.wenxin {
+  border-color: #d8e7fb;
+  background: linear-gradient(145deg, #fbfdff, #eef6ff);
+}
+.model-card.afu {
+  border-color: #f2dfd3;
+  background: linear-gradient(145deg, #fffdfb, #fff4ed);
+}
 .model-card header {
   display: flex;
   align-items: center;
@@ -417,6 +442,12 @@ button {
 }
 .model-card.deepseek header > i {
   color: var(--violet);
+}
+.model-card.wenxin header > i {
+  color: #2563c7;
+}
+.model-card.afu header > i {
+  color: #d85d1f;
 }
 .model-card header b,
 .model-card header small {
@@ -988,6 +1019,14 @@ button {
 .control-card > header > i.deepseek {
   background: var(--violet-soft);
   color: var(--violet);
+}
+.control-card > header > i.wenxin {
+  background: #e8f2ff;
+  color: #2563c7;
+}
+.control-card > header > i.afu {
+  background: #fff0e8;
+  color: #d85d1f;
 }
 .control-card h2 {
   margin: 0;

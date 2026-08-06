@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getIcon } from "./ModelIcon";
 
 type Source = {
   title: string;
@@ -11,6 +12,7 @@ type Source = {
   count?: number;
   brand_mentions?: string[];
   owned_brands?: string[];
+  own_products?: string[];
   own_brand?: boolean;
   brand_match_scope?: string;
 };
@@ -241,7 +243,7 @@ function SourceTop({
                   {item.media} · 出现 {item.count || 1} 轮
                 </small>
                 {item.own_brand && (
-                  <em className="owned-source">自有品牌 · {item.owned_brands?.join("、")} · {item.brand_match_scope}</em>
+                  <em className="owned-source">自有产品 · {item.own_products?.join("、") || item.owned_brands?.join("、")} · {item.brand_match_scope}</em>
                 )}
               </a>
             </li>
@@ -585,7 +587,7 @@ export function Dashboard() {
         <div className="brand">
           <div>MI</div>
           <span>
-            <b>模型情报台</b>
+            <b>GEO大模型监测</b>
             <small>
               <i className={error ? "off" : ""} />
               {error || "数据服务在线"}
@@ -598,21 +600,36 @@ export function Dashboard() {
             className={!model ? "active" : ""}
             onClick={() => setModel("")}
           >
-            <i>全</i>
+            <svg className="model-icon all-models" width={29} height={29} viewBox="0 0 29 29" fill="none">
+              <rect width="29" height="29" rx="8" fill="url(#all-grad)" />
+              <circle cx="10" cy="10" r="3" fill="white" opacity="0.9" />
+              <circle cx="19" cy="10" r="3" fill="white" opacity="0.9" />
+              <circle cx="10" cy="19" r="3" fill="white" opacity="0.9" />
+              <circle cx="19" cy="19" r="3" fill="white" opacity="0.9" />
+              <defs>
+                <linearGradient id="all-grad" x1="0" y1="0" x2="29" y2="29" gradientUnits="userSpaceOnUse">
+                  <stop stopColor="#34C298" />
+                  <stop offset="1" stopColor="#128062" />
+                </linearGradient>
+              </defs>
+            </svg>
             <b>全部模型</b>
             <small>综合比较</small>
           </button>
-          {analytics.model_catalog.map((item) => (
-            <button
-              className={model === item.id ? "active" : ""}
-              key={item.id}
-              onClick={() => setModel(item.id)}
-            >
-              <i className={item.tone}>{item.short_name}</i>
-              <b>{item.name}</b>
-              <small>{control[item.id]?.running ? "采集中" : "已停止"}</small>
-            </button>
-          ))}
+          {analytics.model_catalog.map((item) => {
+            const Icon = getIcon(item.tone);
+            return (
+              <button
+                className={model === item.id ? "active" : ""}
+                key={item.id}
+                onClick={() => setModel(item.id)}
+              >
+                {Icon ? <Icon className={`model-icon ${item.tone}`} size={29} /> : <i className={item.tone}>{item.short_name}</i>}
+                <b>{item.name}</b>
+                <small>{control[item.id]?.running ? "采集中" : "已停止"}</small>
+              </button>
+            );
+          })}
         </div>
         <nav>
           {views.map((item) => (
@@ -735,13 +752,15 @@ export function Dashboard() {
                   note="点击左侧模型可进入单模型视角"
                 />
                 <div className="model-grid">
-                  {selectedModels.map((item) => (
+                  {selectedModels.map((item) => {
+                    const Icon = getIcon(item.tone);
+                    return (
                     <article
                       className={`model-card ${item.tone}`}
                       key={item.id}
                     >
                       <header>
-                        <i>{item.short_name}</i>
+                        {Icon ? <Icon className={`model-icon ${item.tone}`} size={38} /> : <i>{item.short_name}</i>}
                         <div>
                           <b>{item.name}</b>
                           <small>
@@ -774,7 +793,8 @@ export function Dashboard() {
                         </div>
                       </dl>
                     </article>
-                  ))}
+                  );
+                  })}
                 </div>
               </section>
               <section className="two-col">
@@ -859,6 +879,7 @@ export function Dashboard() {
                         </thead>
                         <tbody>
                           {selectedModels.map((item) => {
+                            const Icon = getIcon(item.tone);
                             const max = Math.max(
                               1,
                               ...selectedModels.map((row) => row.sources),
@@ -867,7 +888,7 @@ export function Dashboard() {
                               <tr key={item.id}>
                                 <td>
                                   <span className={`model-pill ${item.tone}`}>
-                                    {item.short_name}
+                                    {Icon ? <Icon className="model-icon" size={28} /> : item.short_name}
                                   </span>
                                   <b>{item.name}</b>
                                 </td>
@@ -1010,7 +1031,7 @@ export function Dashboard() {
                     <article key={`${run.model.id}-${run.run_id}`}>
                       <header>
                         <span className={`model-pill ${run.model.tone}`}>
-                          {run.model.short_name}
+                          {(() => { const Icon = getIcon(run.model.tone); return Icon ? <Icon className="model-icon" size={28} /> : run.model.short_name; })()}
                         </span>
                         <b>
                           {run.model.name} · 第 {run.sequence} 轮
@@ -1039,7 +1060,7 @@ export function Dashboard() {
                               <small>
                                 {source.media} · {source.type}
                               </small>
-                              {source.own_brand && <em className="owned-source">自有品牌 · {source.owned_brands?.join("、")} · {source.brand_match_scope}</em>}
+                              {source.own_brand && <em className="owned-source">自有产品 · {source.own_products?.join("、") || source.owned_brands?.join("、")} · {source.brand_match_scope}</em>}
                             </li>
                           ))}
                         </ul>
@@ -1075,7 +1096,7 @@ export function Dashboard() {
                       key={item.id}
                     >
                       <header>
-                        <i className={item.tone}>{item.short_name}</i>
+                        {(() => { const Icon = getIcon(item.tone); return Icon ? <Icon className={`model-icon ${item.tone}`} size={42} /> : <i className={item.tone}>{item.short_name}</i>; })()}
                         <div>
                           <h2>{item.name}</h2>
                           <span>

@@ -95,9 +95,16 @@ deepseek*
 /deepseek_monitor/deepseek_results.jsonl
 /deepseek_monitor/deepseek_state.json
 /deepseek_monitor/dashboard.json
+/deepseek_monitor/deepseek_brand_ai_cache.json
 /deepseek_monitor/chrome_profile/
 /deepseek_monitor/__pycache__/
 /deepseek_monitor/*.log
+/wenxin_monitor/wenxin_results.jsonl
+/wenxin_monitor/wenxin_state.json
+/wenxin_monitor/dashboard.json
+/afu_monitor/afu_results.jsonl
+/afu_monitor/afu_state.json
+/afu_monitor/dashboard.json
 image_pro/
 mumu-python-api/
 outputs/

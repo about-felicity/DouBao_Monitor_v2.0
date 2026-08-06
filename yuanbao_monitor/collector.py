@@ -83,12 +83,18 @@ class YuanbaoSourceCollector:
 
     # ---------- 页面/会话同步 ----------
     def ensure_chat_page(self):
-        if self.YUANBAO_CHAT_URL not in self.driver.current_url:
+        current = str(self.driver.current_url or "").split("?", 1)[0]
+        if current.rstrip("/") != self.YUANBAO_CHAT_URL.rstrip("/"):
             print(f"正在跳转到 {self.YUANBAO_CHAT_URL}")
             self.driver.get(self.YUANBAO_CHAT_URL)
         else:
             print("刷新页面以同步最新对话...")
             self.driver.refresh()
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if self._safe_finds(By.CSS_SELECTOR, ".yb-recent-conv-list__item"):
+                return
+            time.sleep(0.5)
 
     def click_latest_conversation(self, timeout: int = 20) -> bool:
         """点击左侧聊天列表最上面的最新对话。"""
@@ -147,21 +153,32 @@ class YuanbaoSourceCollector:
             time.sleep(1)
         return ""
 
-    def click_new_conversation(self, previous_reference: str, timeout: int = 90) -> str:
-        """Wait for a newly synced first conversation and click only that item."""
+    def click_new_conversation(self, previous_reference: str, question: str = "", timeout: int = 90) -> str:
+        """Open the newly synced conversation whose main panel has this question."""
         deadline = time.time() + timeout
         last_refresh = 0.0
+        attempted: set[str] = set()
         while time.time() < deadline:
             items = self._safe_finds(By.CSS_SELECTOR, ".yb-recent-conv-list__item")
-            if items:
-                reference = self._conversation_reference(items[0])
-                if reference and (not previous_reference or reference != previous_reference):
-                    items[0].click()
+            for item in items[:12]:
+                reference = self._conversation_reference(item)
+                if not reference or reference == previous_reference or reference in attempted:
+                    continue
+                attempted.add(reference)
+                try:
+                    target = self._safe_find(By.CSS_SELECTOR, ".yb-recent-conv-list__item-name", item) or item
+                    self.driver.execute_script("arguments[0].click();", target)
                     time.sleep(2)
-                    return reference
+                    chat = self._safe_find(By.CSS_SELECTOR, "#chat-content")
+                    chat_text = str(chat.text if chat else "")
+                    if not question or question in chat_text:
+                        return reference
+                except Exception:
+                    continue
             if time.time() - last_refresh >= 4:
                 self.driver.refresh()
                 last_refresh = time.time()
+                attempted.clear()
             time.sleep(1)
         return ""
 
@@ -373,10 +390,13 @@ class YuanbaoSourceCollector:
         self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
         time.sleep(0.5)
 
-        try:
-            btn.click()
-        except Exception:
-            self.driver.execute_script("arguments[0].click();", btn)
+        # Yuanbao's React handler currently ignores Selenium's synthetic
+        # element.click() in some builds; a bubbling MouseEvent matches a real
+        # toolbar click and reliably opens the citation drawer.
+        self.driver.execute_script(
+            "arguments[0].dispatchEvent(new MouseEvent('click',"
+            "{bubbles:true,cancelable:true,view:window}));", btn
+        )
 
         # 等待右侧抽屉出现（真实 DOM: .t-drawer.agent-dialogue__drawer.t-drawer--open）
         print("等待右侧信源抽屉...")
@@ -403,14 +423,39 @@ class YuanbaoSourceCollector:
 
         # 用 JS 从整个页面提取所有 ref_card（抽屉打开后它们就在 DOM 里）
         js_result = self.driver.execute_script("""
+            function extractTitle(card) {
+                // 1. 优先取专用 title 元素
+                var titleEl = card.querySelector('.hyc-common-markdown__ref_card-title');
+                if (titleEl && titleEl.textContent.trim()) {
+                    return titleEl.textContent.trim();
+                }
+                // 2. title 元素内的 span
+                var spanEl = card.querySelector('.hyc-common-markdown__ref_card-title span');
+                if (spanEl && spanEl.textContent.trim()) {
+                    return spanEl.textContent.trim();
+                }
+                // 3. 卡片内的链接文本
+                var aEl = card.querySelector('a[href]');
+                if (aEl) {
+                    var aText = (aEl.textContent || aEl.getAttribute('title') || '').trim();
+                    if (aText) return aText.substring(0, 120);
+                }
+                // 4. 卡片内任意带文本的子元素
+                var candidates = card.querySelectorAll('[class*="title"], [class*="name"], [class*="desc"], span, p, div');
+                for (var j = 0; j < candidates.length; j++) {
+                    var t = (candidates[j].textContent || '').trim();
+                    if (t && t.length > 2) return t.substring(0, 120);
+                }
+                // 5. 兜底:卡片自身文本
+                var selfText = (card.textContent || '').trim().replace(/\\s+/g, ' ');
+                return selfText.substring(0, 120);
+            }
             var results = [];
             var cards = document.querySelectorAll('.hyc-common-markdown__ref_card');
             for (var i = 0; i < cards.length; i++) {
                 var url = cards[i].getAttribute('data-url') || '';
-                var titleEl = cards[i].querySelector('.hyc-common-markdown__ref_card-title');
-                var title = titleEl ? titleEl.textContent.trim() : '';
                 if (url) {
-                    results.push({url: url, title: title});
+                    results.push({url: url, title: extractTitle(cards[i])});
                 }
             }
             // 兜底：也从 agent-dialogue-references__item 的 dt-ext6 取
@@ -481,7 +526,7 @@ class YuanbaoSourceCollector:
         result.update(extra or {})
 
         self.ensure_chat_page()
-        conversation_reference = self.click_new_conversation(previous_conversation, timeout=wait_reply_timeout)
+        conversation_reference = self.click_new_conversation(previous_conversation, question, timeout=wait_reply_timeout)
         if not conversation_reference:
             result["error"] = "new_conversation_sync_timeout"
             self._save(result, output_path)

@@ -17,6 +17,8 @@ class Plugin(ModelPlugin):
     results = ROOT / "deepseek_monitor" / "deepseek_results.jsonl"
     dashboard = ROOT / "deepseek_monitor" / "dashboard.json"
     builder = ROOT / "deepseek_monitor" / "build_dashboard_data.py"
+    execution = "remote"
+    supports_control = False
 
     def ready(self) -> bool:
         return self.questions.exists() and self.runner.exists()
@@ -47,10 +49,12 @@ class Plugin(ModelPlugin):
 
     def account_check(self) -> dict[str, Any]:
         from deepseek_monitor.controller import DeepSeekAppController, DeepSeekWebCollector, ensure_deepseek_chrome
+        from monitor_core.device_lock import device_session
         ensure_deepseek_chrome(9333)
         app = DeepSeekAppController("127.0.0.1:16384")
         web = DeepSeekWebCollector(9333)
-        mobile = app.account_identity()
+        with device_session("127.0.0.1:16384", "DeepSeek 账号校验", timeout=300):
+            mobile = app.account_identity()
         browser = web.account_identity()
         matched = bool(mobile.get("name") and browser.get("name") and mobile["name"].casefold() == browser["name"].casefold())
         return {"ok": matched, "status": "matched" if matched else "mismatch", "message": "模拟器与网页账号一致" if matched else "模拟器与网页账号不一致",

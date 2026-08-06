@@ -74,7 +74,9 @@ def _read_cache() -> dict[str, Any]:
 
 
 def _write_cache(cache: dict[str, Any]) -> None:
-    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
+    temp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(CACHE_FILE)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -244,31 +246,47 @@ def analyze_records(records: list[dict[str, Any]]) -> tuple[dict[str, dict[str, 
         key = _body_hash(body)
         record_by_hash[key] = record
         if key not in entries:
+            candidates = _candidate_lines(body)
+            if not candidates:
+                entries[key] = {"model": "deterministic", "products": [], "candidate_count": 0}
+                continue
             prepared.append({
                 "id": key[:16],
                 "hash": key,
                 "question": str(record.get("question") or ""),
                 "body": body,
-                "candidates": _candidate_lines(body),
+                "candidates": candidates,
             })
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL)
-    if prepared:
-        response, usage, model = _call_deepseek(prepared)
-        response_items = {
-            str(item.get("id")): item for item in response.get("items", []) if isinstance(item, dict)
-        }
-        for item in prepared:
-            raw = response_items.get(item["id"], {})
-            products = _validate_products(item["body"], raw.get("products"))
-            entries[item["hash"]] = {
-                "model": model,
-                "products": products,
-                "candidate_count": len(item["candidates"]),
+    limit = max(0, int(os.getenv("YUANBAO_AI_MAX_NEW_PER_BUILD", "24") or 24))
+    # Newest captures are analyzed first; historical uncached rows keep the
+    # deterministic grounded fallback instead of delaying today's dashboard.
+    selected = prepared[-limit:] if limit else []
+    errors: list[str] = []
+    analyzed_hashes: set[str] = set()
+    for offset in range(0, len(selected), 8):
+        batch = selected[offset:offset + 8]
+        try:
+            response, batch_usage, model = _call_deepseek(batch)
+            for key in usage:
+                usage[key] += int(batch_usage.get(key) or 0)
+            response_items = {
+                str(item.get("id")): item for item in response.get("items", []) if isinstance(item, dict)
             }
-        cache["model"] = model
-        _write_cache(cache)
+            for item in batch:
+                raw = response_items.get(item["id"], {})
+                products = _validate_products(item["body"], raw.get("products"))
+                entries[item["hash"]] = {"model": model, "products": products,
+                                         "candidate_count": len(item["candidates"])}
+                analyzed_hashes.add(item["hash"])
+            cache["model"] = model
+            _write_cache(cache)
+        except Exception as exc:
+            errors.append(str(exc)[:300])
+            # Keep cached results and deterministic grounded coverage available;
+            # one malformed model response must never blank the whole dashboard.
 
     output: dict[str, dict[str, Any]] = {}
     for key, record in record_by_hash.items():
@@ -277,13 +295,15 @@ def analyze_records(records: list[dict[str, Any]]) -> tuple[dict[str, dict[str, 
         output[key] = {
             "model": cached.get("model") or model,
             "products": _validate_products(body, cached.get("products")),
-            "cached": key not in {item["hash"] for item in prepared},
+            "cached": key not in analyzed_hashes,
         }
     return output, {
         "model": model,
         "prompt_version": PROMPT_VERSION,
-        "new_analyses": len(prepared),
-        "cached_analyses": len(records) - len(prepared),
+        "new_analyses": len(analyzed_hashes),
+        "cached_analyses": len(records) - len(analyzed_hashes),
+        "pending_analyses": max(0, len(prepared) - len(analyzed_hashes)),
+        "errors": errors,
         "usage": usage,
     }
 

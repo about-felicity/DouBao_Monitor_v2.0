@@ -17,6 +17,8 @@ class Plugin(ModelPlugin):
     results = ROOT / "yuanbao_monitor" / "yuanbao_results.jsonl"
     dashboard = ROOT / "yuanbao_monitor" / "dashboard" / "public" / "data" / "dashboard.json"
     builder = ROOT / "yuanbao_monitor" / "build_dashboard_data.py"
+    execution = "remote"
+    supports_control = False
 
     def ready(self) -> bool:
         return self.questions.exists() and self.runner.exists()
@@ -43,8 +45,10 @@ class Plugin(ModelPlugin):
     def account_check(self) -> dict[str, Any]:
         from yuanbao_monitor.bowser import ensure_yuanbao_chrome, yuanbao_web_identity
         from yuanbao_monitor.controller import YuanbaoController
+        from monitor_core.device_lock import device_session
         ensure_yuanbao_chrome(9222, user_data_dir=str(ROOT / "yuanbao_monitor" / "chrome_profile_auto"))
-        mobile = YuanbaoController("127.0.0.1:16384").account_identity()
+        with device_session("127.0.0.1:16384", "元宝账号校验", timeout=300):
+            mobile = YuanbaoController("127.0.0.1:16384").account_identity()
         web = yuanbao_web_identity(9222)
         matched = bool(mobile.get("name") and web.get("name") and mobile["name"].casefold() == web["name"].casefold())
         return {"ok": matched, "status": "matched" if matched else "mismatch",

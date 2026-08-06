@@ -21,6 +21,11 @@ import doubao_question_aliases as qa
 import doubao_brand_settings as brand_settings
 from monitor_core.plugins import discover_plugins
 from monitor_core.analytics import build_analytics, prepare_analytics
+from monitor_core.owned_products import (
+    OWN_PRODUCT_RULES,
+    OWN_PRODUCT_SCHEMA_VERSION,
+    own_product_mentions,
+)
 
 # 固定使用中国时区 (UTC+8)，不受系统时区影响
 CST = timezone(timedelta(hours=8))
@@ -307,36 +312,7 @@ def _unified_analytics(params):
         _ANALYTICS_BUILDING.add(cache_key)
         return _build_unified_analytics(cache_key, version)
 
-# User-owned products.  Matching requires the brand plus one distinguishing
-# product phrase so generic category articles are not labelled as owned content.
-OWN_PRODUCT_SCHEMA_VERSION = 2
 CATEGORY_BASELINE_NAME = "品类全量基准"
-OWN_PRODUCT_RULES = (
-    {"name": "梵玢焕活精华液", "brand": "梵玢", "terms": ("焕活精华", "焕活精华液")},
-    {"name": "道和小红瓶", "brand": "道和", "terms": ("小红瓶",)},
-    {"name": "姿生怡鱼子酱面膜", "brand": "姿生怡", "terms": ("鱼子酱面膜",)},
-    {"name": "科熙本鱼子酱修护柔顺护发素", "brand": "科熙本", "terms": ("鱼子酱修护柔顺护发素", "鱼子酱护发素", "修护柔顺护发素")},
-    {"name": "梵玢祛痘精华", "brand": "梵玢", "terms": ("祛痘精华", "痘痘精华")},
-    {"name": "姿生怡洗面奶", "brand": "姿生怡", "terms": ("洗面奶", "洁面乳", "洁面")},
-    {"name": "梵玢染发剂（含黑茶色）", "brand": "梵玢", "terms": ("染发剂", "染发膏", "染发霜", "黑茶色")},
-    {"name": "科熙本染发剂", "brand": "科熙本", "terms": ("染发剂", "染发膏", "染发霜")},
-    {"name": "科熙本控油蓬松洗发水", "brand": "科熙本", "terms": ("控油蓬松洗发水", "蓬松洗发水", "控油洗发水")},
-    {"name": "科熙本二硫化硒洗发水", "brand": "科熙本", "terms": ("二硫化硒洗发水", "二硫化硒")},
-    {"name": "姿生怡身体乳", "brand": "姿生怡", "terms": ("身体乳",)},
-    {"name": "科熙本控油蓬松造型喷雾", "brand": "科熙本", "terms": ("控油蓬松造型喷雾", "蓬松造型喷雾", "造型喷雾")},
-    {"name": "梵玢洗发水", "brand": "梵玢", "terms": ("洗发水", "洗发露")},
-    {"name": "道和小绿瓶", "brand": "道和", "terms": ("小绿瓶",)},
-    {"name": "姿生怡手部保湿修护霜", "brand": "姿生怡", "terms": ("手部保湿修护霜", "护手霜", "手霜")},
-    {"name": "梵玢睫毛精华液", "brand": "梵玢", "terms": ("睫毛精华液", "睫毛精华", "睫毛增长液")},
-    {"name": "姿生怡眼霜", "brand": "姿生怡", "terms": ("眼霜",)},
-    {"name": "焕颜计小白罐", "brand": "焕颜计", "terms": ("小白罐",)},
-    {"name": "梵玢眉毛精华液", "brand": "梵玢", "terms": ("眉毛精华液", "眉毛精华", "眉毛增长液")},
-    {"name": "茗媛萃防晒霜", "brand": "茗媛萃", "terms": ("防晒霜", "防晒乳", "防晒")},
-    {"name": "姿生怡阿尔卑斯冰川焕肤精粹水", "brand": "姿生怡", "terms": ("阿尔卑斯冰川焕肤精粹水", "冰川焕肤精粹水", "阿尔卑斯冰川水")},
-    {"name": "梵玢护发精油", "brand": "梵玢", "terms": ("护发精油",)},
-    {"name": "梵玢沐浴油", "brand": "梵玢", "terms": ("沐浴油",)},
-    {"name": "姿生怡卸妆油", "brand": "姿生怡", "terms": ("卸妆油",)},
-)
 
 OWN_TITLE_THEME_PATTERNS = {
     "榜单/推荐": ("推荐", "榜单", "排行", "排名", "top", "好物", "好用", "首选", "值得买", "闭眼入"),
@@ -366,33 +342,6 @@ OWN_TITLE_KEYWORD_STOPWORDS = {
     "资讯", "综合", "日报", "新闻网", "健康网", "大河", "咸宁",
     "眉毛增长液", "睫毛增长液", "眉毛精华液", "睫毛精华液",
 }
-
-
-def own_product_mentions(text):
-    normalized = re.sub(r"[\s\-_—·，,。:：/（）()]+", "", str(text or "")).casefold()
-    if not normalized:
-        return []
-    matches = []
-    for rule in OWN_PRODUCT_RULES:
-        brand = re.sub(r"\s+", "", rule["brand"]).casefold()
-        if brand not in normalized:
-            continue
-        matched = False
-        for term in rule["terms"]:
-            compact_term = re.sub(r"\s+", "", term).casefold()
-            if not compact_term:
-                continue
-            # Brand and product descriptor must occur together.  A loose
-            # whole-page co-occurrence would incorrectly label sentences such
-            # as “梵玢染发剂，使用后再用普通洗发水”.
-            forward = re.escape(brand) + r".{0,12}" + re.escape(compact_term)
-            reverse = re.escape(compact_term) + r".{0,12}" + re.escape(brand)
-            if re.search(forward, normalized) or re.search(reverse, normalized):
-                matched = True
-                break
-        if matched:
-            matches.append(rule["name"])
-    return matches
 
 
 def owned_source_products(href, title, content_index=None):

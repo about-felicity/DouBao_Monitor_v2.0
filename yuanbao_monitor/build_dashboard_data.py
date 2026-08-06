@@ -12,6 +12,10 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from yuanbao_brand_ai import analyze_records, record_hash
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from monitor_core.quality import answer_quality_reason
+
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS = BASE_DIR / "yuanbao_results.jsonl"
@@ -250,9 +254,18 @@ def main() -> None:
             except json.JSONDecodeError:
                 continue
     success_records = []
+    quarantine = []
     seen_record_ids: set[str] = set()
     for record in raw_records:
         if record.get("status") != "success":
+            continue
+        quality_reason = answer_quality_reason(
+            str(record.get("question") or ""),
+            str(record.get("web_body") or record.get("reply") or ""),
+        )
+        if quality_reason:
+            quarantine.append({"round": record.get("round"), "question": record.get("question"),
+                               "reason": quality_reason, "conversation_reference": record.get("conversation_reference")})
             continue
         unique_id = record_id(record)
         if unique_id in seen_record_ids:
@@ -266,6 +279,8 @@ def main() -> None:
     if success_records:
         try:
             ai_results, ai_meta = analyze_records(success_records)
+            if ai_meta.get("errors"):
+                ai_error = "；".join(str(item) for item in ai_meta["errors"][:3])
         except Exception as exc:
             # 已缓存数据仍可通过下一次运行恢复；错误中不会包含密钥。
             ai_error = str(exc)[:700]
@@ -379,6 +394,7 @@ def main() -> None:
         "top_article_links": source_link_summary(runs, "文章", 10),
         "top_video_links": source_link_summary(runs, "视频", 10),
         "ai_analysis": {**ai_meta, "status": "error" if ai_error else "ready", "error": ai_error},
+        "quality_quarantine": {"count": len(quarantine), "records": quarantine},
         "metric_notes": {
             "mention_rate": "提及该产品的轮次 ÷ 同品类问题的有效轮次",
             "body_rank": "按产品首次证据在回答正文中的出现顺序计算",

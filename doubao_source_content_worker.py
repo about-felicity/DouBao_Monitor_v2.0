@@ -29,6 +29,10 @@ BASE_DIR = Path(__file__).resolve().parent
 SCRAPLING_DIR = BASE_DIR / "Scrapling"
 REFS_CSV = BASE_DIR / "doubao_refs_result.csv"
 PRODUCTS_CSV = BASE_DIR / "doubao_products_result.csv"
+DEEPSEEK_RESULTS = BASE_DIR / "deepseek_monitor" / "deepseek_results.jsonl"
+YUANBAO_RESULTS = BASE_DIR / "yuanbao_monitor" / "yuanbao_results.jsonl"
+WENXIN_RESULTS = BASE_DIR / "wenxin_monitor" / "wenxin_results.jsonl"
+AFU_RESULTS = BASE_DIR / "afu_monitor" / "afu_results.jsonl"
 INDEX_PATH = BASE_DIR / "doubao_source_content_index.json"
 DB_PATH = BASE_DIR / "doubao_source_content.db"
 LOCK_PATH = BASE_DIR / "doubao_source_content_worker.lock"
@@ -38,7 +42,7 @@ CST = timezone(timedelta(hours=8))
 MAX_BYTES = max(500_000, int(os.environ.get("DOUBAO_CONTENT_MAX_BYTES", "4000000") or 4000000))
 MAX_TEXT_CHARS = max(20_000, int(os.environ.get("DOUBAO_CONTENT_MAX_TEXT", "300000") or 300000))
 WORKERS = max(1, min(12, int(os.environ.get("DOUBAO_CONTENT_WORKERS", "6") or 6)))
-BATCH_SIZE = max(1, int(os.environ.get("DOUBAO_CONTENT_BATCH", "120") or 120))
+BATCH_SIZE = max(1, int(os.environ.get("DOUBAO_CONTENT_BATCH", "12") or 12))
 REQUEST_TIMEOUT = max(5, int(os.environ.get("DOUBAO_CONTENT_TIMEOUT", "18") or 18))
 HOST_DELAY = max(0.0, float(os.environ.get("DOUBAO_CONTENT_HOST_DELAY", "0.35") or 0.35))
 MIN_CONTENT_CHARS = 80
@@ -57,6 +61,7 @@ HEADERS = {
 
 HOST_LOCKS = {}
 HOST_LOCKS_GUARD = threading.Lock()
+DYNAMIC_FETCH_LOCK = threading.Semaphore(3)
 _BRAND_CACHE = {"mtime": None, "value": None}
 _URL_CACHE = {"mtime": None, "value": None}
 
@@ -534,6 +539,44 @@ def fetch_http_with_scrapling(url):
     }
 
 
+def fetch_http_with_stealthy_scrapling(url):
+    """Render a script-heavy article in a hidden real browser as last fallback."""
+    if SCRAPLING_DIR.exists() and str(SCRAPLING_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRAPLING_DIR))
+    from scrapling.fetchers import StealthyFetcher
+
+    with DYNAMIC_FETCH_LOCK:
+        page = StealthyFetcher.fetch(
+            url,
+            headless=True,
+            real_chrome=True,
+            disable_resources=True,
+            network_idle=False,
+            load_dom=True,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            timeout=REQUEST_TIMEOUT * 1000,
+            wait=800,
+        )
+    raw = page.body
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="ignore")
+    raw = bytes(raw or b"")[:MAX_BYTES]
+    headers = page.headers
+    content_type = str(
+        headers.get("Content-Type")
+        or headers.get("content-type")
+        or "text/html"
+    )
+    return {
+        "status_code": int(page.status),
+        "final_url": str(page.url or url),
+        "content_type": content_type,
+        "raw": raw,
+        "transport": "scrapling_stealth",
+    }
+
+
 def fetch_http_with_requests(url):
     response = requests.get(
         url, headers=HEADERS, timeout=(6, REQUEST_TIMEOUT), stream=True,
@@ -562,7 +605,7 @@ def iso_after(seconds):
     return (datetime.now(CST) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
-def fetch_one(url, previous_attempts=0):
+def fetch_one(url, previous_attempts=0, source_title=""):
     attempts = previous_attempts + 1
     fetched_at = now_str()
     safe, reason = safe_public_url(url)
@@ -590,12 +633,24 @@ def fetch_one(url, previous_attempts=0):
     try:
         with host_lock:
             try:
-                response = fetch_http_with_scrapling(url)
-            except Exception as scrapling_exc:
-                log("Scrapling fallback for %s: %s" % (
-                    url, repr(scrapling_exc)[:240],
-                ))
                 response = fetch_http_with_requests(url)
+            except Exception as request_exc:
+                log("Requests failed; Scrapling HTTP fallback for %s: %s" % (
+                    url, repr(request_exc)[:240],
+                ))
+                response = fetch_http_with_scrapling(url)
+            if (
+                int(response.get("status_code") or 0) >= 400
+                and not dashboard.own_product_mentions(source_title)
+            ):
+                try:
+                    rendered = fetch_http_with_stealthy_scrapling(url)
+                    if int(rendered.get("status_code") or 0) < int(response.get("status_code") or 999):
+                        response = rendered
+                except Exception as render_exc:
+                    log("Scrapling browser status fallback failed for %s: %s" % (
+                        url, repr(render_exc)[:240],
+                    ))
             final_url = response["final_url"]
             final_safe, final_reason = safe_public_url(final_url)
             if not final_safe:
@@ -624,6 +679,38 @@ def fetch_one(url, previous_attempts=0):
             }
         decoded = decode_bytes(raw, content_type)
         title, content_text, method, quality = extract_html_content(decoded)
+        if (
+            len(content_text) < MIN_CONTENT_CHARS
+            and transport != "scrapling_stealth"
+            and not dashboard.own_product_mentions(source_title)
+        ):
+            try:
+                with host_lock:
+                    rendered = fetch_http_with_stealthy_scrapling(url)
+                    if HOST_DELAY:
+                        time.sleep(HOST_DELAY)
+                rendered_url = rendered["final_url"]
+                rendered_safe, rendered_reason = safe_public_url(rendered_url)
+                if not rendered_safe:
+                    raise ValueError("unsafe rendered redirect: " + rendered_reason)
+                if int(rendered.get("status_code") or 0) < 400:
+                    rendered_decoded = decode_bytes(
+                        rendered["raw"], rendered["content_type"]
+                    )
+                    rendered_title, rendered_text, rendered_method, rendered_quality = extract_html_content(rendered_decoded)
+                    if len(rendered_text) > len(content_text):
+                        final_url = rendered_url
+                        content_type = rendered["content_type"]
+                        status_code = int(rendered["status_code"])
+                        transport = rendered["transport"]
+                        title = rendered_title or title
+                        content_text = rendered_text
+                        method = rendered_method
+                        quality = rendered_quality
+            except Exception as render_exc:
+                log("Scrapling browser content fallback failed for %s: %s" % (
+                    url, repr(render_exc)[:240],
+                ))
         if len(content_text) < MIN_CONTENT_CHARS:
             return {
                 "status": "empty", "fetched_at": fetched_at, "attempts": attempts,
@@ -651,29 +738,79 @@ def fetch_one(url, previous_attempts=0):
         }
 
 
+def _load_jsonl_sources(path):
+    """从模型采集 jsonl 读取信源 URL,返回 {url: (run_no, title)} 字典。
+
+    覆盖 DeepSeek 和元宝的信源,使正文 worker 不再只处理豆包 CSV。
+    """
+    result = {}
+    if not path.exists():
+        return result
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if record.get("status") != "success":
+                continue
+            run_no = int(record.get("round") or 0)
+            for source in record.get("sources") or []:
+                url = str(source.get("url") or source.get("href") or "").strip()
+                if not url:
+                    continue
+                title = str(source.get("title") or "")
+                current = result.get(url)
+                if current is None or run_no > current[0]:
+                    result[url] = (run_no, title)
+    except Exception as exc:
+        log("jsonl sources load failed for %s: %s" % (path, repr(exc)))
+    return result
+
+
 def collect_urls():
-    if not REFS_CSV.exists():
-        return []
-    mtime = REFS_CSV.stat().st_mtime_ns
+    source_files = (REFS_CSV, DEEPSEEK_RESULTS, YUANBAO_RESULTS, WENXIN_RESULTS, AFU_RESULTS)
+    mtime = sum(f.stat().st_mtime_ns if f.exists() else 0 for f in source_files)
     if _URL_CACHE["mtime"] == mtime and _URL_CACHE["value"] is not None:
         return _URL_CACHE["value"]
-    latest = {}
-    with REFS_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            url = str(row.get("href") or "").strip()
-            if not url:
-                continue
-            try:
-                run_no = int(str(row.get("run_no") or "0") or 0)
-            except (TypeError, ValueError):
-                run_no = 0
-            current = latest.get(url)
+    buckets = {"doubao": {}, "deepseek": {}, "yuanbao": {}, "wenxin": {}, "afu": {}}
+    if REFS_CSV.exists():
+        with REFS_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                url = str(row.get("href") or "").strip()
+                if not url:
+                    continue
+                try:
+                    run_no = int(str(row.get("run_no") or "0") or 0)
+                except (TypeError, ValueError):
+                    run_no = 0
+                current = buckets["doubao"].get(url)
+                if current is None or run_no > current[0]:
+                    buckets["doubao"][url] = (run_no, str(row.get("title") or ""))
+    for model_id, jsonl_path in (("deepseek", DEEPSEEK_RESULTS), ("yuanbao", YUANBAO_RESULTS),
+                                 ("wenxin", WENXIN_RESULTS), ("afu", AFU_RESULTS)):
+        for url, (run_no, title) in _load_jsonl_sources(jsonl_path).items():
+            current = buckets[model_id].get(url)
             if current is None or run_no > current[0]:
-                latest[url] = (run_no, str(row.get("title") or ""))
-    value = sorted(
-        ({"url": url, "run_no": value[0], "title": value[1]} for url, value in latest.items()),
-        key=lambda item: (-item["run_no"], item["url"]),
-    )
+                buckets[model_id][url] = (run_no, title)
+    ordered = {
+        model_id: sorted(
+            ({"url": url, "run_no": meta[0], "title": meta[1], "model": model_id}
+             for url, meta in values.items()), key=lambda item: (-item["run_no"], item["url"])
+        )
+        for model_id, values in buckets.items()
+    }
+    # Fair round-robin prevents a large Doubao backlog from starving a newly
+    # added model's article bodies and therefore its owned-brand labels.
+    value, seen = [], set()
+    max_len = max((len(rows) for rows in ordered.values()), default=0)
+    for index in range(max_len):
+        for model_id in ("deepseek", "yuanbao", "wenxin", "afu", "doubao"):
+            rows = ordered[model_id]
+            if index >= len(rows) or rows[index]["url"] in seen:
+                continue
+            seen.add(rows[index]["url"])
+            value.append(rows[index])
     _URL_CACHE.update({"mtime": mtime, "value": value})
     return value
 
@@ -690,6 +827,8 @@ def article_urls(urls):
 
 def due(entry, vocab_hash):
     if not entry:
+        return True
+    if entry.get("vocab_hash") != vocab_hash:
         return True
     if entry.get("status") == "ok" and entry.get("vocab_hash") != vocab_hash:
         return True
@@ -896,7 +1035,12 @@ def process_batch(index, connection, urls, brands, vocab_hash, limit):
     results = {}
     with ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="source-content") as pool:
         futures = {
-            pool.submit(fetch_one, item["url"], int((entries.get(item["url"]) or {}).get("attempts") or 0)): item
+            pool.submit(
+                fetch_one,
+                item["url"],
+                int((entries.get(item["url"]) or {}).get("attempts") or 0),
+                item.get("title", ""),
+            ): item
             for item in selected
         }
         for future in as_completed(futures):
@@ -932,9 +1076,34 @@ def process_batch(index, connection, urls, brands, vocab_hash, limit):
     return skipped_now + len(selected), max(0, len(pending) - len(selected))
 
 
+def refresh_all_vocab(connection, index, urls, brands, vocab_hash):
+    entries = index.setdefault("entries", {})
+    updated_count = 0
+    for item in urls:
+        url = item["url"]
+        entry = entries.get(url) or {}
+        if entry.get("status") != "ok":
+            continue
+        updated = refresh_vocab_only(
+            connection, url, entry, brands, vocab_hash
+        )
+        if updated:
+            entries[url] = updated
+            updated_count += 1
+    index["vocab_hash"] = vocab_hash
+    index["updated_at"] = now_str()
+    atomic_json_write(INDEX_PATH, index)
+    return updated_count
+
+
 def main():
     parser = argparse.ArgumentParser(description="Incrementally archive public source-page content.")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument(
+        "--vocab-only",
+        action="store_true",
+        help="Re-evaluate archived article bodies without making network requests.",
+    )
     parser.add_argument("--limit", type=int, default=BATCH_SIZE)
     parser.add_argument(
         "--articles-only",
@@ -949,13 +1118,24 @@ def main():
     try:
         connection = init_db()
         index = load_index()
+        if args.vocab_only:
+            brands, vocab_hash = brand_vocabulary()
+            updated = refresh_all_vocab(
+                connection,
+                index,
+                article_urls(collect_urls()),
+                brands,
+                vocab_hash,
+            )
+            log("vocab refresh updated=%s" % updated)
+            return
         log("watch start workers=%s batch=%s" % (WORKERS, args.limit))
         while args.once or dashboard_running():
             heartbeat()
             brands, vocab_hash = brand_vocabulary()
-            urls = collect_urls()
-            if args.articles_only:
-                urls = article_urls(urls)
+            # Video ownership is title-only. Browser rendering is reserved for
+            # article pages where body text changes the ownership verdict.
+            urls = article_urls(collect_urls())
             processed, remaining = process_batch(
                 index, connection, urls, brands, vocab_hash, max(1, args.limit)
             )

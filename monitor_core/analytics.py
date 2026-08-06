@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from monitor_core.owned_products import (
+    OWN_PRODUCT_SCHEMA_VERSION,
+    brands_for_products,
+    own_product_mentions,
+)
+
 try:
     import jieba
 except ImportError:  # 部署未安装时仍可使用内置保守分词。
@@ -49,15 +55,21 @@ def content_index() -> dict[str, Any]:
         stamp = CONTENT_INDEX_PATH.stat().st_mtime_ns
     except OSError:
         stamp = 0
-    return _content_index(stamp)
+    value = _content_index(stamp)
+    entries = value.get("entries")
+    return entries if isinstance(entries, dict) else value
+
+
+def brand_vocabulary() -> list[dict[str, Any]]:
+    try:
+        import doubao_brand_settings
+        return list(doubao_brand_settings.vocabulary())
+    except (ImportError, OSError, ValueError):
+        return []
 
 
 def owned_brand_vocabulary() -> list[dict[str, Any]]:
-    try:
-        import doubao_brand_settings
-        return [item for item in doubao_brand_settings.vocabulary() if item.get("group") == "owned"]
-    except (ImportError, OSError, ValueError):
-        return []
+    return [item for item in brand_vocabulary() if item.get("group") == "owned"]
 
 
 def canonical_question(value: str) -> str:
@@ -132,6 +144,7 @@ def normalize_source(raw: dict[str, Any]) -> dict[str, Any]:
             "media": str(raw.get("media") or "").strip() or media_name(domain), "type": kind,
             "brand_mentions": list(raw.get("brand_mentions") or []),
             "owned_brands": list(raw.get("owned_brands") or []),
+            "own_products": list(raw.get("own_products") or []),
             "own_brand": bool(raw.get("own_brand")), "brand_match_scope": str(raw.get("brand_match_scope") or "")}
 
 
@@ -265,18 +278,50 @@ def _product_fields(raw: dict[str, Any]) -> tuple[str, str, int]:
 def _catalogs(runs_by_model: dict[str, list[dict[str, Any]]]) -> tuple[dict[str, set[str]], dict[str, tuple[str, str]]]:
     brand_aliases: dict[str, set[str]] = defaultdict(set)
     product_catalog: dict[str, tuple[str, str]] = {}
-    canonical_by_fold: dict[str, str] = {}
+    canonical_by_key: dict[str, str] = {}
+    raw_brands: list[str] = []
+
+    for item in brand_vocabulary():
+        canonical = str(item.get("name") or "").strip()
+        if not valid_brand(canonical):
+            continue
+        aliases = {
+            str(alias or "").strip()
+            for alias in item.get("aliases") or []
+            if str(alias or "").strip()
+        } | {canonical}
+        brand_aliases[canonical].update(aliases)
+        for alias in aliases:
+            key = _compact(alias)
+            if key:
+                canonical_by_key[key] = canonical
+
+    for runs in runs_by_model.values():
+        for run in runs:
+            raw_brands.extend(str(brand or "").strip() for brand in run.get("brands") or [])
+            for raw in run.get("products") or []:
+                brand, _product, _rank = _product_fields(raw)
+                if brand:
+                    raw_brands.append(brand)
+
+    variants: dict[str, Counter[str]] = defaultdict(Counter)
+    for name in raw_brands:
+        if valid_brand(name) and _compact(name) not in canonical_by_key:
+            variants[_compact(name)][name] += 1
+    for key, counts in variants.items():
+        canonical_by_key[key] = sorted(
+            counts,
+            key=lambda name: (-counts[name], name.count(" "), len(name), name.casefold()),
+        )[0]
+
     def add_brand(value: str) -> str:
         name = str(value or "").strip()
         if not valid_brand(name):
             return ""
-        canonical = canonical_by_fold.setdefault(name.casefold(), name)
+        key = _compact(name)
+        canonical = canonical_by_key.setdefault(key, name)
         brand_aliases[canonical].add(name)
         return canonical
-    for item in owned_brand_vocabulary():
-        name = add_brand(str(item.get("name") or ""))
-        if name:
-            brand_aliases[name].update(str(alias).strip() for alias in item.get("aliases") or [] if str(alias).strip())
     for runs in runs_by_model.values():
         for run in runs:
             for brand in run.get("brands") or []:
@@ -315,7 +360,10 @@ def _mentions(text: str, matcher: tuple[re.Pattern[str] | None, dict[str, set[st
 
 def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: dict[str, set[str]], product_catalog: dict[str, tuple[str, str]], matcher: tuple[re.Pattern[str] | None, dict[str, set[str]]]) -> None:
     canonical_by_fold = {alias.casefold(): brand for brand, aliases in brand_aliases.items() for alias in aliases | {brand}}
-    owned_names = {str(item.get("name") or "") for item in owned_brand_vocabulary()}
+    owned_names = {
+        canonical_by_fold.get(str(item.get("name") or "").strip().casefold(), str(item.get("name") or "").strip())
+        for item in owned_brand_vocabulary() if str(item.get("name") or "").strip()
+    }
     index = content_index()
     for runs in runs_by_model.values():
         for run in runs:
@@ -329,25 +377,54 @@ def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: 
                     if token and token in compact_answer:
                         products.append({"brand": brand, "product_name": product, "rank": 0,
                                          "evidence": "跨模型产品词表精确命中"})
-            run["products"] = products
+            normalized_products = []
+            for raw in products:
+                item = dict(raw)
+                brand, _product, _rank = _product_fields(item)
+                canonical = canonical_by_fold.get(brand.casefold(), brand)
+                if canonical:
+                    item["brand"] = canonical
+                    item["brand_name"] = canonical
+                normalized_products.append(item)
+            run["products"] = normalized_products
             run["brands"] = sorted(explicit_brands)
             for source in run.get("sources") or []:
                 title_matches = set(_mentions(source.get("title") or "", matcher))
                 body_matches: set[str] = set()
+                title_products = set(own_product_mentions(source.get("title") or ""))
+                body_products: set[str] = set()
+                entry = index.get(source.get("url")) or index.get(source.get("canonical_url")) or {}
                 if source.get("type") != "视频":
-                    entry = index.get(source.get("url")) or index.get(source.get("canonical_url")) or {}
                     body_matches.update(canonical_by_fold.get(str(item).strip().casefold(), str(item).strip()) for item in entry.get("brand_mentions") or [] if valid_brand(str(item)))
                     body_matches.update(canonical_by_fold.get(str(item).strip().casefold(), str(item).strip()) for item in entry.get("owned_brand_mentions") or [] if valid_brand(str(item)))
                     if not body_matches and entry.get("excerpt"):
                         body_matches.update(_mentions(str(entry.get("excerpt")), matcher))
+                    if (
+                        entry.get("status") == "ok"
+                        and entry.get("extraction_quality") in {"high", "medium"}
+                    ):
+                        if entry.get("own_product_mentions"):
+                            body_products.update(entry.get("own_product_mentions") or [])
+                        elif int(entry.get("own_product_schema_version") or 0) == OWN_PRODUCT_SCHEMA_VERSION:
+                            pass
+                        else:
+                            body_products.update(own_product_mentions(entry.get("excerpt") or ""))
                 matches = title_matches | body_matches
-                owned = sorted(name for name in matches if name in owned_names)
+                product_matches = sorted(title_products | body_products)
+                title_owned = title_matches & owned_names
+                body_owned = body_matches & owned_names
+                owned = sorted(set(brands_for_products(product_matches)) | title_owned | body_owned)
                 source["brand_mentions"] = sorted(matches)
                 source["title_brand_mentions"] = sorted(title_matches)
                 source["body_brand_mentions"] = sorted(body_matches)
+                source["own_products"] = product_matches
+                source["title_product_mentions"] = sorted(title_products)
+                source["body_product_mentions"] = sorted(body_products)
                 source["owned_brands"] = owned
-                source["own_brand"] = bool(owned)
-                source["brand_match_scope"] = "标题+正文" if title_matches and body_matches else "标题" if title_matches else "正文" if body_matches else ""
+                source["own_brand"] = bool(product_matches or owned)
+                title_owned_hit = bool(title_products or title_owned)
+                body_owned_hit = bool(body_products or body_owned)
+                source["brand_match_scope"] = "标题+正文" if title_owned_hit and body_owned_hit else "标题" if title_owned_hit else "正文" if body_owned_hit else ""
 
 
 def prepare_analytics(

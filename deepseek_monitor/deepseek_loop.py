@@ -16,8 +16,10 @@ from pathlib import Path
 from controller import DeepSeekAppController, DeepSeekWebCollector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from monitor_core.quality import invalid_answer_reason
+from monitor_core.quality import answer_quality_reason
 from monitor_core.scheduling import build_question_schedule
+from monitor_core.device_lock import device_session
+from monitor_core.lan_result_sync import enqueue as enqueue_remote_result
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,6 +38,7 @@ def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    enqueue_remote_result("deepseek", record)
 
 
 def load_state(path: Path) -> dict:
@@ -70,6 +73,13 @@ def answer_from_page(body: str, question: str) -> str:
         if marker in text:
             text = text.split(marker, 1)[0].strip()
     return text
+
+
+def latest_chat_url(value: dict) -> str:
+    links = value.get("links") if isinstance(value, dict) else None
+    if isinstance(links, list) and links:
+        return str((links[0] or {}).get("href") or "")
+    return str((value or {}).get("href") or "")
 
 
 def main() -> int:
@@ -134,25 +144,27 @@ def main() -> int:
         try:
             # 发送前记住网页当前第一条会话。采集时必须等到一个新的会话出现，
             # 这样即使连续询问同一个问题，也不会误抓上一次的旧回答。
-            baseline = web.latest_chat(timeout=min(30, args.timeout))
-            previous_chat_url = str(baseline.get("href") or "")
-            # 唯一允许发送问题的入口是 MuMu DeepSeek App；网页端只读取同步结果。
-            app.send(question)
-            sent = True
-            sent_at = time.time()
-            delay = random.uniform(args.min_interval, args.max_interval)
-            state.update({"last_sent_at": sent_at, "next_send_at": sent_at + delay, "next_index": index})
-            save_state(state_path, state)
-            logger.info("第 %d 轮已发送；下次随机间隔 %.1f 分钟", index + 1, delay / 60)
-            logger.info("第 %d 轮正在等待模拟器端回答加载完成", index + 1)
             app_completion: dict = {}
             app_error = ""
-            try:
-                app_completion = app.wait_for_answer(question, args.timeout, min(5, args.stable_seconds))
-                logger.info("第 %d 轮模拟器端回答已完成，正在等待网页端同步最新会话并采集信源", index + 1)
-            except Exception as exc:
-                app_error = str(exc)
-                logger.warning("第 %d 轮模拟器端回答异常，直接跳过网页采集：%s", index + 1, exc)
+            with device_session(args.serial, "DeepSeek", timeout=args.timeout + 120,
+                                on_wait=logger.info):
+                baseline = web.latest_chat(timeout=min(30, args.timeout))
+                previous_chat_url = latest_chat_url(baseline)
+                # App 发送和等待回答必须是一个原子区间，其他模型只能排队。
+                app.send(question)
+                sent = True
+                sent_at = time.time()
+                delay = random.uniform(args.min_interval, args.max_interval)
+                state.update({"last_sent_at": sent_at, "next_send_at": sent_at + delay, "next_index": index})
+                save_state(state_path, state)
+                logger.info("第 %d 轮已发送；下次随机间隔 %.1f 分钟", index + 1, delay / 60)
+                logger.info("第 %d 轮正在等待模拟器端回答加载完成", index + 1)
+                try:
+                    app_completion = app.wait_for_answer(question, args.timeout, min(5, args.stable_seconds))
+                    logger.info("第 %d 轮模拟器端回答已完成，正在等待网页端同步最新会话并采集信源", index + 1)
+                except Exception as exc:
+                    app_error = str(exc)
+                    logger.warning("第 %d 轮模拟器端回答异常，直接跳过网页采集：%s", index + 1, exc)
             result: dict = {}
             web_error = app_error
             if not app_error:
@@ -169,11 +181,12 @@ def main() -> int:
                         logger.warning("第 %d 轮网页抓取第 %d/%d 次失败：%s", index + 1, web_attempt, args.max_web_retries, exc)
                         if web_attempt < args.max_web_retries:
                             wait_until(time.time() + max(30.0, args.retry_wait), logger)
-            answer = answer_from_page(str(result.get("body") or ""), question)
-            skip_reason = web_error or invalid_answer_reason(answer)
+            answer = str(result.get("answer") or "").strip() or answer_from_page(str(result.get("body") or ""), question)
+            skip_reason = web_error or answer_quality_reason(question, answer)
             append_jsonl(Path(args.results), {"status": "skipped" if skip_reason else "success", "skip_reason": skip_reason,
                 "round": index + 1, "serial": args.serial, "question": question, "reply": answer,
                 "web_body": result.get("body", ""), "sources": [] if skip_reason else result.get("sources", []),
+                "conversation_question": result.get("currentQuestion", ""),
                 "page_url": result.get("conversation_url") or result.get("url", ""), "web_error": web_error,
                 "app_error": app_error, "app_completion": app_completion,
                 "started_at": started, "finished_at": now()})

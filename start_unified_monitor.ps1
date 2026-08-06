@@ -34,6 +34,13 @@ if (-not (Test-ListeningPort 8790)) {
         -WorkingDirectory $projectRoot -RedirectStandardOutput $receiverOut -RedirectStandardError $receiverErr -WindowStyle Hidden
 }
 
+if (-not (Test-ListeningPort 8791)) {
+    $resultReceiverOut = Join-Path $runtimeRoot "lan_result_receiver.out.log"
+    $resultReceiverErr = Join-Path $runtimeRoot "lan_result_receiver.err.log"
+    Start-Process -FilePath "python" -ArgumentList @("-u", (Join-Path $projectRoot "monitor_core\lan_result_receiver.py")) `
+        -WorkingDirectory $projectRoot -RedirectStandardOutput $resultReceiverOut -RedirectStandardError $resultReceiverErr -WindowStyle Hidden
+}
+
 if (-not (Test-ListeningPort 8765)) {
     $backendOut = Join-Path $runtimeRoot "dashboard_server.out.log"
     $backendErr = Join-Path $runtimeRoot "dashboard_server.err.log"

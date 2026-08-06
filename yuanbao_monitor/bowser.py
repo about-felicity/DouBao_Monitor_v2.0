@@ -41,6 +41,25 @@ def _wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
     return False
 
 
+def _is_chrome_debug_port_ready(port: int, timeout: float = 5.0) -> bool:
+    """通过 HTTP /json/version 检测 Chrome 调试端口是否真正就绪。
+
+    比 socket 检测更可靠：只有 Chrome 的 DevTools HTTP 服务就绪才会响应，
+    避免端口在 listen 但 Chrome 还没完全启动的误判。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/version", timeout=1.5
+            ) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
 def connect_chrome(debug_port: int = 9222) -> webdriver.Chrome:
     """连接一个已经用 --remote-debugging-port 启动的 Chrome 实例。"""
     options = Options()
@@ -56,20 +75,22 @@ def ensure_yuanbao_chrome(
     start_url: str = "https://yuanbao.tencent.com/chat/",
 ) -> dict:
     """Ensure the dedicated Yuanbao Chrome exists without waiting for ChromeDriver."""
-    if _wait_for_port("127.0.0.1", debug_port, timeout=0.5):
+    # 用 HTTP 检测代替 socket 检测，更可靠地判断 Chrome 调试端口是否就绪
+    if _is_chrome_debug_port_ready(debug_port, timeout=5.0):
         return {"launched": False, "port": debug_port}
     exe = chrome_path or _find_chrome_executable()
     if not exe:
         raise RuntimeError("找不到 Chrome / Edge 可执行文件")
     profile = Path(user_data_dir or Path(__file__).resolve().parent / "chrome_profile_auto")
     profile.mkdir(parents=True, exist_ok=True)
+    print(f"[bowser] 启动新 Chrome：端口 {debug_port}，profile={profile}")
     subprocess.Popen(
         [exe, f"--remote-debugging-port={debug_port}", "--remote-allow-origins=*",
          f"--user-data-dir={profile.resolve()}", "--no-first-run", "--no-default-browser-check",
-         "--new-window", start_url],
+         start_url],
         cwd=str(Path(__file__).resolve().parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    if not _wait_for_port("127.0.0.1", debug_port, timeout=20):
+    if not _is_chrome_debug_port_ready(debug_port, timeout=20):
         raise RuntimeError(f"元宝 Chrome 调试端口 {debug_port} 启动超时")
     return {"launched": True, "port": debug_port}
 
@@ -115,50 +136,22 @@ def connect_or_launch_chrome(
         start_url: 启动后打开的页面
     """
     ensure_yuanbao_chrome(debug_port, chrome_path, user_data_dir, start_url)
-    # 1) 连接已存在的专用实例
-    try:
-        driver = connect_chrome(debug_port)
-        print(f"已连接到现有 Chrome（端口 {debug_port}）")
-        return driver
-    except Exception as e:
-        print(f"未检测到现有 Chrome 调试端口: {e}")
-
-    # 2) 自动查找 Chrome 路径（旧环境兜底）
-    exe = chrome_path or _find_chrome_executable()
-    if not exe:
-        raise RuntimeError(
-            "找不到 Chrome 可执行文件。请手动指定 chrome_path，"
-            "或先安装 Chrome / Edge，或先用 --remote-debugging-port=9222 启动 Chrome。"
-        )
-    print(f"找到浏览器: {exe}")
-
-    # 3) 准备用户数据目录
-    if user_data_dir is None:
-        user_data_dir = os.path.join(os.getcwd(), "chrome_profile_auto")
-    Path(user_data_dir).mkdir(parents=True, exist_ok=True)
-    print(f"使用用户数据目录: {user_data_dir}")
-
-    # 4) 启动 Chrome
-    cmd = [
-        exe,
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={os.path.abspath(user_data_dir)}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        start_url,
-    ]
-    print(f"正在启动 Chrome: {' '.join(cmd)}")
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 5) 等端口可用
-    if not _wait_for_port("127.0.0.1", debug_port, timeout=20):
-        raise RuntimeError(f"Chrome 调试端口 {debug_port} 未在 20 秒内就绪")
-
-    # 6) 连接
-    time.sleep(1.5)  # 给浏览器多一点时间初始化
-    driver = connect_chrome(debug_port)
-    print("Chrome 已启动并连接")
-    return driver
+    # 连接已存在的专用实例，失败则重试几次（不再重复启动 Chrome，避免窗口堆积）
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            driver = connect_chrome(debug_port)
+            if attempt:
+                print(f"经过 {attempt + 1} 次尝试后连接成功")
+            return driver
+        except Exception as e:
+            last_err = e
+            print(f"连接 Chrome 调试端口失败（第 {attempt + 1} 次）：{e}")
+            time.sleep(1.5)
+    raise RuntimeError(
+        f"无法连接到 Chrome 调试端口 {debug_port}：{last_err}。"
+        "请检查 Chrome 是否在运行，或手动用 --remote-debugging-port=9222 启动 Chrome。"
+    )
 
 
 if __name__ == "__main__":

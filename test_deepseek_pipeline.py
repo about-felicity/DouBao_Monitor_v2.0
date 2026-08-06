@@ -48,11 +48,11 @@ class DeepSeekWebConversationTests(unittest.TestCase):
     def test_collection_waits_for_a_new_conversation_url(self):
         web = controller.DeepSeekWebCollector(9333)
         web.latest_chat = Mock(side_effect=[
-            {"ok": True, "href": "https://chat.deepseek.com/a/chat/s/old"},
-            {"ok": True, "href": "https://chat.deepseek.com/a/chat/s/new"},
+            {"ok": True, "links": [{"href": "https://chat.deepseek.com/a/chat/s/old"}]},
+            {"ok": True, "links": [{"href": "https://chat.deepseek.com/a/chat/s/new"}]},
         ])
         web._navigate = Mock()
-        web.evaluate = Mock(return_value={"body": "推荐一款染发剂 完整回答"})
+        web.evaluate = Mock(return_value={"currentQuestion": "推荐一款染发剂", "body": "完整回答"})
         web.wait_and_collect = Mock(return_value={"ok": True, "sources": []})
         with patch.object(controller.time, "sleep", return_value=None):
             result = web.collect_latest(
