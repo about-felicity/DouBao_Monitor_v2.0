@@ -198,6 +198,49 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(set(plugins), {"afu", "deepseek", "doubao", "wenxin", "yuanbao"})
         self.assertEqual(plugins["doubao"].execution, "remote")
 
+    def test_recommendation_question_word_order_uses_one_bucket(self):
+        from doubao_question_aliases import canonical_question_name
+        expected = "控油蓬松洗发水推荐"
+        self.assertEqual(canonical_question_name("推荐一款控油蓬松洗发水"), expected)
+        self.assertEqual(canonical_question_name("推荐控油蓬松洗发水"), expected)
+        self.assertEqual(canonical_question_name("控油蓬松洗发水推荐"), expected)
+
+    def test_product_fields_remove_compact_repeated_brand_prefix(self):
+        from monitor_core.analytics import _product_fields, valid_brand
+        brand, product, _rank = _product_fields({
+            "brand_name": "John Jeff",
+            "product_name": "JohnJeffJeff二硫化硒",
+        })
+        self.assertEqual(brand, "John Jeff")
+        self.assertEqual(product, "二硫化硒")
+        brand, product, _rank = _product_fields({
+            "brand_name": "23.5°N",
+            "product_name": "23.5°N 23.5°N海洋净化蓬松洗发精",
+        })
+        self.assertEqual(product, "海洋净化蓬松洗发精")
+        self.assertFalse(valid_brand("水杨酸"))
+
+    def test_jsonl_dashboard_preserves_product_analysis(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from monitor_core.jsonl_dashboard import build_jsonl_dashboard
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / "results.jsonl"
+            output = root / "dashboard.json"
+            results.write_text(json.dumps({
+                "status": "success",
+                "round": 1,
+                "question": "推荐一款控油蓬松洗发水",
+                "reply": "推荐儒曼控油蓬松洗发水，适合油性头皮。",
+                "brands": ["儒曼"],
+                "products": [{"brand_name": "儒曼", "product_name": "儒曼 控油蓬松洗发水"}],
+            }, ensure_ascii=False) + "\n", encoding="utf-8")
+            payload = build_jsonl_dashboard("demo", results, output)
+            self.assertEqual(payload["runs"][0]["brands"], ["儒曼"])
+            self.assertEqual(payload["runs"][0]["products"][0]["brand_name"], "儒曼")
+
     def test_question_date_filter_and_source_types_are_isolated(self):
         metadata = {"demo": {"id": "demo", "name": "演示", "short_name": "演", "tone": "demo"}}
         runs = {"demo": [{

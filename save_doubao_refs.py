@@ -705,8 +705,11 @@ def normalize_ai_product_brand_prefix(product_name, canonical_brand):
     for _ in range(4):
         changed = False
         for alias in sorted(aliases, key=len, reverse=True):
+            compact_alias = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", alias)
+            if not compact_alias:
+                continue
             match = re.match(
-                r"^\s*" + re.escape(alias) + r"(?=$|[\s·/（）()\-—+])",
+                r"^\s*" + r"[^0-9A-Za-z\u4e00-\u9fff]*".join(re.escape(char) for char in compact_alias),
                 remainder,
                 re.I,
             )
@@ -717,6 +720,11 @@ def normalize_ai_product_brand_prefix(product_name, canonical_brand):
             break
         if not changed:
             break
+    brand_words = re.findall(r"[A-Za-z0-9]+", brand)
+    if len(brand_words) > 1 and len(brand_words[-1]) >= 3:
+        remainder = re.sub(
+            r"^\s*" + re.escape(brand_words[-1]), "", remainder, count=1, flags=re.I,
+        ).lstrip(" \t·/（）()-—+")
     return (brand + (" " + remainder if remainder else "")).strip()
 
 
@@ -923,7 +931,7 @@ def product_ai_max_tokens(answer_text):
     }
     numbered_count = max(numbered) if numbered else 0
     expected = min(20, max(4, claimed, rule_count, numbered_count))
-    return min(1200, max(320, 120 + expected * 90))
+    return 1200
 
 
 def product_ai_cache_key(answer_text):

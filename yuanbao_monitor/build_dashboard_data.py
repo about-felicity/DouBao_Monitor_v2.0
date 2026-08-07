@@ -162,6 +162,29 @@ def question_category(question: str) -> str:
     return "其他"
 
 
+def products_from_record(record: dict) -> list[dict]:
+    products = []
+    category = question_category(str(record.get("question") or ""))
+    for position, raw in enumerate(record.get("products") or [], 1):
+        if not isinstance(raw, dict):
+            continue
+        brand = str(raw.get("brand_name") or raw.get("brand") or "").strip()
+        product_name = str(raw.get("product_name") or raw.get("name") or "").strip()
+        evidence = str(raw.get("evidence") or product_name).strip()
+        if not product_name or not evidence:
+            continue
+        products.append({
+            "brand": brand,
+            "raw_brand": brand,
+            "product_name": product_name,
+            "evidence": evidence,
+            "category": category,
+            "position": int(raw.get("rank") or position),
+            "rank": int(raw.get("rank") or position),
+        })
+    return products
+
+
 def record_id(record: dict) -> str:
     stable = "\0".join((
         str(record.get("serial") or ""),
@@ -303,7 +326,7 @@ def main() -> None:
                 "media": media_for(domain), "type": source_type(domain, title),
             })
         ai = ai_results.get(record_hash(record), {})
-        products = [dict(product) for product in (ai.get("products") or [])]
+        products = products_from_record(record) or [dict(product) for product in (ai.get("products") or [])]
         runs.append({
             "run_id": record_id(record),
             "sequence": sequence,

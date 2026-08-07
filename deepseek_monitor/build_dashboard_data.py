@@ -402,6 +402,29 @@ def question_category(question: str) -> str:
     return "其他"
 
 
+def products_from_record(record: dict) -> list[dict[str, Any]]:
+    products = []
+    category = question_category(str(record.get("question") or ""))
+    for position, raw in enumerate(record.get("products") or [], 1):
+        if not isinstance(raw, dict):
+            continue
+        brand = str(raw.get("brand_name") or raw.get("brand") or "").strip()
+        product_name = str(raw.get("product_name") or raw.get("name") or "").strip()
+        evidence = str(raw.get("evidence") or product_name).strip()
+        if not product_name or not evidence:
+            continue
+        products.append({
+            "brand": brand,
+            "raw_brand": brand,
+            "product_name": product_name,
+            "evidence": evidence,
+            "category": category,
+            "position": int(raw.get("rank") or position),
+            "rank": int(raw.get("rank") or position),
+        })
+    return products
+
+
 def product_summary(runs: list[dict]) -> list[dict]:
     grouped: dict[tuple[str, str], dict] = {}
     for run in runs:
@@ -580,7 +603,7 @@ def build() -> dict:
             title = str(raw.get("title") or "").strip()
             sources.append({"title": title, "url": url, "canonical_url": stable, "domain": domain, "media": media_name(domain), "type": source_type(domain, title)})
         ai = ai_results.get(_body_hash(record.get("_original_body", "")), {})
-        products = [dict(product) for product in (ai.get("products") or [])]
+        products = products_from_record(record) or [dict(product) for product in (ai.get("products") or [])]
         runs.append({"run_id": rid, "sequence": len(runs) + 1, "round": int(record.get("round") or 0), "serial": str(record.get("serial") or "DeepSeek Web"), "question": str(record.get("question") or "未知问题"), "reply": str(record.get("reply") or ""), "web_body": str(record.get("web_body") or ""), "started_at": str(record.get("started_at") or ""), "finished_at": str(record.get("finished_at") or ""), "day": day(record.get("finished_at") or record.get("started_at") or ""), "status": "success", "sources": sources, "products": products, "brands": list(dict.fromkeys(product["brand"] for product in products)), "ai_cached": bool(ai.get("cached"))})
     canonicalize_product_names(runs)
     payload = empty_payload()

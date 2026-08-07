@@ -29,7 +29,7 @@ SHOP_DOMAINS = ("jd.com", "taobao.com", "tmall.com", "yangkeduo.com")
 SOCIAL_DOMAINS = ("xiaohongshu.com", "weibo.com")
 MEDIA_NAMES = {"zhihu.com": "知乎", "xiaohongshu.com": "小红书", "weibo.com": "微博", "bilibili.com": "哔哩哔哩", "douyin.com": "抖音", "iesdouyin.com": "抖音", "jd.com": "京东", "taobao.com": "淘宝", "tmall.com": "天猫", "baidu.com": "百度", "qq.com": "腾讯网", "163.com": "网易", "ifeng.com": "凤凰网"}
 KEYWORD_STOP = {"推荐", "一款", "什么", "怎么", "可以", "一个", "使用", "产品", "品牌", "最新", "真的", "这款", "哪些", "比较", "选择", "效果", "十大", "排行榜", "测评"}
-BRAND_STOP = {"家用", "小助手", "泡沫染发", "植物染发", "染发", "染发剂", "染发膏", "角蛋白", "米诺地尔", "生物素", "多肽", "精华液", "洗发水", "护发素", "防晒", "面膜"}
+BRAND_STOP = {"家用", "小助手", "泡沫染发", "植物染发", "染发", "染发剂", "染发膏", "角蛋白", "米诺地尔", "生物素", "多肽", "精华液", "洗发水", "护发素", "防晒", "面膜", "水杨酸", "二硫化硒", "烟酰胺", "玻尿酸", "PCA锌", "辛酰甘氨酸", "氨基酸", "无硅油"}
 PARTICLES = "的了是一在于和及与或到用为把被从对跟等很更最也都还就"
 ENGLISH_STOP = {"the", "and", "for", "with", "from", "best", "top", "review", "reviews"}
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,6 +73,10 @@ def owned_brand_vocabulary() -> list[dict[str, Any]]:
 
 
 def canonical_question(value: str) -> str:
+    from monitor_core.recommendation_questions import canonical_recommendation_question
+    recommendation = canonical_recommendation_question(value) if "推荐" in str(value or "") else ""
+    if recommendation:
+        return recommendation
     try:
         from doubao_question_aliases import canonical_question_name
         return canonical_question_name(value) or str(value or "未知问题")
@@ -266,8 +270,20 @@ def _top_sources(runs: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
 def _product_fields(raw: dict[str, Any]) -> tuple[str, str, int]:
     brand = str(raw.get("brand") or raw.get("brand_name") or "").strip()
     product = str(raw.get("product_name") or raw.get("name") or "").strip()
-    while brand and product.casefold().startswith(brand.casefold()):
-        product = product[len(brand):].lstrip(" ·-_/｜|")
+    compact_brand = _compact(brand)
+    if compact_brand:
+        prefix = re.compile(
+            r"^\s*" + r"[^0-9A-Za-z\u4e00-\u9fff]*".join(re.escape(char) for char in compact_brand),
+            re.I,
+        )
+        for _ in range(4):
+            match = prefix.match(product)
+            if not match:
+                break
+            product = product[match.end():].lstrip(" ·-_/～|（）()")
+        words = re.findall(r"[A-Za-z0-9]+", brand)
+        if len(words) > 1 and len(words[-1]) >= 3:
+            product = re.sub(r"^\s*" + re.escape(words[-1]), "", product, count=1, flags=re.I).lstrip(" ·-_/～|（）()")
     try:
         rank = int(raw.get("rank") or raw.get("product_index") or 0)
     except (TypeError, ValueError):
@@ -381,10 +397,11 @@ def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: 
             for raw in products:
                 item = dict(raw)
                 brand, _product, _rank = _product_fields(item)
+                if not valid_brand(brand):
+                    brand = ""
                 canonical = canonical_by_fold.get(brand.casefold(), brand)
-                if canonical:
-                    item["brand"] = canonical
-                    item["brand_name"] = canonical
+                item["brand"] = canonical
+                item["brand_name"] = canonical
                 normalized_products.append(item)
             run["products"] = normalized_products
             run["brands"] = sorted(explicit_brands)

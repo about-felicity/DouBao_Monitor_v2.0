@@ -55,7 +55,11 @@ CONTROL_RUNTIME_DIR = Path(BASE_DIR) / "runtime" / "unified_control"
 HOST = os.environ.get("DOUBAO_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DOUBAO_DASHBOARD_PORT", "8765"))
 
-MODEL_PLUGINS = discover_plugins()
+MODEL_PLUGINS = {
+    model_id: plugin
+    for model_id, plugin in discover_plugins().items()
+    if model_id != "afu"
+}
 MODEL_REGISTRY = {model_id: plugin.metadata() for model_id, plugin in MODEL_PLUGINS.items()}
 RESERVED_MODEL_SLOTS = 1
 

@@ -72,7 +72,9 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
                      "started_at": str(record.get("started_at") or ""),
                      "finished_at": str(record.get("finished_at") or ""),
                      "day": _day(record.get("finished_at") or record.get("started_at") or ""),
-                     "status": "success", "sources": sources, "brands": [], "products": []})
+                     "status": "success", "sources": sources,
+                     "brands": [str(item).strip() for item in (record.get("brands") or []) if str(item).strip()],
+                     "products": [dict(item) for item in (record.get("products") or []) if isinstance(item, dict)]})
     all_sources = [source for run in runs for source in run["sources"]]
     questions = []
     for question in dict.fromkeys(run["question"] for run in runs):

@@ -119,6 +119,15 @@ def canonical_question_name(value):
     if not question:
         return ""
 
+    if "推荐" in question:
+        try:
+            from monitor_core.recommendation_questions import canonical_recommendation_question
+            recommendation = canonical_recommendation_question(question)
+        except ImportError:
+            recommendation = ""
+        if recommendation:
+            return recommendation
+
     # Exact alias first.
     if question in QUESTION_ALIASES:
         return QUESTION_ALIASES[question]

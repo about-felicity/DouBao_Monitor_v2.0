@@ -45,6 +45,20 @@ class ProductAiEfficiencyTests(unittest.TestCase):
         )
         self.assertGreaterEqual(saver.product_ai_max_tokens(answer), 1000)
 
+    def test_unnumbered_product_lists_have_safe_json_budget(self):
+        answer = "推荐几款不同定位的产品，可以根据发质和预算选择。" * 20
+        self.assertEqual(saver.product_ai_max_tokens(answer), 1200)
+
+    def test_repeated_contiguous_brand_prefix_is_collapsed(self):
+        self.assertEqual(
+            saver.normalize_ai_product_brand_prefix("儒曼 儒曼控油蓬松洗发水", "儒曼"),
+            "儒曼 控油蓬松洗发水",
+        )
+        self.assertEqual(
+            saver.normalize_ai_product_brand_prefix("JohnJeffJeff二硫化硒", "John Jeff"),
+            "John Jeff 二硫化硒",
+        )
+
     def test_grounding_rejects_evidence_not_present_in_answer(self):
         with self.assertRaises(ValueError):
             saver.validate_grounded_ai_products(
