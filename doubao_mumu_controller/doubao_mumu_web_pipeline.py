@@ -678,10 +678,13 @@ def browser_port_for_slot(slot: str | int | None) -> int | None:
     text = str(slot if slot is not None else "").strip()
     if not text:
         return None
+    mapping: dict[str, Any] = {}
     try:
-        mapping = json.loads(
+        loaded = json.loads(
             BROWSER_SLOT_MAP_PATH.read_text(encoding="utf-8")
         )
+        if isinstance(loaded, dict):
+            mapping = loaded
         mapped = int(mapping.get(text) or 0)
         if 9300 <= mapped <= 9399:
             return mapped
@@ -691,7 +694,14 @@ def browser_port_for_slot(slot: str | int | None) -> int | None:
         value = int(text)
     except ValueError:
         value = sum(ord(char) for char in text)
-    return 9300 + (value % 80)
+    default_port = 9300 + (value % 80)
+    for mapped_slot, mapped_port in mapping.items():
+        try:
+            if str(mapped_slot) != text and int(mapped_port) == default_port:
+                return None
+        except (TypeError, ValueError):
+            continue
+    return default_port
 
 
 def remember_browser_port(slot: str | int | None, port: int) -> None:
@@ -770,10 +780,13 @@ def find_matching_browser(
     *,
     preferred_port: int | None = None,
     require_capture_ready: bool = True,
+    excluded_ports: set[int] | None = None,
 ) -> dict[str, Any] | None:
     # Login order is user-controlled. The slot's original port is only a hint;
     # scan all known browser windows so swapped logins can be remapped by UID.
     for port in browser_candidate_ports(preferred_port):
+        if excluded_ports and port in excluded_ports:
+            continue
         if not port_is_listening(port):
             continue
         try:

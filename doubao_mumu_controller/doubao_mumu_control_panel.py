@@ -1175,12 +1175,14 @@ class DoubaoMuMuControlPanel:
 
             browser_processes: dict[str, subprocess.Popen[Any]] = {}
             cdp_ports: dict[str, int] = {}
+            claimed_ports: set[int] = set()
             opened: list[str] = []
             for device in devices:
                 index = str(device["index"])
                 preferred_port = pipeline.browser_port_for_slot(index)
                 if (
                     preferred_port is not None
+                    and preferred_port not in claimed_ports
                     and pipeline.port_is_listening(preferred_port)
                     and pipeline.doubao_debug_port_ready(preferred_port)
                 ):
@@ -1200,6 +1202,7 @@ class DoubaoMuMuControlPanel:
                     )
                     browser_processes[index] = process
                 cdp_ports[index] = int(port)
+                claimed_ports.add(int(port))
                 opened.append(f"实例 {index} → Chrome CDP {port}")
 
             self.events.put(
@@ -1808,6 +1811,7 @@ class DoubaoMuMuControlPanel:
         instance_results: list[dict[str, Any]] = []
         browser_processes: dict[str, subprocess.Popen[Any]] = {}
         cdp_ports: dict[str, int] = {}
+        claimed_ports: set[int] = set()
         for device in devices:
             index = str(device["index"])
             serial = str(device["serial"])
@@ -1855,6 +1859,7 @@ class DoubaoMuMuControlPanel:
                     account["uid"],
                     preferred_port=preferred_port,
                     require_capture_ready=False,
+                    excluded_ports=claimed_ports,
                 )
                 browser_process = None
                 identity: dict[str, Any]
@@ -1866,6 +1871,7 @@ class DoubaoMuMuControlPanel:
                         preferred_port = matched_port
                 elif (
                     preferred_port is not None
+                    and preferred_port not in claimed_ports
                     and pipeline.port_is_listening(preferred_port)
                 ):
                     identity = pipeline.web_identity(
@@ -1890,6 +1896,7 @@ class DoubaoMuMuControlPanel:
                 port = int(identity.get("port") or preferred_port or 0)
                 if port:
                     cdp_ports[index] = port
+                    claimed_ports.add(port)
                 if (
                     identity.get("loggedIn")
                     and str(identity.get("uid") or "") == account["uid"]

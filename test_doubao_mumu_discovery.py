@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
@@ -43,6 +44,23 @@ emulator-5554 device
         devices = pipeline.parse_mumu_adb_devices(output, "2")
         self.assertEqual(len(devices), 1)
         self.assertEqual(devices[0]["serial"], "127.0.0.1:16448")
+
+    def test_default_browser_port_does_not_reuse_another_slot_mapping(self) -> None:
+        original_path = pipeline.BROWSER_SLOT_MAP_PATH
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            pipeline.BROWSER_SLOT_MAP_PATH = (
+                Path(temporary_dir) / "doubao_browser_slots.json"
+            )
+            pipeline.BROWSER_SLOT_MAP_PATH.write_text(
+                '{"2": 9301}',
+                encoding="utf-8",
+            )
+            try:
+                self.assertIsNone(pipeline.browser_port_for_slot("1"))
+                self.assertEqual(pipeline.browser_port_for_slot("2"), 9301)
+                self.assertEqual(pipeline.browser_port_for_slot("0"), 9300)
+            finally:
+                pipeline.BROWSER_SLOT_MAP_PATH = original_path
 
 
 if __name__ == "__main__":
