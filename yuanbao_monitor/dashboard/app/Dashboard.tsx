@@ -113,6 +113,25 @@ type RemoteEvent = {
   account_uid_masked?: string;
   rows_written: number;
   message?: string;
+  analysis_status?: "pending" | "success" | "warning" | "failed";
+  run_no?: number;
+  source_count?: number;
+  expected_source_count?: number;
+  source_capture_complete?: boolean;
+  missing_source_links?: number;
+  missing_source_titles?: number;
+  answer_present?: boolean | null;
+  answer_length?: number;
+  recommendation_question?: boolean;
+  product_count?: number;
+  product_review_status?: string;
+  product_parse_complete?: boolean;
+  source_content_total?: number;
+  source_content_analyzed?: number;
+  source_content_failed?: number;
+  owned_product_links_marked?: number;
+  owned_product_links_detected?: number;
+  missing_fields?: string[];
 };
 type RemoteActivity = {
   queue: { queued: number; processed: number; errors: number };
@@ -335,17 +354,39 @@ function RemoteTransferLog({ activity }: { activity?: RemoteActivity }) {
         </div>
       </div>
       <div className="remote-event-list">
-        {events.length ? events.map((event) => (
-          <div className={`remote-event ${event.status}`} key={`${event.status}-${event.request_id}`}>
-            <time>{beijingTime(event.processed_at || event.received_at)}</time>
-            <i>{event.status === "processed" ? "已入库" : event.status === "queued" ? "处理中" : "异常"}</i>
-            <div>
-              <b>{event.question || "未记录问题"}</b>
-              <small>{event.source_device}{event.account_uid_masked ? ` · UID ${event.account_uid_masked}` : ""}</small>
+        {events.length ? events.map((event) => {
+          const analysisStatus = event.analysis_status || (event.status === "processed" ? "success" : event.status === "error" ? "failed" : "pending");
+          const sourceCount = event.source_count ?? event.rows_written ?? 0;
+          const contentTotal = event.source_content_total ?? 0;
+          const contentAnalyzed = event.source_content_analyzed ?? 0;
+          const ownedMarked = event.owned_product_links_marked ?? 0;
+          const missing = event.missing_fields || [];
+          const analysisLabel = analysisStatus === "success" ? "分析成功" : analysisStatus === "warning" ? "信息待补" : analysisStatus === "failed" ? "分析失败" : "正在分析";
+          return (
+            <div className={`remote-event ${event.status} analysis-${analysisStatus}`} key={`${event.status}-${event.request_id}`}>
+              <time>{beijingTime(event.processed_at || event.received_at)}</time>
+              <i>{event.status === "processed" ? "已入库" : event.status === "queued" ? "处理中" : "异常"}</i>
+              <div className="remote-event-main">
+                <div className="remote-event-title">
+                  <b>{event.question || "未记录问题"}</b>
+                  <em>{analysisLabel}</em>
+                </div>
+                <small>{event.source_device}{event.account_uid_masked ? ` · UID ${event.account_uid_masked}` : ""}{event.run_no ? ` · 第 ${event.run_no} 轮` : ""}</small>
+                <div className="remote-checks">
+                  <span className={sourceCount ? "ok" : "warn"}>回传 {sourceCount} 条信源</span>
+                  <span className={event.missing_source_links ? "bad" : "ok"}>信源链接 {event.missing_source_links ? `缺 ${event.missing_source_links}` : "完整"}</span>
+                  <span className={event.answer_present === false ? "bad" : event.answer_present ? "ok" : "pending"}>回答正文 {event.answer_present === false ? "缺失" : event.answer_present ? `已存 ${event.answer_length || 0} 字` : "待核查"}</span>
+                  {event.recommendation_question && <span className={event.product_parse_complete ? "ok" : "warn"}>产品推荐 {event.product_parse_complete ? (event.product_count ? `已解析 ${event.product_count} 个` : "规则解析完成") : "待复核"}</span>}
+                  <span className={contentTotal && contentAnalyzed >= contentTotal ? "ok" : "pending"}>信源正文 {contentTotal ? `${contentAnalyzed}/${contentTotal}` : "待抓取"}</span>
+                  <span className={contentTotal && ownedMarked >= contentTotal ? "ok" : "pending"}>自有产品标记 {contentTotal ? `${ownedMarked}/${contentTotal}` : "待核查"}</span>
+                  {!!event.source_content_failed && <span className="bad">正文失败 {event.source_content_failed}</span>}
+                  {!!event.owned_product_links_detected && <span className="owned">命中自有产品 {event.owned_product_links_detected}</span>}
+                </div>
+                {(missing.length > 0 || event.message) && <div className="remote-event-warning">{event.message || `缺少：${missing.join("、")}`}</div>}
+              </div>
             </div>
-            <strong>{event.status === "processed" ? `${event.rows_written} 条信源` : event.message || "等待写入正式数据"}</strong>
-          </div>
-        )) : <Empty>等待远端豆包数据回传</Empty>}
+          );
+        }) : <Empty>等待远端模型数据回传</Empty>}
       </div>
     </section>
   );

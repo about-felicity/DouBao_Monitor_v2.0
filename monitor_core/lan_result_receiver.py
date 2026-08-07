@@ -13,6 +13,7 @@ import socket
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -24,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from monitor_core.plugins import ROOT
+from monitor_core.recommendation_questions import canonical_recommendation_question
 
 
 CONFIG = ROOT / "runtime" / "lan_result_receiver.json"
@@ -77,8 +79,10 @@ def write_pairing(config: dict[str, Any]) -> None:
     port = int(config["port"])
     ip = preferred_lan_ip()
     token = str(config["token"])
-    _atomic_json(PAIRING, {"version": 2, "receiver_url": f"http://{ip}:{port}",
-                           "receiver_urls": [f"http://{ip}:{port}", f"http://{socket.gethostname()}:{port}"],
+    fallback_port = 8765
+    _atomic_json(PAIRING, {"version": 3, "receiver_url": f"http://{ip}:{port}",
+                           "receiver_urls": [f"http://{ip}:{port}", f"http://{ip}:{fallback_port}",
+                                             f"http://{socket.gethostname()}:{port}", f"http://{socket.gethostname()}:{fallback_port}"],
                            "token": token, "upload_timeout": 5,
                            "discovery_port": int(config.get("discovery_port") or DISCOVERY_PORT),
                            "discovery_fingerprint": token_fingerprint(token)})
@@ -142,6 +146,135 @@ def valid_request_id(value: Any) -> str:
     return text
 
 
+def result_receipt(model: str, request_id: str, value: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    sources = record.get("sources") if isinstance(record.get("sources"), list) else []
+    compact_sources = []
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        compact_sources.append({
+            "title": str(item.get("title") or "").strip(),
+            "href": str(item.get("href") or item.get("url") or "").strip(),
+        })
+    question = str(record.get("question") or record.get("prompt") or "").strip()
+    answer = str(record.get("web_body") or record.get("reply") or record.get("answer") or "").strip()
+    products = record.get("products") if isinstance(record.get("products"), list) else []
+    review_status = str(record.get("product_review_status") or "")
+    successful = str(record.get("status") or "success").casefold() == "success"
+    return {
+        "request_id": request_id,
+        "model": model,
+        "source_device": str(value.get("source_device") or ""),
+        "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "question": question,
+        "account_uid_masked": str(record.get("account_uid_masked") or ""),
+        "rows_written": len(compact_sources),
+        "analysis": {
+            "question_present": bool(question),
+            "answer_present": bool(answer),
+            "answer_length": len(answer),
+            "source_count": len(compact_sources),
+            "expected_source_count": len(compact_sources),
+            "source_capture_complete": successful,
+            "missing_source_links": sum(not item["href"] for item in compact_sources),
+            "missing_source_titles": sum(not item["title"] for item in compact_sources),
+            "recommendation_question": bool(canonical_recommendation_question(question)),
+            "product_count": len(products),
+            "product_review_status": review_status or ("not_required" if not canonical_recommendation_question(question) else "pending"),
+            "product_extraction_method": str(record.get("product_extraction_method") or ""),
+            "product_analysis_model": str(record.get("product_analysis_model") or ""),
+            "product_parse_complete": (not canonical_recommendation_question(question)) or review_status == "ai_verified",
+            "sources": compact_sources,
+        },
+    }
+
+
+def analyze_record_products(record: dict[str, Any]) -> None:
+    question = str(record.get("question") or record.get("prompt") or "").strip()
+    if not canonical_recommendation_question(question):
+        record["products"] = []
+        record["product_review_status"] = "not_required"
+        record["product_extraction_method"] = "not_required"
+        record["product_analysis_model"] = ""
+        return
+    answer = str(record.get("web_body") or record.get("reply") or record.get("answer") or "").strip()
+    if not answer:
+        record["products"] = []
+        record["product_review_status"] = "no_answer"
+        record["product_extraction_method"] = "none"
+        record["product_analysis_model"] = ""
+        return
+    from save_doubao_refs import review_products_with_ai
+    products, review_status, extraction_method, analysis_model = review_products_with_ai(answer)
+    if review_status == "ai_pending":
+        raise RuntimeError("product analysis is pending; queued result will retry automatically")
+    record["products"] = products
+    record["brands"] = sorted({
+        str(item.get("brand_name") or "").strip()
+        for item in products if isinstance(item, dict) and str(item.get("brand_name") or "").strip()
+    })
+    record["product_review_status"] = review_status
+    record["product_extraction_method"] = extraction_method
+    record["product_analysis_model"] = analysis_model
+
+
+def target_has_request(target: Path, request_id: str) -> bool:
+    if not target.exists():
+        return False
+    needle = f'"remote_request_id": "{request_id}"'
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            return any(needle in line for line in handle)
+    except OSError:
+        return False
+
+
+class ResultWorker(threading.Thread):
+    def __init__(self, server: "Server") -> None:
+        super().__init__(name="lan-result-analysis-worker", daemon=True)
+        self.server = server
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            processed = False
+            for model in sorted(MODELS):
+                inbox = QUEUE / model / "inbox"
+                for path in sorted(inbox.glob("*.json")) if inbox.exists() else []:
+                    processed = True
+                    self.process(model, path)
+                    if self.stop_event.is_set():
+                        break
+            self.stop_event.wait(0.25 if processed else 1.0)
+
+    def process(self, model: str, path: Path) -> None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+            request_id = valid_request_id(value.get("request_id"))
+            record = dict(value["record"])
+            analyze_record_products(record)
+            record["remote_request_id"] = request_id
+            record["remote_source_device"] = str(value.get("source_device") or "")
+            record["remote_received_at"] = time.time()
+            target = TARGETS[model]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            error_path = QUEUE / model / "errors" / f"{request_id}.json"
+            with self.server.write_lock:
+                if not error_path.exists() or not target_has_request(target, request_id):
+                    with target.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                _atomic_json(QUEUE / model / "done" / f"{request_id}.json", result_receipt(model, request_id, value, record))
+                path.unlink(missing_ok=True)
+                error_path.unlink(missing_ok=True)
+        except Exception as exc:
+            _atomic_json(QUEUE / model / "errors" / f"{path.stem}.json", {
+                "request_id": path.stem,
+                "last_error": f"{type(exc).__name__}: {exc}",
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            self.stop_event.wait(2.0)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -150,6 +283,13 @@ class Server(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.config = config
         self.write_lock = threading.Lock()
+        self.worker = ResultWorker(self)
+        self.worker.start()
+
+    def server_close(self) -> None:
+        self.worker.stop_event.set()
+        self.worker.join(timeout=3)
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -196,18 +336,13 @@ class Handler(BaseHTTPRequestHandler):
             if value.get("model") != model or not isinstance(value.get("record"), dict):
                 raise ValueError("invalid result envelope")
             done = QUEUE / model / "done" / f"{request_id}.json"
-            if not done.exists():
+            inbox = QUEUE / model / "inbox" / f"{request_id}.json"
+            if not done.exists() and not inbox.exists():
                 with self.server.write_lock:
-                    if not done.exists():
-                        target = TARGETS[model]
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        record = dict(value["record"])
-                        record["remote_source_device"] = str(value.get("source_device") or "")
-                        record["remote_received_at"] = time.time()
-                        with target.open("a", encoding="utf-8") as handle:
-                            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        _atomic_json(done, {"request_id": request_id, "received_at": time.time()})
-            self.send_json(202, {"ok": True, "request_id": request_id, "status": "processed"})
+                    if not done.exists() and not inbox.exists():
+                        _atomic_json(inbox, value)
+            self.send_json(202, {"ok": True, "request_id": request_id,
+                                 "status": "processed" if done.exists() else "queued"})
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             self.send_json(400, {"ok": False, "error": str(exc)})
 

@@ -29,7 +29,7 @@ $rules += @{ Name = "Doubao Remote Model Results 8791"; Port = 8791; Protocol = 
 $rules += @{ Name = "Doubao Remote Model Discovery 8792"; Port = 8792; Protocol = "UDP" }
 
 # 允许哪个网络配置文件:Private 仅家庭/工作网络,Any 包含公用网络
-$profile = "Private"
+$profile = "Any"
 
 foreach ($rule in $rules) {
     $existing = Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
@@ -40,7 +40,8 @@ foreach ($rule in $rules) {
             -Action Allow `
             -Protocol $rule.Protocol `
             -LocalPort $rule.Port `
-            -Profile $profile | Out-Null
+            -Profile $profile `
+            -RemoteAddress LocalSubnet | Out-Null
     } else {
         Set-NetFirewallRule `
             -DisplayName $rule.Name `
@@ -48,6 +49,8 @@ foreach ($rule in $rules) {
             -Direction Inbound `
             -Action Allow `
             -Profile $profile | Out-Null
+        $existing | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter `
+            -RemoteAddress LocalSubnet | Out-Null
         $existing | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter `
             -Protocol $rule.Protocol `
             -LocalPort $rule.Port | Out-Null

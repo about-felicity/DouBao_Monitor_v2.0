@@ -16,6 +16,7 @@ import urllib.request
 import doubao_env_loader  # noqa: F401  loads API keys from local .env file
 import doubao_question_aliases as qa
 import doubao_brand_settings as brand_settings
+from monitor_core.owned_products import OWN_PRODUCT_SCHEMA_VERSION, own_product_mentions
 
 # 固定使用中国时区 (UTC+8)，不受系统时区影响
 CST = timezone(timedelta(hours=8))
@@ -1828,7 +1829,7 @@ def find_existing_source_run(payload):
     return None
 
 
-def append_csv(payload):
+def append_csv(payload, analysis_result=None):
     normalize_payload_times(payload)
     normalize_payload_question(payload)
     rows = payload.get("items") or []
@@ -1911,11 +1912,33 @@ def append_csv(payload):
                     writer.writeheader()
                 writer.writerows(source_rows)
 
-    append_products_csv(payload, run_no, run_time)
+    if analysis_result is not None:
+        source_details = []
+        for item in rows:
+            title = str(item.get("title") or "").strip()
+            href = str(item.get("href") or "").strip()
+            source_details.append({
+                "title": title,
+                "href": href,
+                "owned_products_in_title": own_product_mentions(title),
+            })
+        analysis_result.update({
+            "question_present": bool(question and question != "未采集到问题"),
+            "answer_present": bool(str(payload.get("answerText") or payload.get("answer_text") or "").strip()),
+            "answer_length": len(str(payload.get("answerText") or payload.get("answer_text") or "").strip()),
+            "source_count": len(rows),
+            "expected_source_count": int(payload.get("expectedCount") or payload.get("count") or len(rows) or 0),
+            "source_capture_complete": bool(payload.get("complete")),
+            "missing_source_links": sum(not item["href"] for item in source_details),
+            "missing_source_titles": sum(not item["title"] for item in source_details),
+            "owned_product_schema_version": OWN_PRODUCT_SCHEMA_VERSION,
+            "sources": source_details,
+        })
+    append_products_csv(payload, run_no, run_time, analysis_result)
     return run_no, len(rows)
 
 
-def append_products_csv(payload, run_no, run_time):
+def append_products_csv(payload, run_no, run_time, analysis_result=None):
     normalize_payload_question(payload)
     question = str(payload.get("question") or "").strip()
     answer_text = payload.get("answerText") or payload.get("answer_text") or ""
@@ -1923,13 +1946,23 @@ def append_products_csv(payload, run_no, run_time):
     # the background retry worker still has the exact answer body to review.
     answer_hash = append_answer_csv(payload, run_no, run_time, answer_text, "ai_pending", product_ai_model_label())
     products, review_status, extraction_method, model = review_products_with_ai(answer_text)
+    recommendation_question = is_recommendation_question(question)
+    if analysis_result is not None:
+        analysis_result.update({
+            "recommendation_question": recommendation_question,
+            "product_count": len(products),
+            "product_review_status": review_status,
+            "product_extraction_method": extraction_method,
+            "product_analysis_model": model,
+            "product_parse_complete": (not recommendation_question) or review_status == "ai_verified",
+        })
     if not update_answer_review(run_no, answer_hash, review_status, model):
         debug_log(
             "answer review status deferred; run_no=" + str(run_no)
             + " status=" + str(review_status)
             + " (background worker will retry)"
         )
-    if not is_recommendation_question(question):
+    if not recommendation_question:
         debug_log("product statistics skipped; non recommendation question=" + repr(question) + " run_no=" + str(run_no))
         return 0
     if not products:
@@ -2687,7 +2720,9 @@ def main():
         raw = sys.stdin.read()
 
     payload = load_payload(raw)
-    run_no, rows_written = append_csv(payload)
+    analysis = {}
+    run_no, rows_written = append_csv(payload, analysis)
+    analysis["run_no"] = run_no
     has_xlsx = False
     if os.environ.get("DOUBAO_SKIP_XLSX", "").strip() not in ("1", "true", "TRUE", "yes"):
         has_xlsx = write_xlsx_from_csv()
@@ -2700,6 +2735,7 @@ def main():
         "xlsx": OUT_XLSX if has_xlsx else "",
         "count": payload.get("count", 0),
         "complete": payload.get("complete", False),
+        "analysis": analysis,
     }, ensure_ascii=False))
 
 

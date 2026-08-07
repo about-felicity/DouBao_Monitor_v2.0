@@ -4,12 +4,14 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from unittest import mock
 
 import monitor_core.lan_result_receiver as receiver
 import monitor_core.lan_result_sync as sync
+import monitor_core.plugins as plugins
 
 
 class LanResultReceiverTest(unittest.TestCase):
@@ -53,9 +55,16 @@ class LanResultReceiverTest(unittest.TestCase):
                     )
                     self.assertTrue(json.loads(urllib.request.urlopen(request, timeout=5).read())["ok"])
                     self.assertTrue(json.loads(urllib.request.urlopen(request, timeout=5).read())["ok"])
+                    deadline = time.time() + 5
+                    while time.time() < deadline and not receiver.TARGETS["deepseek"].exists():
+                        time.sleep(0.05)
                     lines = receiver.TARGETS["deepseek"].read_text(encoding="utf-8").splitlines()
                     self.assertEqual(len(lines), 1)
                     self.assertEqual(json.loads(lines[0])["remote_source_device"], "test-worker")
+                    receipt = json.loads((receiver.QUEUE / "deepseek" / "done" / ("a" * 64 + ".json")).read_text(encoding="utf-8"))
+                    self.assertEqual(receipt["source_device"], "test-worker")
+                    self.assertEqual(receipt["question"], "test")
+                    self.assertTrue(receipt["analysis"]["question_present"])
                 finally:
                     server.shutdown()
                     server.server_close()
@@ -92,6 +101,9 @@ class LanResultReceiverTest(unittest.TestCase):
                     self.assertTrue(result["ok"])
                     updated = json.loads(config_path.read_text(encoding="utf-8"))
                     self.assertEqual(updated["receiver_url"], new_url)
+                    deadline = time.time() + 5
+                    while time.time() < deadline and not receiver.TARGETS["deepseek"].exists():
+                        time.sleep(0.05)
                     rows = receiver.TARGETS["deepseek"].read_text(encoding="utf-8").splitlines()
                     self.assertEqual(len(rows), 1)
                     self.assertEqual(json.loads(rows[0])["remote_source_device"], "remote-pc")
@@ -102,6 +114,50 @@ class LanResultReceiverTest(unittest.TestCase):
             receiver.QUEUE = original_queue
             receiver.TARGETS["deepseek"] = original_target
             sync.ROOT = original_root
+
+    def test_dashboard_fallback_is_added_for_result_receiver(self) -> None:
+        self.assertEqual(
+            sync._urls({"receiver_url": "http://192.168.1.233:8791"}),
+            ["http://192.168.1.233:8791", "http://192.168.1.233:8765"],
+        )
+
+    def test_remote_plugin_activity_exposes_analysis_audit(self) -> None:
+        original_root = plugins.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                plugins.ROOT = Path(directory)
+                done = plugins.ROOT / "runtime" / "lan_result_receiver" / "deepseek" / "done"
+                done.mkdir(parents=True)
+                (done / ("c" * 64 + ".json")).write_text(json.dumps({
+                    "request_id": "c" * 64,
+                    "source_device": "worker-1",
+                    "received_at": "2026-08-06T12:00:00+00:00",
+                    "question": "推荐一款睫毛增长液",
+                    "rows_written": 1,
+                    "analysis": {
+                        "question_present": True,
+                        "answer_present": True,
+                        "answer_length": 128,
+                        "source_count": 1,
+                        "missing_source_links": 0,
+                        "missing_source_titles": 0,
+                        "recommendation_question": True,
+                        "product_parse_complete": True,
+                        "sources": [{"title": "资料", "href": "https://example.com/a"}],
+                    },
+                }), encoding="utf-8")
+
+                class RemotePlugin(plugins.ModelPlugin):
+                    id = "deepseek"
+                    execution = "remote"
+
+                result = RemotePlugin().activity()
+                self.assertEqual(result["queue"]["processed"], 1)
+                self.assertEqual(result["events"][0]["source_device"], "worker-1")
+                self.assertEqual(result["events"][0]["source_count"], 1)
+                self.assertEqual(result["events"][0]["analysis_status"], "pending")
+        finally:
+            plugins.ROOT = original_root
 
 
 if __name__ == "__main__":

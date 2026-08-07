@@ -59,6 +59,11 @@ def _urls(config: dict[str, Any]) -> list[str]:
         url = str(candidate or "").strip().rstrip("/")
         if url.startswith("http://") and url not in result:
             result.append(url)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "http" and parsed.hostname and parsed.port == 8791:
+            fallback = f"http://{parsed.hostname}:8765"
+            if fallback not in result:
+                result.append(fallback)
     return result
 
 

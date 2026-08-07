@@ -253,6 +253,23 @@ def queue_counts() -> dict[str, int]:
     }
 
 
+def parse_save_analysis(save_result: dict[str, Any]) -> dict[str, Any]:
+    raw: Any = save_result.get("output")
+    if isinstance(raw, str):
+        for candidate in reversed(raw.splitlines()):
+            try:
+                decoded = json.loads(candidate.strip())
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                raw = decoded
+                break
+    if not isinstance(raw, dict):
+        return {}
+    analysis = raw.get("analysis")
+    return analysis if isinstance(analysis, dict) else {}
+
+
 class CaptureWorker(threading.Thread):
     def __init__(self) -> None:
         super().__init__(name="doubao-lan-capture-worker", daemon=True)
@@ -286,6 +303,7 @@ class CaptureWorker(threading.Thread):
                 envelope.get("received_at") or ""
             )
             save_result = self.grabber.save_payload(payload)
+            analysis = parse_save_analysis(save_result)
             receipt = {
                 "request_id": request_id,
                 "source_device": envelope.get("source_device") or "",
@@ -295,6 +313,7 @@ class CaptureWorker(threading.Thread):
                 "account_uid_masked": payload.get("account_uid_masked") or "",
                 "url": payload.get("url") or "",
                 "save": save_result,
+                "analysis": analysis,
             }
             atomic_json(DONE_DIR / f"{request_id}.json", receipt)
             path.unlink(missing_ok=True)
@@ -465,6 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="接收同一局域网内远端豆包抓取数据。")
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--no-dashboard", action="store_true")
     return parser.parse_args()
 
 
@@ -479,7 +499,8 @@ def main() -> int:
     pairing = write_pairing(config)
     for directory in (INBOX_DIR, DONE_DIR, ERROR_DIR):
         directory.mkdir(parents=True, exist_ok=True)
-    ensure_dashboard(config)
+    if not args.no_dashboard:
+        ensure_dashboard(config)
     worker = CaptureWorker()
     worker.start()
     server = ReceiverServer(

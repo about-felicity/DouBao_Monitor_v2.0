@@ -30,7 +30,7 @@ function Test-ListeningPort([int]$Port) {
 if (-not (Test-ListeningPort 8790)) {
     $receiverOut = Join-Path $runtimeRoot "doubao_receiver.out.log"
     $receiverErr = Join-Path $runtimeRoot "doubao_receiver.err.log"
-    Start-Process -FilePath "python" -ArgumentList @("-u", (Join-Path $projectRoot "doubao_mumu_controller\doubao_lan_receiver.py")) `
+    Start-Process -FilePath "python" -ArgumentList @("-u", (Join-Path $projectRoot "doubao_mumu_controller\doubao_lan_receiver.py"), "--no-dashboard") `
         -WorkingDirectory $projectRoot -RedirectStandardOutput $receiverOut -RedirectStandardError $receiverErr -WindowStyle Hidden
 }
 

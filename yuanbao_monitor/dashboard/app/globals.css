@@ -1235,16 +1235,16 @@ button {
   color: var(--danger);
 }
 .remote-event-list {
-  max-height: 360px;
+  max-height: 520px;
   overflow: auto;
 }
 .remote-event {
   display: grid;
-  grid-template-columns: 88px 54px minmax(220px, 1fr) 92px;
-  align-items: center;
+  grid-template-columns: 88px 54px minmax(220px, 1fr);
+  align-items: start;
   gap: 10px;
-  min-height: 50px;
-  padding: 8px 14px;
+  min-height: 72px;
+  padding: 11px 14px;
   border-bottom: 1px solid #e7eeea;
 }
 .remote-event:last-child {
@@ -1274,6 +1274,58 @@ button {
   background: #ffe8ea;
   color: var(--danger);
 }
+.remote-event-main {
+  min-width: 0;
+}
+.remote-event-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.remote-event-title em {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #ddf4eb;
+  color: #16795b;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 800;
+}
+.remote-event.analysis-pending .remote-event-title em,
+.remote-event.analysis-warning .remote-event-title em {
+  background: #fff4d8;
+  color: #9b6a08;
+}
+.remote-event.analysis-failed .remote-event-title em {
+  background: #ffe8ea;
+  color: var(--danger);
+}
+.remote-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+.remote-checks span {
+  padding: 3px 6px;
+  border: 1px solid #dfe9e4;
+  border-radius: 5px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 8px;
+}
+.remote-checks .ok { color: #16795b; border-color: #bfe3d5; background: #f1faf6; }
+.remote-checks .warn,
+.remote-checks .pending { color: #8d650d; border-color: #ead8a8; background: #fffaf0; }
+.remote-checks .bad { color: var(--danger); border-color: #efc9cd; background: #fff5f6; }
+.remote-checks .owned { color: #6548a8; border-color: #d9cdf2; background: #f8f5ff; }
+.remote-event-warning {
+  margin-top: 7px;
+  color: var(--danger);
+  font-size: 8px;
+}
 .remote-event > div b,
 .remote-event > div small {
   display: block;
@@ -1286,9 +1338,6 @@ button {
 }
 .remote-event > div small {
   margin-top: 3px;
-}
-.remote-event strong {
-  text-align: right;
 }
 .empty {
   min-height: 92px;
@@ -1417,9 +1466,7 @@ button {
   .remote-event {
     grid-template-columns: 68px 48px minmax(0, 1fr);
   }
-  .remote-event strong {
-    display: none;
-  }
+  .remote-event-title { align-items: flex-start; flex-direction: column; gap: 5px; }
   .control-row {
     grid-template-columns: 1fr;
   }

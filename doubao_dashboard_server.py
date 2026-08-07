@@ -6334,7 +6334,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8", status,
         )
 
-    def proxy_doubao_receiver(self):
+    def proxy_doubao_receiver(self, port=8790):
         length = safe_int(self.headers.get("Content-Length"))
         if length < 0 or length > 25 * 1024 * 1024:
             self.send_json({"ok": False, "error": "invalid body size"}, 413)
@@ -6350,7 +6350,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }.items()
             if value
         }
-        connection = http.client.HTTPConnection("127.0.0.1", 8790, timeout=15)
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
         try:
             connection.request(self.command, self.path, body=body, headers=headers)
             response = connection.getresponse()
@@ -6387,6 +6387,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/v1/captures":
             self.proxy_doubao_receiver()
+            return
+        if re.fullmatch(r"/api/v1/models/(deepseek|yuanbao|wenxin|afu)/results", path):
+            self.proxy_doubao_receiver(8791)
             return
         model_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/(questions|account-check)", path)
         if model_route:

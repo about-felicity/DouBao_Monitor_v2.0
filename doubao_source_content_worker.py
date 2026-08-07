@@ -942,8 +942,7 @@ def acquire_lock():
             owner_pid = LOCK_PATH.read_text(
                 encoding="ascii", errors="ignore"
             ).strip()
-            age = time.time() - LOCK_PATH.stat().st_mtime
-            if age < 15 * 60 and pid_is_running(owner_pid):
+            if pid_is_running(owner_pid):
                 return False
         except Exception:
             pass
@@ -951,11 +950,22 @@ def acquire_lock():
             LOCK_PATH.unlink()
         except Exception:
             return False
+    descriptor = None
     try:
-        LOCK_PATH.write_text(str(os.getpid()), encoding="ascii")
+        descriptor = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
         return True
-    except Exception:
+    except FileExistsError:
         return False
+    except Exception:
+        try:
+            LOCK_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def heartbeat():
