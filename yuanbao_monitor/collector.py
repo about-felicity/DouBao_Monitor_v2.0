@@ -483,6 +483,18 @@ class YuanbaoSourceCollector:
         print(f"共收集 {len(sources)} 条信源")
         return sources
 
+    def _expected_source_count(self) -> int:
+        texts = self.driver.execute_script("""
+            return Array.from(document.querySelectorAll(
+                '#search-guide-tool, .agent-dialogue__drawer.t-drawer--open'
+            )).map(function(el) {
+                return [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
+            }).join('\n');
+        """) or ""
+        matches = re.findall(r"(?:参考|来源|信源)[^\d]{0,8}(\d+)|(\d+)[^\d]{0,4}(?:篇|条|个)?(?:参考|来源|信源)", texts)
+        counts = [int(left or right) for left, right in matches if left or right]
+        return max(counts, default=0)
+
     def _close_drawer(self):
         close_xpaths = [
             "//div[contains(@class,'drawer')]//button[contains(@class,'close')]",
@@ -562,6 +574,11 @@ class YuanbaoSourceCollector:
         print("收集信源...")
         sources = self._collect_all_sources(last_msg)
         result["sources"] = sources
+        expected_source_count = self._expected_source_count()
+        result["expected_source_count"] = expected_source_count
+        result["source_capture_complete"] = len(sources) >= expected_source_count
+        if len(sources) < expected_source_count:
+            result["error"] = f"incomplete_sources:{len(sources)}/{expected_source_count}"
         print(f"收集到 {len(result['sources'])} 条信源")
 
         self._save(result, output_path)

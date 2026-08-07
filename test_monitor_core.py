@@ -1,4 +1,7 @@
 import unittest
+import json
+from pathlib import Path
+import tempfile
 from unittest import mock
 
 from monitor_core.analytics import build_analytics, prepare_analytics
@@ -6,6 +9,7 @@ from monitor_core.cdp_chat import external_sources
 from monitor_core.owned_products import OWN_PRODUCT_RULES, own_product_mentions
 from monitor_core.plugins import discover_plugins
 from monitor_core.quality import invalid_answer_reason
+from monitor_core.jsonl_dashboard import build_jsonl_dashboard
 from monitor_core.recommendation_questions import (
     CANONICAL_QUESTIONS,
     PROMPTS,
@@ -16,6 +20,23 @@ from monitor_core.scheduling import build_question_schedule, normalize_question_
 
 
 class QualityTests(unittest.TestCase):
+    def test_dashboard_quarantines_records_from_another_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / "results.jsonl"
+            output = root / "dashboard.json"
+            records = [
+                {"collector_model": "wenxin", "status": "success", "round": 1,
+                 "question": "推荐一款染发剂", "reply": "这是足够长的文心染发剂推荐正文内容。"},
+                {"collector_model": "yuanbao", "status": "success", "round": 2,
+                 "question": "推荐一款染发剂", "reply": "这是不应进入文心面板的元宝推荐正文内容。"},
+            ]
+            results.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in records), encoding="utf-8")
+            payload = build_jsonl_dashboard("wenxin", results, output)
+        self.assertEqual(payload["successful_runs"], 1)
+        self.assertEqual(payload["quality_quarantine"]["count"], 1)
+        self.assertIn("模型标识不匹配", payload["quality_quarantine"]["records"][0]["reason"])
+
     def test_empty_short_and_system_errors_are_skipped(self):
         self.assertTrue(invalid_answer_reason(""))
         self.assertTrue(invalid_answer_reason("好的"))

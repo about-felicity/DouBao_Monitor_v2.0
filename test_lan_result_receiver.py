@@ -15,6 +15,45 @@ import monitor_core.plugins as plugins
 
 
 class LanResultReceiverTest(unittest.TestCase):
+    def test_sender_stamps_model_and_rejects_cross_model_record(self) -> None:
+        stamped = sync.stamp_record_model("wenxin", {"question": "q"})
+        self.assertEqual(stamped["collector_model"], "wenxin")
+        with self.assertRaisesRegex(ValueError, "collector model mismatch"):
+            sync.stamp_record_model("yuanbao", stamped)
+
+    def test_receiver_rejects_cross_model_and_tampered_identity(self) -> None:
+        record = {"collector_model": "wenxin", "question": "q"}
+        device = "worker-1"
+        request_id = sync._request_id("wenxin", record, device)
+        envelope = {"model": "wenxin", "request_id": request_id,
+                    "source_device": device, "record": record}
+        validated_id, validated = receiver.validate_result_envelope("wenxin", envelope)
+        self.assertEqual(validated_id, request_id)
+        self.assertEqual(validated["collector_model"], "wenxin")
+        with self.assertRaisesRegex(ValueError, "collector model mismatch"):
+            receiver.validate_result_envelope("yuanbao", {**envelope, "model": "yuanbao"})
+        with self.assertRaisesRegex(ValueError, "request identity mismatch"):
+            receiver.validate_result_envelope("wenxin", {**envelope, "request_id": "f" * 64})
+
+    def test_legacy_unstamped_result_remains_compatible_without_crossing_models(self) -> None:
+        record = {"question": "legacy"}
+        device = "old-worker"
+        request_id = sync._request_id("wenxin", record, device)
+        envelope = {"model": "wenxin", "request_id": request_id,
+                    "source_device": device, "record": record}
+        _, stamped = receiver.validate_result_envelope("wenxin", envelope)
+        self.assertEqual(stamped["collector_model"], "wenxin")
+        receiver.validate_result_envelope("wenxin", envelope)
+
+    def test_receipt_does_not_mask_incomplete_sources(self) -> None:
+        record = {"status": "success", "question": "q", "web_body": "answer",
+                  "sources": [{"title": "one", "url": "https://example.com/1"}],
+                  "expected_source_count": 3, "source_capture_complete": False}
+        receipt = receiver.result_receipt("wenxin", "a" * 64, {"source_device": "pc"}, record)
+        self.assertEqual(receipt["analysis"]["source_count"], 1)
+        self.assertEqual(receipt["analysis"]["expected_source_count"], 3)
+        self.assertFalse(receipt["analysis"]["source_capture_complete"])
+
     def test_discovery_response_is_authenticated(self) -> None:
         token = "x" * 32
         nonce = "a" * 32
@@ -46,8 +85,9 @@ class LanResultReceiverTest(unittest.TestCase):
                         "model": "deepseek",
                         "request_id": "a" * 64,
                         "source_device": "test-worker",
-                        "record": {"status": "success", "question": "test", "sources": []},
+                        "record": {"collector_model": "deepseek", "status": "success", "question": "test", "sources": []},
                     }
+                    envelope["request_id"] = sync._request_id("deepseek", envelope["record"], "test-worker")
                     request = urllib.request.Request(
                         f"http://127.0.0.1:{server.server_address[1]}/api/v1/models/deepseek/results",
                         data=json.dumps(envelope).encode("utf-8"), method="POST",
@@ -61,7 +101,7 @@ class LanResultReceiverTest(unittest.TestCase):
                     lines = receiver.TARGETS["deepseek"].read_text(encoding="utf-8").splitlines()
                     self.assertEqual(len(lines), 1)
                     self.assertEqual(json.loads(lines[0])["remote_source_device"], "test-worker")
-                    receipt = json.loads((receiver.QUEUE / "deepseek" / "done" / ("a" * 64 + ".json")).read_text(encoding="utf-8"))
+                    receipt = json.loads((receiver.QUEUE / "deepseek" / "done" / (envelope["request_id"] + ".json")).read_text(encoding="utf-8"))
                     self.assertEqual(receipt["source_device"], "test-worker")
                     self.assertEqual(receipt["question"], "test")
                     self.assertTrue(receipt["analysis"]["question_present"])
@@ -93,8 +133,10 @@ class LanResultReceiverTest(unittest.TestCase):
                     config_path.write_text(json.dumps({"enabled": True, "token": token,
                                                        "receiver_url": "http://127.0.0.1:1",
                                                        "upload_timeout": 1}), encoding="utf-8")
-                    envelope = {"version": 1, "model": "deepseek", "request_id": "b" * 64,
-                                "source_device": "remote-pc", "record": {"status": "success"}}
+                    record = {"collector_model": "deepseek", "status": "success"}
+                    envelope = {"version": 1, "model": "deepseek",
+                                "request_id": sync._request_id("deepseek", record, "remote-pc"),
+                                "source_device": "remote-pc", "record": record}
                     config = sync._load_config("deepseek")
                     with mock.patch.object(sync, "_discover", return_value=[new_url]):
                         result = sync._post(config, envelope)

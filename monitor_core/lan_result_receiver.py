@@ -146,6 +146,29 @@ def valid_request_id(value: Any) -> str:
     return text
 
 
+def validate_result_envelope(model: str, value: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if value.get("model") != model or not isinstance(value.get("record"), dict):
+        raise ValueError("invalid result envelope")
+    request_id = valid_request_id(value.get("request_id"))
+    record = dict(value["record"])
+    declared = str(record.get("collector_model") or "").strip()
+    if declared and declared != model:
+        raise ValueError(f"collector model mismatch: expected {model}, got {declared}")
+    device = str(value.get("source_device") or "").strip()
+    raw = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    valid_ids = {hashlib.sha256(f"{model}\n{device}\n{raw}".encode("utf-8")).hexdigest()}
+    if declared == model:
+        legacy_record = dict(record)
+        legacy_record.pop("collector_model", None)
+        legacy_raw = json.dumps(legacy_record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        valid_ids.add(hashlib.sha256(f"{model}\n{device}\n{legacy_raw}".encode("utf-8")).hexdigest())
+    if request_id not in valid_ids:
+        raise ValueError("request identity mismatch")
+    record["collector_model"] = model
+    value["record"] = record
+    return request_id, record
+
+
 def result_receipt(model: str, request_id: str, value: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     sources = record.get("sources") if isinstance(record.get("sources"), list) else []
     compact_sources = []
@@ -161,6 +184,8 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
     products = record.get("products") if isinstance(record.get("products"), list) else []
     review_status = str(record.get("product_review_status") or "")
     successful = str(record.get("status") or "success").casefold() == "success"
+    expected_source_count = max(len(compact_sources), int(record.get("expected_source_count") or 0))
+    capture_complete = bool(record.get("source_capture_complete", len(compact_sources) >= expected_source_count))
     return {
         "request_id": request_id,
         "model": model,
@@ -174,8 +199,8 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
             "answer_present": bool(answer),
             "answer_length": len(answer),
             "source_count": len(compact_sources),
-            "expected_source_count": len(compact_sources),
-            "source_capture_complete": successful,
+            "expected_source_count": expected_source_count,
+            "source_capture_complete": successful and capture_complete and len(compact_sources) >= expected_source_count,
             "missing_source_links": sum(not item["href"] for item in compact_sources),
             "missing_source_titles": sum(not item["title"] for item in compact_sources),
             "recommendation_question": bool(canonical_recommendation_question(question)),
@@ -250,9 +275,9 @@ class ResultWorker(threading.Thread):
     def process(self, model: str, path: Path) -> None:
         try:
             value = json.loads(path.read_text(encoding="utf-8-sig"))
-            request_id = valid_request_id(value.get("request_id"))
-            record = dict(value["record"])
+            request_id, record = validate_result_envelope(model, value)
             analyze_record_products(record)
+            record["model_id"] = model
             record["remote_request_id"] = request_id
             record["remote_source_device"] = str(value.get("source_device") or "")
             record["remote_received_at"] = time.time()
@@ -332,9 +357,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("invalid body size")
             value = json.loads(self.rfile.read(size).decode("utf-8"))
             model = match.group(1)
-            request_id = valid_request_id(value.get("request_id"))
-            if value.get("model") != model or not isinstance(value.get("record"), dict):
-                raise ValueError("invalid result envelope")
+            request_id, _record = validate_result_envelope(model, value)
             done = QUEUE / model / "done" / f"{request_id}.json"
             inbox = QUEUE / model / "inbox" / f"{request_id}.json"
             if not done.exists() and not inbox.exists():

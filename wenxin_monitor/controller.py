@@ -118,7 +118,7 @@ class WenxinWebCollector:
     def latest_reference(self) -> str:
         return self._open_latest_once()
 
-    def collect_latest(self, previous_url: str, timeout: int = 180) -> dict[str, Any]:
+    def collect_latest(self, previous_url: str, timeout: int = 180, expected_question: str = "") -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         current_url = ""
         while time.monotonic() < deadline:
@@ -167,8 +167,27 @@ class WenxinWebCollector:
             sources.extend(external_sources(current_payload, self.EXCLUDED))
         deduped = {item["url"]: item for item in sources}
         snapshot = self._snapshot()
+        if str(snapshot.get("url") or "") != current_url:
+            raise RuntimeError("文心网页会话在采集时发生切换")
         body = str(snapshot.get("body") or "")
-        answer_match = re.search(r"共参考\d+篇资料\s*(.*?)(?:聊聊新话题|任务\nAI生图)", body, re.S)
-        answer = answer_match.group(1).strip() if answer_match else body
+        compact_body = re.sub(r"\s+", "", body)
+        compact_question = re.sub(r"\s+", "", expected_question)
+        if compact_question and compact_question not in compact_body:
+            raise RuntimeError("文心网页会话与当前问题不匹配")
+        count_match = re.search(r"共参考\s*(\d+)\s*篇资料", body)
+        expected_source_count = int(count_match.group(1)) if count_match else 0
+        answer_match = re.search(
+            r"共参考\s*\d+\s*篇资料\s*(.*?)(?:聊聊新话题|任务\s*AI生图)",
+            body,
+            re.S,
+        )
+        if not answer_match or not answer_match.group(1).strip():
+            raise RuntimeError("文心正文区域提取失败，拒绝保存整页或旧会话文本")
+        answer = answer_match.group(1).strip()
+        if len(deduped) < expected_source_count:
+            raise RuntimeError(
+                f"文心信源抓取不完整：页面显示 {expected_source_count} 条，实际获取 {len(deduped)} 条"
+            )
         return {"url": current_url, "body": answer, "page_body": body,
-                "sources": list(deduped.values()), "source_count": len(deduped)}
+                "sources": list(deduped.values()), "source_count": len(deduped),
+                "expected_source_count": expected_source_count, "source_capture_complete": True}

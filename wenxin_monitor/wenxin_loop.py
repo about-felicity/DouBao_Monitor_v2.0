@@ -29,6 +29,7 @@ def now() -> str:
 
 
 def append(path: Path, row: dict) -> None:
+    row = {**row, "collector_model": "wenxin"}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     enqueue_remote_result("wenxin", row)
@@ -89,7 +90,7 @@ def main() -> int:
                     previous = web.latest_reference()
                     app.send(prompt)
                     mobile = app.wait_for_mobile_accept(min(60, args.timeout))
-                result = web.collect_latest(previous, args.timeout)
+                result = web.collect_latest(previous, args.timeout, prompt)
                 answer = str(result.get("body") or "")
                 skip = answer_quality_reason(prompt, answer)
                 if skip:
@@ -98,6 +99,8 @@ def main() -> int:
                        "round": index + 1, "serial": args.serial, "prompt": prompt,
                        "question": canonical_recommendation_question(prompt), "reply": answer,
                        "web_body": answer, "sources": result.get("sources", []),
+                       "expected_source_count": result.get("expected_source_count", len(result.get("sources", []))),
+                       "source_capture_complete": bool(result.get("source_capture_complete")),
                        "page_url": result.get("url"), "mobile": mobile,
                        "started_at": started, "finished_at": now()}
                 append(Path(args.results), row)

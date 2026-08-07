@@ -23,6 +23,7 @@ _AGENTS: set[str] = set()
 _AGENT_LOCK = threading.Lock()
 DISCOVERY_PORT = 8792
 DISCOVERY_SERVICE = "monitor-lan-result-v1"
+ALLOWED_MODELS = frozenset({"deepseek", "yuanbao", "wenxin", "afu"})
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -70,6 +71,19 @@ def _urls(config: dict[str, Any]) -> list[str]:
 def _request_id(model: str, record: dict[str, Any], device: str) -> str:
     payload = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(f"{model}\n{device}\n{payload}".encode("utf-8")).hexdigest()
+
+
+def stamp_record_model(model: str, record: dict[str, Any]) -> dict[str, Any]:
+    if model not in ALLOWED_MODELS:
+        raise ValueError(f"unsupported collector model: {model}")
+    if not isinstance(record, dict):
+        raise TypeError("collector result must be a JSON object")
+    value = dict(record)
+    declared = str(value.get("collector_model") or "").strip()
+    if declared and declared != model:
+        raise ValueError(f"collector model mismatch: expected {model}, got {declared}")
+    value["collector_model"] = model
+    return value
 
 
 def _token_fingerprint(token: str) -> str:
@@ -152,9 +166,13 @@ def _remember_receiver(model: str, config: dict[str, Any], receiver_url: str) ->
 
 def enqueue(model: str, record: dict[str, Any]) -> dict[str, Any]:
     """Persist an upload before any network attempt; safe to call per result."""
+    record = stamp_record_model(model, record)
     config = _load_config(model)
     if not config.get("enabled"):
         return {"enabled": False, "status": "disabled"}
+    configured_model = str(config.get("model") or model).strip()
+    if configured_model != model:
+        raise ValueError(f"sync config model mismatch: expected {model}, got {configured_model}")
     device = str(config.get("device_name") or socket.gethostname()).strip()
     request_id = _request_id(model, record, device)
     root = ROOT / "runtime" / "remote_workers" / model
@@ -217,6 +235,16 @@ def flush(model: str, max_items: int = 100) -> dict[str, Any]:
     for path in sorted(pending.glob("*.json"))[:max_items]:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8-sig"))
+            if envelope.get("model") != model:
+                raise ValueError(f"outbox model mismatch: expected {model}, got {envelope.get('model')}")
+            original_record = envelope.get("record")
+            record = stamp_record_model(model, original_record)
+            device = str(envelope.get("source_device") or "").strip()
+            valid_ids = {_request_id(model, record, device)}
+            if isinstance(original_record, dict):
+                valid_ids.add(_request_id(model, original_record, device))
+            if envelope.get("request_id") not in valid_ids or path.stem != envelope.get("request_id"):
+                raise ValueError("outbox request identity mismatch")
             receipt = _post(config, envelope)
             _atomic_json(sent / path.name, {"uploaded_at": time.time(), "receiver": receipt})
             path.unlink(missing_ok=True)

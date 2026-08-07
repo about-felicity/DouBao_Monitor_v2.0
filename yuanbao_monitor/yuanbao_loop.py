@@ -113,6 +113,7 @@ def build_schedule(questions: list[dict[str, Any]], mode: str) -> list[str]:
 
 
 def append_jsonl(path: Path, record: dict[str, Any]):
+    record = {**record, "collector_model": "yuanbao"}
     line = json.dumps(record, ensure_ascii=False) + "\n"
     with WRITE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +252,8 @@ def worker(
                     "started_at": started, "finished_at": now(), "xml": str(xml_path),
                     "web_body": web_result.get("body", ""),
                     "sources": web_result.get("sources", []),
+                    "expected_source_count": web_result.get("expected_source_count", len(web_result.get("sources", []))),
+                    "source_capture_complete": bool(web_result.get("source_capture_complete")),
                     "web_error": web_result.get("error"),
                 }
                 append_jsonl(Path(args.results), record)

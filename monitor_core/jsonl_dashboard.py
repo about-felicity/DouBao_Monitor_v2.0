@@ -39,6 +39,11 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
                 continue
     runs, seen, quarantine = [], set(), []
     for record in records:
+        declared_model = str(record.get("collector_model") or record.get("model_id") or "").strip()
+        if declared_model and declared_model != model_id:
+            quarantine.append({"round": record.get("round"), "question": record.get("question"),
+                               "reason": f"模型标识不匹配：{declared_model}"})
+            continue
         if record.get("status") != "success":
             continue
         question = canonical_recommendation_question(record.get("question") or record.get("prompt"))
