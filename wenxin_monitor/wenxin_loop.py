@@ -93,12 +93,15 @@ def main() -> int:
                         app = WenxinAppController(args.serial)
                     with device_session(args.serial, "文心", timeout=args.timeout + 120, on_wait=log.info):
                         previous = web.latest_reference()
-                        app.send(prompt)
+                        send_state = app.send(prompt)
                         submitted = True
                         mobile = app.wait_for_mobile_accept(min(60, args.timeout), prompt)
+                        mobile.update(send_state)
                     log.info("第 %d 轮问题已由 App 接受，后续网页失败只重试抓取，不会重复提问", index + 1)
                 if not generation_complete:
-                    generation = app.wait_for_generation_complete(args.timeout)
+                    generation = app.wait_for_generation_complete(
+                        args.timeout, bool(mobile.get("generation_indicator_seen_at_send"))
+                    )
                     mobile.update(generation)
                     generation_complete = True
                     log.info("第 %d 轮检测到停止生成按钮已消失，开始网页端正文与信源抓取", index + 1)

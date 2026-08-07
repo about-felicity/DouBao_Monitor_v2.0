@@ -54,6 +54,13 @@ class RemoteModelPanelTest(unittest.TestCase):
         self.assertTrue(result["generation_indicator_seen"])
         self.assertTrue(result["generation_complete"])
 
+    def test_wenxin_generation_wait_accepts_indicator_seen_during_send(self):
+        controller = wenxin_controller.WenxinAppController.__new__(wenxin_controller.WenxinAppController)
+        controller.generation_indicator_visible = mock.Mock(side_effect=[False, False])
+        with mock.patch.object(wenxin_controller.time, "sleep", return_value=None):
+            result = controller.wait_for_generation_complete(10, already_seen=True)
+        self.assertTrue(result["generation_complete"])
+
     def test_wenxin_and_yuanbao_require_successful_login_check(self):
         self.assertFalse(account_gate_open("wenxin", False))
         self.assertFalse(account_gate_open("yuanbao", False))

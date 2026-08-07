@@ -47,7 +47,7 @@ class WenxinAppController:
         if not self._edit().exists(timeout=5):
             raise RuntimeError("文心 App 新建会话失败，未找到问题输入框")
 
-    def send(self, prompt: str) -> None:
+    def send(self, prompt: str) -> dict[str, Any]:
         self.new_chat()
         edit = self._edit()
         width, height = self.d.window_size()
@@ -59,9 +59,12 @@ class WenxinAppController:
             raise RuntimeError("文心 App 问题写入校验失败")
         # Filled composer replaces the bottom-right plus with a purple send arrow.
         self.d.click(width - max(42, int(width * 0.105)), height - max(70, int(height * 0.095)))
-        time.sleep(1)
+        time.sleep(0.25)
+        generation_indicator_seen = self.generation_indicator_visible()
+        time.sleep(0.75)
         if self._edit().exists and str(self._edit().info.get("text") or "").strip() == prompt:
             raise RuntimeError("文心 App 发送按钮没有生效")
+        return {"generation_indicator_seen_at_send": generation_indicator_seen}
 
     def wait_for_mobile_accept(self, timeout: int = 60, prompt: str = "") -> dict[str, Any]:
         deadline = time.monotonic() + max(3, timeout)
@@ -150,9 +153,9 @@ class WenxinAppController:
             return False
         return self.generation_indicator_in_image(xml, image)
 
-    def wait_for_generation_complete(self, timeout: int = 180) -> dict[str, Any]:
+    def wait_for_generation_complete(self, timeout: int = 180, already_seen: bool = False) -> dict[str, Any]:
         deadline = time.monotonic() + max(10, timeout)
-        appeared = False
+        appeared = already_seen
         disappeared_stably = 0
         while time.monotonic() < deadline:
             visible = self.generation_indicator_visible()
