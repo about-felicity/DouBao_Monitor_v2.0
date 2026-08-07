@@ -9,11 +9,11 @@ if not exist "%~dp0doubao_remote_sync_config.json" (
   exit /b 4
 )
 
-call "%~dp0remote_one_click.cmd" --capture-only
+call "%~dp0remote_one_click.cmd" --panel-only
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (
-  echo [ERROR] Doubao collector stopped with exit code %EXIT_CODE%.
+  echo [ERROR] Doubao control panel stopped with exit code %EXIT_CODE%.
   pause
 )
 
