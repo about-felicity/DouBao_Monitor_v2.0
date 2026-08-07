@@ -173,7 +173,7 @@ OFFICIAL_HINTS = (
 SOURCE_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_cache.json")
 SOURCE_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_ai_cache.json")
 PRODUCT_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_product_ai_cache.json")
-PRODUCT_AI_ANALYZER_VERSION = "compact-grounded-v1"
+PRODUCT_AI_ANALYZER_VERSION = "compact-grounded-v3"
 DEEPSEEK_THINKING_MODE = {"type": "disabled"}
 
 
@@ -814,24 +814,35 @@ def declared_recommendation_count(answer_text):
 
 
 def ensure_complete_ai_products(answer_text, parsed, products):
-    """Ensure normalization did not discard anything the model extracted.
-
-    The answer can be internally inconsistent (for example, say “3款” but
-    actually name only two).  Therefore the prose claim is diagnostic only;
-    the hard guarantee is that every raw model item survives normalization.
-    """
+    """Report filtered model items while preserving validated products."""
     raw_items = []
     if isinstance(parsed, dict):
         raw_items = parsed.get("products") or parsed.get("items") or []
-    raw_count = sum(
-        1 for item in raw_items
-        if isinstance(item, dict)
-        and str(item.get("product_name") or item.get("product") or item.get("name") or "").strip()
-    )
-    if raw_count != len(products or []):
-        raise ValueError(
-            "normalization dropped model products: raw=%d normalized=%d"
-            % (raw_count, len(products or []))
+    normalized = [
+        (
+            _grounding_text(item.get("product_name")),
+            _grounding_text(item.get("evidence")),
+        )
+        for item in products or [] if isinstance(item, dict)
+    ]
+    uncovered = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_name = _grounding_text(item.get("product_name") or item.get("product") or item.get("name"))
+        if not raw_name:
+            continue
+        raw_evidence = _grounding_text(item.get("evidence") or item.get("reason") or item.get("line"))
+        if not any(
+            raw_name == name or raw_name.endswith(name) or name.endswith(raw_name)
+            or (raw_evidence and raw_evidence == evidence)
+            for name, evidence in normalized
+        ):
+            uncovered.append(raw_name)
+    if uncovered:
+        debug_log(
+            "normalization filtered model products: filtered=%d normalized=%d"
+            % (len(uncovered), len(products or []))
         )
     claimed = declared_recommendation_count(answer_text)
     if claimed and claimed != len(products or []):
@@ -899,12 +910,13 @@ def strip_reference_prefix(text):
 def build_product_prompt(answer_text):
     cleaned = strip_reference_prefix(answer_text)
     return {
-        "task": "提取回答正文中明确推荐的全部产品，禁止补充正文外信息。",
+        "task": "Extract every explicitly recommended commercial product from the text. Never infer missing products.",
         "rules": [
-            "忽略参考标题、相关文章、提示和泛品类；同一产品去重，按首次出现排序。",
-            "brand用稳定主品牌；系列/子品牌留在product_name。仅在正文明确列出多个品牌时拆成多项。",
-            "evidence必须逐字复制正文中的最短推荐证据；没有原文证据就不要输出。",
-            "有数字名次才用explicit_rank，否则用appearance_order。只返回JSON。",
+            "Ignore references, related-content titles, generic categories and advice. Deduplicate by first appearance.",
+            "Shopping cards repeat the narrative recommendation; merge them and never count a card as another product.",
+            "Use the stable parent brand; keep series/sub-brand in product_name.",
+            "evidence must be the shortest exact quote proving that recommendation. Output JSON only.",
+            "Use explicit_rank only for a numbered ranking; otherwise appearance_order.",
         ],
         "schema": {
             "products": [{
@@ -915,7 +927,7 @@ def build_product_prompt(answer_text):
                 "evidence": "原文短句",
             }]
         },
-        "text": cleaned[:4000],
+        "text": cleaned,
     }
 
 
@@ -971,6 +983,34 @@ def _grounding_text(value):
     return re.sub(r"[\s\W_]+", "", str(value or ""), flags=re.UNICODE).casefold()
 
 
+def _longest_common_substring_length(left, right):
+    previous = [0] * (len(right) + 1)
+    longest = 0
+    for left_char in left:
+        current = [0]
+        for index, right_char in enumerate(right, 1):
+            length = previous[index - 1] + 1 if left_char == right_char else 0
+            current.append(length)
+            longest = max(longest, length)
+        previous = current
+    return longest
+
+
+def _grounded_brand_aliases(brand_name):
+    aliases = {str(brand_name or "").strip()}
+    try:
+        import doubao_dashboard_server as dashboard
+        aliases.update(dashboard.aliases_for_brand(str(brand_name or "").strip()))
+    except Exception:
+        pass
+    return {_grounding_text(alias) for alias in aliases if _grounding_text(alias)}
+
+
+def _is_subsequence(needle, haystack):
+    iterator = iter(haystack)
+    return all(any(char == candidate for candidate in iterator) for char in needle)
+
+
 def validate_grounded_ai_products(answer_text, products):
     """Reject model output whose quoted evidence is not in the captured answer."""
     answer = _grounding_text(strip_reference_prefix(answer_text))
@@ -981,6 +1021,26 @@ def validate_grounded_ai_products(answer_text, products):
                 "product evidence is not grounded in answer: "
                 + str(item.get("product_name") or "")[:80]
             )
+        product = _grounding_text(item.get("product_name"))
+        if product and product not in answer:
+            aliases = _grounded_brand_aliases(item.get("brand_name"))
+            grounded_alias = next((alias for alias in aliases if alias in answer), "")
+            remainder = product
+            canonical_brand = _grounding_text(item.get("brand_name"))
+            if canonical_brand and remainder.startswith(canonical_brand):
+                remainder = remainder[len(canonical_brand):]
+            candidate = remainder if grounded_alias else product
+            if not candidate and grounded_alias:
+                continue
+            if _is_subsequence(candidate, evidence):
+                continue
+            longest = _longest_common_substring_length(candidate, evidence)
+            required = min(6, max(2 if len(candidate) <= 2 else 3, (len(candidate) + 1) // 2))
+            if longest < required:
+                raise ValueError(
+                    "product name is not grounded in evidence: "
+                    + str(item.get("product_name") or "")[:80]
+                )
     return products
 
 

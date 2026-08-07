@@ -29,13 +29,15 @@ EXCLUDED_NAMES = {
     "diagnostics",
     "web_results",
     "dashboard",
+    "yuanbao_state",
+    "runtime",
     ".venv",
     ".git",
     "node_modules",
     "deepseek_brand_ai_cache.json",
     "yuanbao_brand_ai_cache.json",
 }
-EXCLUDED_SUFFIXES = {".log", ".jsonl", ".tmp", ".pyc", ".png", ".xml"}
+EXCLUDED_SUFFIXES = {".log", ".jsonl", ".tmp", ".pyc", ".png", ".xml", ".xlsx", ".html", ".env"}
 
 
 def copy_source_tree(source: Path, target: Path) -> None:
@@ -43,7 +45,7 @@ def copy_source_tree(source: Path, target: Path) -> None:
         directories[:] = [name for name in directories if name not in EXCLUDED_NAMES]
         current_path = Path(current)
         for filename in filenames:
-            if filename in EXCLUDED_NAMES:
+            if filename in EXCLUDED_NAMES or filename.endswith("_state.json") or filename == "dashboard.json":
                 continue
             path = current_path / filename
             if path.suffix.lower() in EXCLUDED_SUFFIXES:
@@ -92,15 +94,23 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
         encoding="utf-8",
     )
     launcher = package_root / f"一键启动{model_name}远端采集.bat"
-    launcher.write_text(
-        "@echo off\n"
-        "cd /d \"%~dp0\"\n"
-        "python -m pip install -r remote_worker_requirements.txt --disable-pip-version-check\n"
-        "if errorlevel 1 (echo Dependency installation failed & pause & exit /b 1)\n"
-        f"python remote_model_control_panel.py --model {model}\n"
-        "if errorlevel 1 pause\n",
-        encoding="utf-8-sig",
+    launcher_content = (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "set \"PYTHONUTF8=1\"\r\n"
+        "set \"PY_CMD=python\"\r\n"
+        "where py >nul 2>nul && set \"PY_CMD=py -3\"\r\n"
+        "%PY_CMD% -c \"import requests,selenium,uiautomator2,websocket\" >nul 2>nul\r\n"
+        "if errorlevel 1 %PY_CMD% -m pip install -r remote_worker_requirements.txt --disable-pip-version-check\r\n"
+        "if errorlevel 1 (echo Dependency installation failed & pause & exit /b 1)\r\n"
+        f"%PY_CMD% remote_model_worker.py --model {model} --preflight\r\n"
+        "if errorlevel 1 (echo Preflight failed & pause & exit /b 1)\r\n"
+        f"%PY_CMD% remote_model_control_panel.py --model {model}\r\n"
+        "if errorlevel 1 pause\r\n"
     )
+    launcher.write_bytes(launcher_content.encode("ascii"))
+    (package_root / f"start_{model}_remote.cmd").write_bytes(launcher_content.encode("ascii"))
     (package_root / "使用说明.txt").write_text(
         f"本部署包只运行 {model_name}。\n"
         f"主机回传地址已写入：{pairing['receiver_url']}\n"

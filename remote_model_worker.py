@@ -33,6 +33,37 @@ def configure(model: str, pairing: Path) -> Path:
     return target
 
 
+def validate_sync_config(model: str, path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid remote sync config: {path}") from exc
+    urls = [value.get("receiver_url")]
+    if isinstance(value.get("receiver_urls"), list):
+        urls.extend(value["receiver_urls"])
+    if not value.get("enabled") or value.get("model") != model:
+        raise ValueError(f"remote sync config is not enabled for {model}")
+    if len(str(value.get("token") or "")) < 24:
+        raise ValueError("remote sync token is missing or too short")
+    if not any(str(url or "").startswith("http://") for url in urls):
+        raise ValueError("remote receiver URL is missing")
+    return value
+
+
+def preflight(model: str) -> dict[str, Any]:
+    config = ROOT / "runtime" / "remote_workers" / f"{model}_sync.json"
+    validate_sync_config(model, config)
+    plugin = discover_plugins().get(model)
+    if plugin is None or not plugin.ready():
+        raise ValueError(f"collector files are incomplete for {model}")
+    questions = plugin.load_questions()
+    if not questions:
+        raise ValueError(f"question list is empty for {model}")
+    for module in ("requests", "selenium", "uiautomator2", "websocket"):
+        __import__(module)
+    return {"ok": True, "model": model, "questions": len(questions), "sync_config": str(config)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run one remote model worker and return results to the main machine")
     parser.add_argument("--model", choices=REMOTE_MODELS, required=True)
@@ -40,11 +71,15 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--question-mode", choices=("interleaved", "sequential"), default="interleaved")
     parser.add_argument("--configure-only", action="store_true")
+    parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     if args.pairing:
         path = configure(args.model, args.pairing)
         print(f"remote sync configured: {path}")
     if args.configure_only:
+        return 0
+    if args.preflight:
+        print(json.dumps(preflight(args.model), ensure_ascii=False))
         return 0
     guard = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -56,6 +91,7 @@ def main() -> int:
         config = ROOT / "runtime" / "remote_workers" / f"{args.model}_sync.json"
         if not config.exists():
             raise SystemExit("Run once with --pairing <lan_result_pairing.json> before collecting.")
+        validate_sync_config(args.model, config)
         start_result_sync(args.model)
         plugin = discover_plugins().get(args.model)
         if plugin is None:

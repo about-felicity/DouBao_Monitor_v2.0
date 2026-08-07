@@ -54,7 +54,7 @@ class RemoteModelPanel:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.status_var = tk.StringVar(value="未启动")
         self.pairing_var = tk.StringVar(value=str(self.settings.get("pairing") or ""))
-        self.rounds_var = tk.StringVar(value=str(self.settings.get("rounds") or 1000000))
+        self.rounds_var = tk.StringVar(value=str(self.settings.get("rounds") or 10))
         self.mode_var = tk.StringVar(value=str(self.settings.get("question_mode") or "interleaved"))
         self.build_ui()
         self.root.after(200, self.refresh)

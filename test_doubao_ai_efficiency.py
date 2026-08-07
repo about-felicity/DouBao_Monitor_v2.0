@@ -38,6 +38,11 @@ class ProductAiEfficiencyTests(unittest.TestCase):
         self.assertLess(len(encoded), 1100)
         self.assertLessEqual(saver.product_ai_max_tokens(answer), 1200)
 
+    def test_product_prompt_does_not_truncate_long_answers(self):
+        marker = "UNIQUE_PRODUCT_AT_THE_END"
+        answer = "正文推荐信息。" * 1000 + marker
+        self.assertTrue(saver.build_product_prompt(answer)["text"].endswith(marker))
+
     def test_output_budget_expands_for_long_numbered_lists(self):
         answer = "\n".join(
             "%d. 品牌%d产品，推荐理由。" % (index, index)
@@ -69,6 +74,28 @@ class ProductAiEfficiencyTests(unittest.TestCase):
                     "evidence": "这是正文中不存在的证据",
                 }],
             )
+
+    def test_grounding_rejects_product_name_unrelated_to_evidence(self):
+        with self.assertRaises(ValueError):
+            saver.validate_grounded_ai_products(
+                "推荐欧莱雅小金瓶，适合干枯发质。",
+                [{
+                    "product_name": "虚构品牌神奇精华液",
+                    "brand_name": "虚构品牌",
+                    "evidence": "推荐欧莱雅小金瓶",
+                }],
+            )
+
+    def test_complete_check_allows_duplicate_model_items_after_deduplication(self):
+        parsed = {"products": [
+            {"product_name": "欧莱雅小金瓶", "evidence": "推荐欧莱雅小金瓶"},
+            {"product_name": "欧莱雅小金瓶", "evidence": "推荐欧莱雅小金瓶"},
+        ]}
+        products = [{"product_name": "欧莱雅小金瓶", "evidence": "推荐欧莱雅小金瓶"}]
+        self.assertEqual(
+            saver.ensure_complete_ai_products("推荐欧莱雅小金瓶", parsed, products),
+            products,
+        )
 
     def test_verified_result_uses_fingerprint_cache(self):
         answer = "推荐欧莱雅小金瓶，适合干枯发质。"

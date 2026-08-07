@@ -26,6 +26,11 @@ class RemoteModelPackageTests(unittest.TestCase):
                 ["deepseek"],
             )
             self.assertTrue((folder / "一键启动DeepSeek远端采集.bat").exists())
+            launcher = (folder / "一键启动DeepSeek远端采集.bat").read_bytes()
+            self.assertTrue(launcher.startswith(b"@echo off\r\n"))
+            self.assertNotIn(b"pip install", launcher.splitlines()[0])
+            self.assertIn(b"--preflight", launcher)
+            self.assertTrue((folder / "start_deepseek_remote.cmd").exists())
             self.assertTrue(archive.exists())
 
     def test_clean_removes_only_generated_packages(self):
@@ -46,9 +51,13 @@ class RemoteModelPackageTests(unittest.TestCase):
             (source / ".venv" / "Lib").mkdir(parents=True)
             (source / ".venv" / "Lib" / "large.py").write_text("ignored", encoding="utf-8")
             (source / "collector.py").write_text("kept", encoding="utf-8")
+            (source / "wenxin_state.json").write_text("{}", encoding="utf-8")
+            (source / "secret.env").write_text("SECRET=x", encoding="utf-8")
             copy_source_tree(source, target)
             self.assertTrue((target / "collector.py").exists())
             self.assertFalse((target / ".venv").exists())
+            self.assertFalse((target / "wenxin_state.json").exists())
+            self.assertFalse((target / "secret.env").exists())
 
 
 if __name__ == "__main__":
