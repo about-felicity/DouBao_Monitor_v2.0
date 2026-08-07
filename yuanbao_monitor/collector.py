@@ -22,7 +22,10 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from bowser import connect_or_launch_chrome
+try:
+    from .bowser import connect_or_launch_chrome
+except ImportError:
+    from bowser import connect_or_launch_chrome
 
 
 class YuanbaoSourceCollector:
@@ -489,7 +492,7 @@ class YuanbaoSourceCollector:
                 '#search-guide-tool, .agent-dialogue__drawer.t-drawer--open'
             )).map(function(el) {
                 return [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
-            }).join('\n');
+            }).join('\\n');
         """) or ""
         matches = re.findall(r"(?:参考|来源|信源)[^\d]{0,8}(\d+)|(\d+)[^\d]{0,4}(?:篇|条|个)?(?:参考|来源|信源)", texts)
         counts = [int(left or right) for left, right in matches if left or right]

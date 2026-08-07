@@ -323,9 +323,12 @@ class PluginCommandTests(unittest.TestCase):
         command, _ = plugin.command({"rounds": 3, "question_mode": "sequential"})
         self.assertIn("--rounds-per-question", command)
         self.assertEqual(command[command.index("--rounds-per-question") + 1], "3")
+        self.assertEqual(command[command.index("--serial") + 1], "127.0.0.1:16384")
         self.assertEqual(command[command.index("--mode") + 1], "sequential")
         self.assertEqual(command[command.index("--max-retries") + 1], "0")
         self.assertEqual(command[command.index("--retry-wait") + 1], "90")
+        self.assertEqual(Path(command[command.index("--results") + 1]), plugin.collector_results)
+        self.assertNotEqual(plugin.collector_results, plugin.results)
 
     def test_deepseek_command_receives_interleaved_mode(self):
         plugin = discover_plugins()["deepseek"]
@@ -335,6 +338,14 @@ class PluginCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--question-mode") + 1], "interleaved")
         self.assertEqual(command[command.index("--min-interval") + 1], "120")
         self.assertEqual(command[command.index("--max-interval") + 1], "300")
+        self.assertEqual(Path(command[command.index("--results") + 1]), plugin.collector_results)
+        self.assertNotEqual(plugin.collector_results, plugin.results)
+
+    def test_wenxin_command_uses_separate_collector_results(self):
+        plugin = discover_plugins()["wenxin"]
+        command, _ = plugin.command({"rounds": 2, "question_mode": "interleaved"})
+        self.assertEqual(Path(command[command.index("--results") + 1]), plugin.collector_results)
+        self.assertNotEqual(plugin.collector_results, plugin.results)
     def test_yuanbao_command_uses_a_humanized_random_interval(self):
         command, _ = discover_plugins()["yuanbao"].command(
             {"rounds": 2, "question_mode": "interleaved"}

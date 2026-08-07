@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from yuanbao_monitor import controller
+from yuanbao_monitor.collector import YuanbaoSourceCollector
 
 
 class _Exists:
@@ -38,6 +39,25 @@ class YuanbaoCompletionTests(unittest.TestCase):
             xml = bot._wait_for_reply("推荐一款染发剂", max_wait=2, poll_interval=0)
         self.assertIn("已经完成", xml)
         self.assertGreaterEqual(bot.d.index, 4)
+
+
+class _SourceCountDriver:
+    def __init__(self):
+        self.script = ""
+
+    def execute_script(self, script):
+        self.script = script
+        return "参考来源 17"
+
+
+class YuanbaoSourceCountTests(unittest.TestCase):
+    def test_expected_source_count_uses_valid_javascript_newline_escape(self):
+        collector = YuanbaoSourceCollector.__new__(YuanbaoSourceCollector)
+        collector.driver = _SourceCountDriver()
+
+        self.assertEqual(collector._expected_source_count(), 17)
+        self.assertIn("join('\\n')", collector.driver.script)
+        self.assertNotIn("join('\n')", collector.driver.script)
 
 
 if __name__ == "__main__":

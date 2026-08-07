@@ -16,6 +16,7 @@ class Plugin(ModelPlugin):
     questions = ROOT / "wenxin_monitor" / "product.txt"
     runner = ROOT / "wenxin_monitor" / "wenxin_loop.py"
     results = ROOT / "wenxin_monitor" / "wenxin_results.jsonl"
+    collector_results = ROOT / "runtime" / "remote_workers" / "wenxin_collector_results.jsonl"
     dashboard = ROOT / "wenxin_monitor" / "dashboard.json"
     builder = ROOT / "wenxin_monitor" / "build_dashboard_data.py"
     execution = "remote"
@@ -29,7 +30,8 @@ class Plugin(ModelPlugin):
         mode = normalize_question_mode(options.get("question_mode"))
         return [sys.executable, str(self.runner), "--questions-file", str(self.questions),
                 "--rounds-per-question", str(rounds), "--question-mode", mode,
-                "--resume", "--wait", "30", "--random-wait", "90", "--retry-wait", "15"], self.runner.parent
+                "--resume", "--wait", "30", "--random-wait", "90", "--retry-wait", "15",
+                "--results", str(self.collector_results)], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         if progress:

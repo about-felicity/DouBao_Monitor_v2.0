@@ -15,6 +15,7 @@ class Plugin(ModelPlugin):
     questions = ROOT / "yuanbao_monitor" / "product.txt"
     runner = ROOT / "yuanbao_monitor" / "yuanbao_loop.py"
     results = ROOT / "yuanbao_monitor" / "yuanbao_results.jsonl"
+    collector_results = ROOT / "runtime" / "remote_workers" / "yuanbao_collector_results.jsonl"
     dashboard = ROOT / "yuanbao_monitor" / "dashboard" / "public" / "data" / "dashboard.json"
     builder = ROOT / "yuanbao_monitor" / "build_dashboard_data.py"
     execution = "remote"
@@ -27,7 +28,11 @@ class Plugin(ModelPlugin):
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
         mode = normalize_question_mode(options.get("question_mode"))
         runner_mode = "cross" if mode == "interleaved" else "sequential"
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "0", "--retry-wait", "90", "--wait", "30", "--random-wait", "90"], self.runner.parent
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions),
+                "--serial", "127.0.0.1:16384", "--rounds-per-question", str(rounds),
+                "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "0",
+                "--retry-wait", "90", "--wait", "30", "--random-wait", "90",
+                "--results", str(self.collector_results)], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         from yuanbao_monitor.bowser import ensure_yuanbao_chrome

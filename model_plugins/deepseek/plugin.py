@@ -15,6 +15,7 @@ class Plugin(ModelPlugin):
     questions = ROOT / "deepseek_monitor" / "product.txt"
     runner = ROOT / "deepseek_monitor" / "deepseek_loop.py"
     results = ROOT / "deepseek_monitor" / "deepseek_results.jsonl"
+    collector_results = ROOT / "runtime" / "remote_workers" / "deepseek_collector_results.jsonl"
     dashboard = ROOT / "deepseek_monitor" / "dashboard.json"
     builder = ROOT / "deepseek_monitor" / "build_dashboard_data.py"
     execution = "remote"
@@ -26,7 +27,7 @@ class Plugin(ModelPlugin):
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
         mode = normalize_question_mode(options.get("question_mode"))
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "120", "--max-interval", "300"], self.runner.parent
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "120", "--max-interval", "300", "--results", str(self.collector_results)], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         from deepseek_monitor.controller import ensure_deepseek_chrome
