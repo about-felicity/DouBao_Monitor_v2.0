@@ -80,6 +80,7 @@ def main() -> int:
         prompt = schedule[index]
         attempts = 0
         submitted = False
+        generation_complete = False
         previous = ""
         mobile = {}
         started = now()
@@ -96,6 +97,11 @@ def main() -> int:
                         submitted = True
                         mobile = app.wait_for_mobile_accept(min(60, args.timeout), prompt)
                     log.info("第 %d 轮问题已由 App 接受，后续网页失败只重试抓取，不会重复提问", index + 1)
+                if not generation_complete:
+                    generation = app.wait_for_generation_complete(args.timeout)
+                    mobile.update(generation)
+                    generation_complete = True
+                    log.info("第 %d 轮检测到停止生成按钮已消失，开始网页端正文与信源抓取", index + 1)
                 result = web.collect_latest(previous, args.timeout, prompt)
                 answer = str(result.get("body") or "")
                 skip = answer_quality_reason(prompt, answer)
@@ -123,7 +129,7 @@ def main() -> int:
                     app = None
                 web = None
                 log.warning("%s 秒后%s", max(1, args.retry_wait),
-                            "只重试网页抓取，不会再次向 App 提问" if submitted else "重新连接后重试发送")
+                            "只重试生成状态或网页抓取，不会再次向 App 提问" if submitted else "重新连接后重试发送")
                 time.sleep(max(1, args.retry_wait))
         if STOP:
             break

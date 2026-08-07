@@ -75,6 +75,99 @@ class WenxinAppController:
                 return {"ok": True, "title": "App 已接受问题，等待网页同步", "input_cleared": True}
             time.sleep(1)
         raise TimeoutError("文心 App 输入框未清空，问题可能没有发送成功")
+
+    @staticmethod
+    def generation_indicator_in_xml(xml: str) -> bool:
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return False
+        markers = ("停止生成", "停止回答", "停止响应", "stop generating", "stop response")
+        for node in root.iter():
+            identity = " ".join(
+                str(node.attrib.get(key) or "")
+                for key in ("text", "content-desc", "resource-id", "hint")
+            ).casefold()
+            if any(marker in identity for marker in markers):
+                return True
+        return False
+
+    @staticmethod
+    def generation_indicator_in_image(xml: str, image: Any) -> bool:
+        try:
+            root = ET.fromstring(xml)
+            grayscale = image.convert("L")
+        except (ET.ParseError, AttributeError):
+            return False
+        screen_width, screen_height = grayscale.size
+        for node in root.iter():
+            bounds = [int(value) for value in re.findall(r"\d+", str(node.attrib.get("bounds") or ""))]
+            if len(bounds) != 4:
+                continue
+            left, top, right, bottom = bounds
+            width, height = right - left, bottom - top
+            center_x, center_y = (left + right) / 2, (top + bottom) / 2
+            if not (center_x >= screen_width * 0.82 and center_y >= screen_height * 0.70):
+                continue
+            if not (28 <= width <= 120 and 28 <= height <= 120 and 0.65 <= width / max(1, height) <= 1.45):
+                continue
+            crop = grayscale.crop((left + width * 0.30, top + height * 0.30,
+                                   right - width * 0.30, bottom - height * 0.30))
+            dark = [(pixel < 125) for pixel in crop.getdata()]
+            if not dark or sum(dark) < 12:
+                continue
+            pixels = list(crop.getdata())
+            crop_width, crop_height = crop.size
+            positions = [(index % crop_width, index // crop_width)
+                         for index, pixel in enumerate(pixels) if pixel < 125]
+            dark_left = min(x for x, _ in positions)
+            dark_right = max(x for x, _ in positions)
+            dark_top = min(y for _, y in positions)
+            dark_bottom = max(y for _, y in positions)
+            box_area = max(1, (dark_right - dark_left + 1) * (dark_bottom - dark_top + 1))
+            if len(positions) / box_area >= 0.55:
+                return True
+        return False
+
+    def generation_indicator_visible(self) -> bool:
+        selectors = (
+            {"textMatches": ".*(停止生成|停止回答|停止响应).*"},
+            {"descriptionMatches": ".*(停止生成|停止回答|停止响应).*"},
+            {"resourceIdMatches": ".*(stop|generating|answering).*"},
+        )
+        for selector in selectors:
+            try:
+                if self.d(**selector).exists:
+                    return True
+            except Exception:
+                continue
+        xml = self.d.dump_hierarchy(compressed=False)
+        if self.generation_indicator_in_xml(xml):
+            return True
+        try:
+            image = self.d.screenshot(format="pillow")
+        except Exception:
+            return False
+        return self.generation_indicator_in_image(xml, image)
+
+    def wait_for_generation_complete(self, timeout: int = 180) -> dict[str, Any]:
+        deadline = time.monotonic() + max(10, timeout)
+        appeared = False
+        disappeared_stably = 0
+        while time.monotonic() < deadline:
+            visible = self.generation_indicator_visible()
+            if visible:
+                appeared = True
+                disappeared_stably = 0
+            elif appeared:
+                disappeared_stably += 1
+                if disappeared_stably >= 2:
+                    return {"ok": True, "generation_indicator_seen": True,
+                            "generation_complete": True, "rendering_required": False}
+            time.sleep(1)
+        if not appeared:
+            raise TimeoutError("没有检测到文心 App 右下角的停止生成按钮")
+        raise TimeoutError("文心 App 停止生成按钮长时间未消失")
     def account_identity(self) -> dict[str, str]:
         self.ensure_ready()
         # The App no longer exposes the account name in its accessibility tree.
