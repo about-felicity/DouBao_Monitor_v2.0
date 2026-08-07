@@ -1,6 +1,7 @@
 import csv
 import gzip
 import html
+import http.client
 import importlib
 import json
 import math
@@ -6333,6 +6334,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8", status,
         )
 
+    def proxy_doubao_receiver(self):
+        length = safe_int(self.headers.get("Content-Length"))
+        if length < 0 or length > 25 * 1024 * 1024:
+            self.send_json({"ok": False, "error": "invalid body size"}, 413)
+            return
+        body = self.rfile.read(length) if length else None
+        headers = {
+            key: value
+            for key, value in {
+                "Content-Type": self.headers.get("Content-Type"),
+                "Authorization": self.headers.get("Authorization"),
+                "X-Doubao-Token": self.headers.get("X-Doubao-Token"),
+                "X-Doubao-Device": self.headers.get("X-Doubao-Device"),
+            }.items()
+            if value
+        }
+        connection = http.client.HTTPConnection("127.0.0.1", 8790, timeout=15)
+        try:
+            connection.request(self.command, self.path, body=body, headers=headers)
+            response = connection.getresponse()
+            payload = response.read()
+            self.send_bytes(
+                payload,
+                response.getheader("Content-Type") or "application/json; charset=utf-8",
+                response.status,
+            )
+        except OSError as exc:
+            self.send_json({"ok": False, "error": f"receiver unavailable: {exc}"}, 503)
+        finally:
+            connection.close()
+
     def redirect_to_react_dashboard(self):
         host = (self.headers.get("Host") or "127.0.0.1").split(":", 1)[0]
         self.send_response(302)
@@ -6353,6 +6385,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": "forbidden origin"}, 403)
             return
         path = self.path.split("?", 1)[0]
+        if path == "/api/v1/captures":
+            self.proxy_doubao_receiver()
+            return
         model_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/(questions|account-check)", path)
         if model_route:
             model, action = model_route.groups()
@@ -6403,7 +6438,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, 400)
 
     def do_GET(self):
-        if self.path.split("?", 1)[0] == "/api/models":
+        path = self.path.split("?", 1)[0]
+        if path == "/api/v1/health" or path.startswith("/api/v1/status/"):
+            self.proxy_doubao_receiver()
+            return
+        if path == "/api/models":
             self.send_json({
                 "ok": True,
                 "models": list(MODEL_REGISTRY.values()),

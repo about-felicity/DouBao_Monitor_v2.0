@@ -81,6 +81,14 @@ def candidate_receiver_urls(config: dict[str, Any]) -> list[str]:
         url = str(value or "").rstrip("/")
         if url.startswith("http://") and url not in result:
             result.append(url)
+            try:
+                parsed = urllib.parse.urlparse(url)
+                if parsed.port == 8790 and parsed.hostname:
+                    fallback = f"http://{parsed.hostname}:8765"
+                    if fallback not in result:
+                        result.append(fallback)
+            except ValueError:
+                pass
     return result
 
 

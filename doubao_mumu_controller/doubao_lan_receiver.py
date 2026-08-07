@@ -137,7 +137,9 @@ def write_pairing(config: dict[str, Any]) -> dict[str, Any]:
         "receiver_url": f"http://{ip}:{port}",
         "receiver_urls": [
             f"http://{ip}:{port}",
+            f"http://{ip}:8765",
             f"http://{hostname}:{port}",
+            f"http://{hostname}:8765",
         ],
         "receiver_host": hostname,
         "token": str(config["token"]),
