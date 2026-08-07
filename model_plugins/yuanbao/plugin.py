@@ -51,8 +51,16 @@ class Plugin(ModelPlugin):
             mobile = YuanbaoController("127.0.0.1:16384").account_identity()
         web = yuanbao_web_identity(9222)
         matched = bool(mobile.get("name") and web.get("name") and mobile["name"].casefold() == web["name"].casefold())
-        return {"ok": matched, "status": "matched" if matched else "mismatch",
-                "message": "元宝模拟器与网页账号一致" if matched else "元宝模拟器与网页账号不一致",
+        if not mobile.get("name"):
+            message = "元宝模拟器 App 未登录或无法读取账号，请登录后重新检测"
+        elif not web.get("name"):
+            message = "元宝专用 Chrome 未登录，请在打开的 Chrome 中完成登录"
+        elif not matched:
+            message = "元宝模拟器与专用 Chrome 登录的不是同一个账号"
+        else:
+            message = "元宝模拟器与网页账号一致"
+        return {"ok": matched, "status": "matched" if matched else "login_required",
+                "message": message,
                 "mobile": mobile, "web": web, "location": "local"}
 
     def load_questions(self) -> list[str]:

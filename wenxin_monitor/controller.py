@@ -34,8 +34,10 @@ class WenxinAppController:
         self.d.app_start(self.PACKAGE, stop=False)
         if self._edit().exists(timeout=8):
             return
-        if str(self.d.app_current().get("package") or "") != self.PACKAGE:
-            raise RuntimeError("文心 App 未正常启动，请检查登录状态")
+        current = str(self.d.app_current().get("package") or "")
+        if current != self.PACKAGE:
+            raise RuntimeError("文心 App 未正常启动，请检查模拟器是否已开启")
+        raise RuntimeError("文心 App 尚未登录或未进入可提问页面")
 
     def new_chat(self) -> None:
         self.ensure_ready()
@@ -96,6 +98,8 @@ class WenxinWebCollector:
         body = str(snapshot.get("body") or "")
         match = re.search(r"\n([^\n]{2,40})\n百度首页\n", body)
         name = match.group(1).strip() if match else ""
+        if not name and "对话历史" in body and "登录后" not in body:
+            name = "已登录文心网页"
         return {"name": name, "masked": name[:2] + "***" if name else ""}
 
     def _open_latest_once(self) -> str:

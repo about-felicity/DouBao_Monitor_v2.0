@@ -116,7 +116,8 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
         f"主机回传地址已写入：{pairing['receiver_url']}\n"
         "主机 IP 变化时会通过局域网 UDP 8792 自动发现新地址，并继续补传离线队列。\n"
         f"远端电脑安装 Chrome、MuMu 和 Python 后，双击：{launcher.name}\n"
-        "首次打开后先点账号检查，确认 App 与专用 Chrome 登录一致，再点启动采集。\n",
+        "首次打开会自动启动登录检测：分别登录模拟器 App 与专用 Chrome 后，点击“打开并重新检测”。\n"
+        "登录检测通过前无法启动采集；启动时还会再次校验，防止账号退出或不一致。\n",
         encoding="utf-8-sig",
     )
     archive = output_root / f"{package_root.name}.zip"

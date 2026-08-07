@@ -63,10 +63,18 @@ class Plugin(ModelPlugin):
             latest = web.latest_reference()
         except Exception:
             latest = ""
-        matched = bool(mobile.get("name") and browser.get("name") and "/search/" in latest)
-        return {"ok": matched, "status": "matched" if matched else "mismatch",
-                "message": "文心 App 与网页会话已同步" if matched else "文心 App 或专用 Chrome 未登录，或网页没有同步 App 会话",
-                "mobile": mobile, "web": browser, "latest": latest, "location": "local"}
+        mobile_logged_in = bool(mobile.get("name"))
+        browser_logged_in = bool(browser.get("name"))
+        ready = mobile_logged_in and browser_logged_in
+        if not mobile_logged_in:
+            message = "文心模拟器 App 未登录或未进入可提问页面"
+        elif not browser_logged_in:
+            message = "文心专用 Chrome 未登录；请在打开的 Chrome 中完成登录"
+        else:
+            message = "文心 App 与专用 Chrome 均已登录；采集首轮会用新会话再次确认同步关系"
+        return {"ok": ready, "status": "logged_in" if ready else "login_required",
+                "message": message, "mobile": mobile, "web": browser, "latest": latest,
+                "conversation_sync_ready": "/search/" in latest, "location": "local"}
 
     def stats(self) -> dict[str, Any]:
         if self.results.exists() and (not self.dashboard.exists() or self.results.stat().st_mtime > self.dashboard.stat().st_mtime):

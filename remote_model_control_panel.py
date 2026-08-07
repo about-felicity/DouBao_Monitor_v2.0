@@ -21,6 +21,11 @@ MODELS = {
     "yuanbao": "腾讯元宝",
     "wenxin": "文心",
 }
+LOGIN_REQUIRED_MODELS = frozenset({"yuanbao", "wenxin"})
+
+
+def account_gate_open(model: str, verified: bool) -> bool:
+    return model not in LOGIN_REQUIRED_MODELS or verified
 
 
 def build_worker_command(model: str, rounds: int, question_mode: str, pairing: str = "") -> list[str]:
@@ -44,6 +49,8 @@ class RemoteModelPanel:
         self.model = model
         self.model_name = MODELS[model]
         self.process: subprocess.Popen[str] | None = None
+        self.account_verified = False
+        self.account_check_running = False
         self.messages: queue.Queue[str] = queue.Queue()
         self.config_path = ROOT / "runtime" / "remote_workers" / f"{model}_panel.json"
         self.settings = self.load_settings()
@@ -53,11 +60,14 @@ class RemoteModelPanel:
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.status_var = tk.StringVar(value="未启动")
+        self.account_var = tk.StringVar(value="首次启动将自动打开模拟器和专用 Chrome 检测登录")
         self.pairing_var = tk.StringVar(value=str(self.settings.get("pairing") or ""))
         self.rounds_var = tk.StringVar(value=str(self.settings.get("rounds") or 10))
         self.mode_var = tk.StringVar(value=str(self.settings.get("question_mode") or "interleaved"))
         self.build_ui()
         self.root.after(200, self.refresh)
+        if self.model in LOGIN_REQUIRED_MODELS:
+            self.root.after(800, self.check_account)
 
     def load_settings(self) -> dict[str, Any]:
         try:
@@ -117,11 +127,21 @@ class RemoteModelPanel:
             width=18,
         ).grid(row=2, column=1, sticky="w", pady=5)
 
+        identity = ttk.LabelFrame(container, text="登录与账号检测", padding=12)
+        identity.pack(fill="x", pady=(12, 0))
+        ttk.Label(identity, textvariable=self.account_var).pack(side="left", fill="x", expand=True)
+        self.account_button = ttk.Button(identity, text="打开并重新检测", command=self.check_account)
+        self.account_button.pack(side="right")
+
         actions = ttk.Frame(container)
         actions.pack(fill="x", pady=12)
-        ttk.Button(actions, text="账号检查", command=self.check_account).pack(side="left")
         ttk.Button(actions, text="打开问题文件", command=self.open_questions).pack(side="left", padx=8)
-        self.start_button = ttk.Button(actions, text="启动采集", command=self.start)
+        self.start_button = ttk.Button(
+            actions,
+            text="启动采集",
+            command=self.start,
+            state="disabled" if self.model in LOGIN_REQUIRED_MODELS else "normal",
+        )
         self.start_button.pack(side="left", padx=8)
         self.stop_button = ttk.Button(actions, text="停止采集", command=self.stop, state="disabled")
         self.stop_button.pack(side="left")
@@ -147,7 +167,15 @@ class RemoteModelPanel:
         self.log.configure(state="disabled")
 
     def check_account(self) -> None:
+        if self.account_check_running or (self.process and self.process.poll() is None):
+            return
+        self.account_check_running = True
+        self.account_verified = False
         self.status_var.set("正在检查账号")
+        self.account_var.set("正在启动模拟器 App 和专用 Chrome，请在打开的窗口中完成登录……")
+        self.account_button.configure(state="disabled")
+        self.start_button.configure(state="disabled")
+        self.append_log("开始登录检测：请分别登录模拟器 App 与专用 Chrome；登录后点击“打开并重新检测”。")
         threading.Thread(target=self.account_worker, daemon=True).start()
 
     def account_worker(self) -> None:
@@ -170,6 +198,13 @@ class RemoteModelPanel:
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
+            return
+        if not account_gate_open(self.model, self.account_verified):
+            messagebox.showwarning(
+                "请先完成登录检测",
+                f"请先登录{self.model_name}模拟器 App 和专用 Chrome，然后点击“打开并重新检测”。",
+            )
+            self.check_account()
             return
         try:
             pairing = self.pairing_var.get().strip()
@@ -223,15 +258,27 @@ class RemoteModelPanel:
             except queue.Empty:
                 break
             if message == "__ACCOUNT_OK__":
-                self.status_var.set("账号一致")
+                self.account_check_running = False
+                self.account_verified = True
+                self.status_var.set("登录检测通过")
+                self.account_var.set("登录检测通过；启动采集时还会再次校验，防止中途退出账号")
+                self.account_button.configure(state="normal")
+                self.start_button.configure(state="normal")
             elif message == "__ACCOUNT_FAIL__":
+                self.account_check_running = False
+                self.account_verified = False
                 self.status_var.set("账号检查失败")
+                self.account_var.set("未登录或账号不一致；请完成两端登录后重新检测")
+                self.account_button.configure(state="normal")
+                self.start_button.configure(state="disabled")
             else:
                 self.append_log(message)
         if self.process and self.process.poll() is not None:
             return_code = self.process.returncode
             self.status_var.set("已停止" if return_code == 0 else f"异常退出 {return_code}")
-            self.start_button.configure(state="normal")
+            self.start_button.configure(
+                state="normal" if account_gate_open(self.model, self.account_verified) else "disabled"
+            )
             self.stop_button.configure(state="disabled")
             self.process = None
         self.root.after(200, self.refresh)
