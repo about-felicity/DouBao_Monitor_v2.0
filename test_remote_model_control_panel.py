@@ -16,6 +16,17 @@ class RemoteModelPanelTest(unittest.TestCase):
         device.set_input_ime.assert_not_called()
         device.set_fastinput_ime.assert_not_called()
 
+    def test_wenxin_mobile_accept_requires_cleared_input(self):
+        controller = wenxin_controller.WenxinAppController.__new__(wenxin_controller.WenxinAppController)
+        controller.d = mock.Mock()
+        controller.d.app_current.return_value = {"package": controller.PACKAGE}
+        edit = mock.Mock()
+        edit.exists = True
+        edit.info = {"text": ""}
+        controller._edit = mock.Mock(return_value=edit)
+        result = controller.wait_for_mobile_accept(3, "推荐一款护发素")
+        self.assertTrue(result["input_cleared"])
+
     def test_wenxin_and_yuanbao_require_successful_login_check(self):
         self.assertFalse(account_gate_open("wenxin", False))
         self.assertFalse(account_gate_open("yuanbao", False))

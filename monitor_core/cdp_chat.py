@@ -56,8 +56,18 @@ class CDPPage:
         self.connect()
 
     def connect(self) -> None:
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
         tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=10))
-        page = next((item for item in tabs if item.get("type") == "page"), None)
+        pages = [item for item in tabs if item.get("type") == "page"]
+        page = next(
+            (item for item in pages if str(item.get("url") or "").startswith(("http://", "https://"))),
+            pages[0] if pages else None,
+        )
         if not page:
             raise RuntimeError("Chrome 中没有可采集页面")
         self.ws = websocket.create_connection(
@@ -76,7 +86,7 @@ class CDPPage:
         self.ws.settimeout(timeout)
         return json.loads(self.ws.recv())
 
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 15) -> dict[str, Any]:
+    def _call_once(self, method: str, params: dict[str, Any] | None, timeout: float) -> dict[str, Any]:
         request_id = self.send(method, params)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -89,6 +99,13 @@ class CDPPage:
                     raise RuntimeError(str(message["error"]))
                 return message.get("result") or {}
         raise TimeoutError(f"Chrome 调试调用超时：{method}")
+
+    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 15) -> dict[str, Any]:
+        try:
+            return self._call_once(method, params, timeout)
+        except (TimeoutError, OSError, websocket.WebSocketException):
+            self.connect()
+            return self._call_once(method, params, timeout)
 
     def evaluate(self, expression: str, timeout: float = 15) -> Any:
         result = self.call(

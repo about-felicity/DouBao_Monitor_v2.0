@@ -5,7 +5,7 @@ import tempfile
 from unittest import mock
 
 from monitor_core.analytics import build_analytics, prepare_analytics
-from monitor_core.cdp_chat import external_sources
+from monitor_core.cdp_chat import CDPPage, external_sources
 from monitor_core.owned_products import OWN_PRODUCT_RULES, own_product_mentions
 from monitor_core.plugins import discover_plugins
 from monitor_core.quality import invalid_answer_reason
@@ -20,6 +20,31 @@ from monitor_core.scheduling import build_question_schedule, normalize_question_
 
 
 class QualityTests(unittest.TestCase):
+    def test_cdp_call_reconnects_once_after_timeout(self):
+        page = CDPPage.__new__(CDPPage)
+        page.port = 9444
+        page.ws = mock.Mock()
+        page.sequence = 0
+        with mock.patch.object(page, "_call_once", side_effect=[TimeoutError("stale"), {"ok": True}]) as call, \
+                mock.patch.object(page, "connect") as connect:
+            result = page.call("Page.navigate", {"url": "https://wenxin.baidu.com/"}, timeout=1)
+        self.assertEqual(result, {"ok": True})
+        connect.assert_called_once_with()
+        self.assertEqual(call.call_count, 2)
+
+    def test_cdp_call_reconnects_once_after_closed_socket(self):
+        import websocket
+        page = CDPPage.__new__(CDPPage)
+        page.port = 9444
+        page.ws = mock.Mock()
+        page.sequence = 0
+        closed = websocket.WebSocketConnectionClosedException("closed")
+        with mock.patch.object(page, "_call_once", side_effect=[closed, {"ok": True}]), \
+                mock.patch.object(page, "connect") as connect:
+            result = page.call("Runtime.evaluate", {"expression": "1"}, timeout=1)
+        self.assertEqual(result, {"ok": True})
+        connect.assert_called_once_with()
+
     def test_dashboard_quarantines_records_from_another_model(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

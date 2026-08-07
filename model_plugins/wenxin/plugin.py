@@ -29,7 +29,7 @@ class Plugin(ModelPlugin):
         mode = normalize_question_mode(options.get("question_mode"))
         return [sys.executable, str(self.runner), "--questions-file", str(self.questions),
                 "--rounds-per-question", str(rounds), "--question-mode", mode,
-                "--resume", "--wait", "30", "--random-wait", "90"], self.runner.parent
+                "--resume", "--wait", "30", "--random-wait", "90", "--retry-wait", "15"], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         if progress:

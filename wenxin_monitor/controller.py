@@ -63,9 +63,18 @@ class WenxinAppController:
         if self._edit().exists and str(self._edit().info.get("text") or "").strip() == prompt:
             raise RuntimeError("文心 App 发送按钮没有生效")
 
-    def wait_for_mobile_accept(self, timeout: int = 60) -> dict[str, Any]:
-        time.sleep(min(8, max(1, timeout)))
-        return {"ok": True, "title": "App 已发送（网页端校验）", "accessibility_fallback": True}
+    def wait_for_mobile_accept(self, timeout: int = 60, prompt: str = "") -> dict[str, Any]:
+        deadline = time.monotonic() + max(3, timeout)
+        normalized_prompt = re.sub(r"\s+", "", prompt)
+        while time.monotonic() < deadline:
+            if str(self.d.app_current().get("package") or "") != self.PACKAGE:
+                raise RuntimeError("文心 App 在发送后意外退出")
+            edit = self._edit()
+            current = str(edit.info.get("text") or "") if edit.exists else ""
+            if not normalized_prompt or re.sub(r"\s+", "", current) != normalized_prompt:
+                return {"ok": True, "title": "App 已接受问题，等待网页同步", "input_cleared": True}
+            time.sleep(1)
+        raise TimeoutError("文心 App 输入框未清空，问题可能没有发送成功")
     def account_identity(self) -> dict[str, str]:
         self.ensure_ready()
         # The App no longer exposes the account name in its accessibility tree.

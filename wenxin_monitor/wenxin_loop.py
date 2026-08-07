@@ -79,17 +79,23 @@ def main() -> int:
     while not STOP and index < len(schedule):
         prompt = schedule[index]
         attempts = 0
+        submitted = False
+        previous = ""
+        mobile = {}
+        started = now()
         while not STOP:
-            started = now()
             try:
-                if app is None:
-                    app = WenxinAppController(args.serial)
                 if web is None:
                     web = WenxinWebCollector(args.chrome_port)
-                with device_session(args.serial, "文心", timeout=args.timeout + 120, on_wait=log.info):
-                    previous = web.latest_reference()
-                    app.send(prompt)
-                    mobile = app.wait_for_mobile_accept(min(60, args.timeout))
+                if not submitted:
+                    if app is None:
+                        app = WenxinAppController(args.serial)
+                    with device_session(args.serial, "文心", timeout=args.timeout + 120, on_wait=log.info):
+                        previous = web.latest_reference()
+                        app.send(prompt)
+                        submitted = True
+                        mobile = app.wait_for_mobile_accept(min(60, args.timeout), prompt)
+                    log.info("第 %d 轮问题已由 App 接受，后续网页失败只重试抓取，不会重复提问", index + 1)
                 result = web.collect_latest(previous, args.timeout, prompt)
                 answer = str(result.get("body") or "")
                 skip = answer_quality_reason(prompt, answer)
@@ -113,8 +119,11 @@ def main() -> int:
                               index + 1, attempts, exc)
                 if args.max_retries > 0 and attempts >= args.max_retries:
                     return 1
-                app = None
+                if not submitted:
+                    app = None
                 web = None
+                log.warning("%s 秒后%s", max(1, args.retry_wait),
+                            "只重试网页抓取，不会再次向 App 提问" if submitted else "重新连接后重试发送")
                 time.sleep(max(1, args.retry_wait))
         if STOP:
             break
