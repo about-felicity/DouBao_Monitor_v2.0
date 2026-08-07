@@ -13,21 +13,16 @@ if (-not $isAdmin) {
 $existing = Get-NetFirewallRule `
     -DisplayName $ruleName `
     -ErrorAction SilentlyContinue
-if (-not $existing) {
-    New-NetFirewallRule `
-        -DisplayName $ruleName `
-        -Direction Inbound `
-        -Action Allow `
-        -Protocol TCP `
-        -LocalPort 8790 `
-        -Profile Private | Out-Null
-} else {
-    Set-NetFirewallRule `
-        -DisplayName $ruleName `
-        -Enabled True `
-        -Direction Inbound `
-        -Action Allow `
-        -Profile Private | Out-Null
+if ($existing) {
+    $existing | Remove-NetFirewallRule
 }
-Write-Host "Firewall rule is ready: Private TCP 8790." `
+New-NetFirewallRule `
+    -DisplayName $ruleName `
+    -Direction Inbound `
+    -Action Allow `
+    -Protocol TCP `
+    -LocalPort 8790 `
+    -Profile Any `
+    -RemoteAddress LocalSubnet | Out-Null
+Write-Host "Firewall rule is ready: local subnet TCP 8790 on any network profile." `
     -ForegroundColor Green

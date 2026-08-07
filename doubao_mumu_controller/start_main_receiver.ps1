@@ -17,10 +17,17 @@ if ($CheckOnly) {
     exit 0
 }
 
-$ruleText = (& netsh.exe advfirewall firewall show rule `
-    name="$ruleName" 2>$null) -join "`n"
-$ruleExists = $ruleText -match [regex]::Escape($ruleName)
-if (-not $ruleExists) {
+$rules = @(
+    Get-NetFirewallRule `
+        -DisplayName $ruleName `
+        -ErrorAction SilentlyContinue
+)
+$ruleReady = $rules.Count -eq 1 `
+    -and $rules[0].Enabled -eq "True" `
+    -and $rules[0].Direction -eq "Inbound" `
+    -and $rules[0].Action -eq "Allow" `
+    -and $rules[0].Profile -eq "Any"
+if (-not $ruleReady) {
     Write-Host "A Windows administrator prompt will appear once."
     $elevated = Start-Process `
         -FilePath "powershell.exe" `
