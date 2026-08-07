@@ -62,6 +62,10 @@ class RemoteModelPanel:
         self.status_var = tk.StringVar(value="未启动")
         self.account_var = tk.StringVar(value="首次启动将自动打开模拟器和专用 Chrome 检测登录")
         self.pairing_var = tk.StringVar(value=str(self.settings.get("pairing") or ""))
+        embedded_sync = ROOT / "runtime" / "remote_workers" / f"{model}_sync.json"
+        self.pairing_hint_var = tk.StringVar(
+            value="已内置主机回传配置，无需选择" if embedded_sync.exists() else "首次启动请选择主机配对文件"
+        )
         self.rounds_var = tk.StringVar(value=str(self.settings.get("rounds") or 10))
         self.mode_var = tk.StringVar(value=str(self.settings.get("question_mode") or "interleaved"))
         self.build_ui()
@@ -116,6 +120,7 @@ class RemoteModelPanel:
         ttk.Label(settings, text="主机配对文件").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
         ttk.Entry(settings, textvariable=self.pairing_var).grid(row=0, column=1, sticky="ew", pady=5)
         ttk.Button(settings, text="选择", command=self.choose_pairing).grid(row=0, column=2, padx=(8, 0), pady=5)
+        ttk.Label(settings, textvariable=self.pairing_hint_var).grid(row=0, column=3, sticky="w", padx=(10, 0), pady=5)
         ttk.Label(settings, text="每个问题轮数").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
         ttk.Entry(settings, textvariable=self.rounds_var, width=18).grid(row=1, column=1, sticky="w", pady=5)
         ttk.Label(settings, text="问题顺序").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -159,6 +164,7 @@ class RemoteModelPanel:
         path = filedialog.askopenfilename(title="选择主机生成的 lan_result_pairing.json", filetypes=(("JSON", "*.json"),))
         if path:
             self.pairing_var.set(path)
+            self.pairing_hint_var.set("已选择新的主机配对文件")
 
     def append_log(self, text: str) -> None:
         self.log.configure(state="normal")

@@ -22,10 +22,6 @@ class WenxinAppController:
     def __init__(self, serial: str = "127.0.0.1:16384"):
         self.serial = serial
         self.d = u2.connect(serial)
-        try:
-            self.d.set_input_ime(True)
-        except Exception:
-            self.d.set_fastinput_ime(True)
 
     def _edit(self):
         return self.d(className="android.widget.EditText")
@@ -48,22 +44,19 @@ class WenxinAppController:
         else:
             self.d.click(int(width * 0.42), int(height * 0.18))
         time.sleep(1)
-        if not self._edit().exists(timeout=5) and str(self.d.app_current().get("package") or "") != self.PACKAGE:
-            raise RuntimeError("文心 App 新建会话失败")
+        if not self._edit().exists(timeout=5):
+            raise RuntimeError("文心 App 新建会话失败，未找到问题输入框")
 
     def send(self, prompt: str) -> None:
         self.new_chat()
         edit = self._edit()
         width, height = self.d.window_size()
-        if edit.exists:
-            edit.set_text(prompt)
-            time.sleep(1)
-            if re.sub(r"\s+", "", str(edit.info.get("text") or "")) != re.sub(r"\s+", "", prompt):
-                raise RuntimeError("文心 App 问题写入校验失败")
-        else:
-            self.d.click(int(width * 0.48), int(height * 0.90))
-            self.d.send_keys(prompt, clear=True)
-            time.sleep(1)
+        if not edit.exists:
+            raise RuntimeError("文心 App 没有可用的问题输入框")
+        edit.set_text(prompt)
+        time.sleep(1)
+        if re.sub(r"\s+", "", str(edit.info.get("text") or "")) != re.sub(r"\s+", "", prompt):
+            raise RuntimeError("文心 App 问题写入校验失败")
         # Filled composer replaces the bottom-right plus with a purple send arrow.
         self.d.click(width - max(42, int(width * 0.105)), height - max(70, int(height * 0.095)))
         time.sleep(1)
