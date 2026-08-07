@@ -42,12 +42,13 @@ class YuanbaoCompletionTests(unittest.TestCase):
 
 
 class _SourceCountDriver:
-    def __init__(self):
+    def __init__(self, text="参考来源 17"):
         self.script = ""
+        self.text = text
 
     def execute_script(self, script):
         self.script = script
-        return "参考来源 17"
+        return self.text
 
 
 class YuanbaoSourceCountTests(unittest.TestCase):
@@ -58,6 +59,12 @@ class YuanbaoSourceCountTests(unittest.TestCase):
         self.assertEqual(collector._expected_source_count(), 17)
         self.assertIn("join('\\n')", collector.driver.script)
         self.assertNotIn("join('\n')", collector.driver.script)
+
+    def test_expected_source_count_ignores_years_in_source_titles(self):
+        collector = YuanbaoSourceCollector.__new__(YuanbaoSourceCollector)
+        collector.driver = _SourceCountDriver("参考来源 15 2026年度热门眉毛增长液来源推荐")
+
+        self.assertEqual(collector._expected_source_count(), 15)
 
 
 if __name__ == "__main__":

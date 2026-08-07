@@ -495,7 +495,13 @@ class YuanbaoSourceCollector:
             }).join('\\n');
         """) or ""
         matches = re.findall(r"(?:参考|来源|信源)[^\d]{0,8}(\d+)|(\d+)[^\d]{0,4}(?:篇|条|个)?(?:参考|来源|信源)", texts)
-        counts = [int(left or right) for left, right in matches if left or right]
+        counts = [
+            value
+            for left, right in matches
+            if left or right
+            for value in [int(left or right)]
+            if 0 < value <= 100
+        ]
         return max(counts, default=0)
 
     def _close_drawer(self):
