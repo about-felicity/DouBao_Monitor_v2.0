@@ -116,10 +116,19 @@ class Plugin(ModelPlugin):
 def _saved_rows(save: dict[str, Any]) -> int:
     raw = save.get("output")
     if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, json.JSONDecodeError):
-            raw = {}
+        candidates = [raw, *reversed(raw.splitlines())]
+        raw = {}
+        for candidate in candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            try:
+                decoded = json.loads(candidate)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                raw = decoded
+                break
     if not isinstance(raw, dict):
         return 0
     return int(raw.get("rows_written") or raw.get("count") or 0)
