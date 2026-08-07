@@ -31,6 +31,8 @@ test("采集控制包含问题计划、账号校验及启停能力", async () =>
   assert.match(source, /正在启动…/);
   assert.match(source, /Chrome 启动、账号校验完成后会自动运行采集脚本/);
   assert.match(source, /状态每 2 秒从采集日志同步/);
+  assert.match(source, /打开\$\{item\.name\}操作台/);
+  assert.match(source, /api\/control\/\$\{modelId\}\/panel/);
 });
 
 test("信源分析区区分文章视频并显示每日 Top 10 与关键词", async () => {

@@ -1,5 +1,6 @@
 import csv
 import gzip
+import hashlib
 import html
 import http.client
 import importlib
@@ -65,7 +66,9 @@ RESERVED_MODEL_SLOTS = 1
 
 _CONTROL_LOCK = threading.Lock()
 _CONTROL_PROCESSES = {}
+_PANEL_PROCESSES = {}
 _ANALYTICS_LOCK = threading.RLock()
+_ANALYTICS_SNAPSHOT_LOCK = threading.Lock()
 _ANALYTICS_CACHE = {}
 _ANALYTICS_BUILDING = set()
 _ANALYTICS_SNAPSHOT = None
@@ -259,7 +262,7 @@ def _analytics_data_version():
 
 def _analytics_snapshot(version):
     global _ANALYTICS_SNAPSHOT
-    with _ANALYTICS_LOCK:
+    with _ANALYTICS_SNAPSHOT_LOCK:
         if _ANALYTICS_SNAPSHOT and _ANALYTICS_SNAPSHOT[0] == version:
             return _ANALYTICS_SNAPSHOT
         runs_by_model = {
@@ -282,7 +285,33 @@ def _build_unified_analytics(cache_key, version):
     with _ANALYTICS_LOCK:
         _ANALYTICS_CACHE[cache_key] = (snapshot_version, result)
         _ANALYTICS_BUILDING.discard(cache_key)
+    _persist_unified_analytics(cache_key, result)
     return result
+
+
+def _unified_analytics_cache_path(cache_key):
+    payload = json.dumps(cache_key, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    return Path(BASE_DIR) / "runtime" / "unified_analytics_cache" / f"{digest}.json"
+
+
+def _persist_unified_analytics(cache_key, result):
+    path = _unified_analytics_cache_path(cache_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(result, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        pass
+
+
+def _load_persisted_unified_analytics(cache_key):
+    try:
+        value = json.loads(_unified_analytics_cache_path(cache_key).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) and isinstance(value.get("models"), list) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _refresh_unified_analytics(cache_key, version):
@@ -300,6 +329,7 @@ def _unified_analytics(params):
         (params.get("model") or [""])[0],
     )
     version = _analytics_data_version()
+    build_now = False
     with _ANALYTICS_LOCK:
         cached = _ANALYTICS_CACHE.get(cache_key)
         if cached and cached[0] == version:
@@ -314,8 +344,45 @@ def _unified_analytics(params):
                     daemon=True,
                 ).start()
             return cached[1]
+        persisted = _load_persisted_unified_analytics(cache_key)
+        if persisted is not None:
+            _ANALYTICS_CACHE[cache_key] = ((), persisted)
+            _ANALYTICS_BUILDING.add(cache_key)
+            threading.Thread(
+                target=_refresh_unified_analytics,
+                args=(cache_key, version),
+                name="unified-analytics-refresh",
+                daemon=True,
+            ).start()
+            return persisted
         _ANALYTICS_BUILDING.add(cache_key)
+        build_now = True
+    if build_now:
         return _build_unified_analytics(cache_key, version)
+    raise RuntimeError("analytics build was not scheduled")
+
+
+def _open_remote_model_panel(model):
+    if model not in {"deepseek", "yuanbao", "wenxin"}:
+        raise ValueError("该模型没有远端操作台")
+    existing = _PANEL_PROCESSES.get(model)
+    if _process_alive(existing):
+        return {"opened": True, "pid": existing.pid, "message": "操作台已经打开"}
+    script = Path(BASE_DIR) / "remote_model_control_panel.py"
+    if not script.exists():
+        raise FileNotFoundError("找不到远端模型操作台")
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    executable = pythonw if pythonw.exists() else Path(sys.executable)
+    process = subprocess.Popen(
+        [str(executable), str(script), "--model", model],
+        cwd=BASE_DIR,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    _PANEL_PROCESSES[model] = process
+    return {"opened": True, "pid": process.pid, "message": "操作台已打开"}
 
 CATEGORY_BASELINE_NAME = "品类全量基准"
 
@@ -6394,6 +6461,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if re.fullmatch(r"/api/v1/models/(deepseek|yuanbao|wenxin|afu)/results", path):
             self.proxy_doubao_receiver(8791)
+            return
+        panel_route = re.fullmatch(r"/api/control/(deepseek|yuanbao|wenxin)/panel", path)
+        if panel_route:
+            try:
+                self.send_json({"ok": True, **_open_remote_model_panel(panel_route.group(1))})
+            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
             return
         model_route = re.fullmatch(r"/api/models/([a-z0-9_-]+)/(questions|account-check)", path)
         if model_route:

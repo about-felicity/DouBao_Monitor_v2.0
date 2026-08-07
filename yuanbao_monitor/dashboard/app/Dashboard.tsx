@@ -412,25 +412,35 @@ export function Dashboard() {
   const [error, setError] = useState("");
   const [lastRefresh, setLastRefresh] = useState("");
   const draftsInitialized = useRef(false);
+  const analyticsCache = useRef(new Map<string, Analytics>());
+  const analyticsRequest = useRef<AbortController | null>(null);
 
-  const load = useCallback(async () => {
+  const loadAnalytics = useCallback(async (force = false) => {
+    const cacheKey = JSON.stringify([model, question, date]);
+    const cached = analyticsCache.current.get(cacheKey);
+    if (cached && !force) {
+      setAnalytics(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
+    analyticsRequest.current?.abort();
+    const request = new AbortController();
+    analyticsRequest.current = request;
     try {
       const base = apiBase();
-      const params = new URLSearchParams({ _: String(Date.now()) });
+      const params = new URLSearchParams();
       if (model) params.set("model", model);
       if (question) params.set("question", question);
       if (date) params.set("date", date);
-      const [a, c] = await Promise.all([
-        fetch(`${base}/api/analytics?${params}`, { cache: "no-store" }),
-        fetch(`${base}/api/control/status?_=${Date.now()}`, {
-          cache: "no-store",
-        }),
-      ]);
-      if (!a.ok || !c.ok) throw new Error("本地数据服务暂不可用");
-      const analyticsPayload = await a.json();
-      const controlPayload = await c.json();
+      const response = await fetch(`${base}/api/analytics?${params}`, {
+        cache: "no-store",
+        signal: request.signal,
+      });
+      if (!response.ok) throw new Error("本地分析服务暂不可用");
+      const analyticsPayload = await response.json();
+      analyticsCache.current.set(cacheKey, analyticsPayload);
       setAnalytics(analyticsPayload);
-      setControl(controlPayload.models || {});
       setError("");
       setLastRefresh(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
       if (!draftsInitialized.current && analyticsPayload.model_catalog?.length) {
@@ -474,22 +484,46 @@ export function Dashboard() {
         );
       }
     } catch (reason) {
+      if (reason instanceof DOMException && reason.name === "AbortError") return;
       setError(reason instanceof Error ? reason.message : "连接失败");
     } finally {
-      setLoading(false);
+      if (analyticsRequest.current === request) setLoading(false);
     }
   }, [model, question, date]);
 
   useEffect(() => {
-    const initial = window.setTimeout(load, 0);
+    const initial = window.setTimeout(() => void loadAnalytics(), 0);
     const timer = window.setInterval(() => {
-      if (!document.hidden) void load();
-    }, 5000);
+      if (!document.hidden && view !== "control") void loadAnalytics(true);
+    }, 15000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
+      analyticsRequest.current?.abort();
     };
-  }, [load]);
+  }, [loadAnalytics, view]);
+
+  const loadControl = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase()}/api/control/status?_=${Date.now()}`, {
+        cache: "no-store",
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        setControl(payload.models || {});
+      }
+    } catch (reason) {
+      void reason;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadControl();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void loadControl();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [loadControl]);
 
   useEffect(() => {
     if (question && !analytics.questions.includes(question)) setQuestion("");
@@ -502,7 +536,7 @@ export function Dashboard() {
     .join(",");
 
   useEffect(() => {
-    if (!remoteModelIds) return;
+    if (!remoteModelIds || view !== "control") return;
     let active = true;
     const ids = remoteModelIds.split(",");
     const refresh = async () => {
@@ -532,7 +566,7 @@ export function Dashboard() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [remoteModelIds]);
+  }, [remoteModelIds, view]);
 
   const selectedModels = analytics.models;
   const totals = useMemo(
@@ -614,11 +648,27 @@ export function Dashboard() {
       setMessage(
         `${analytics.model_catalog.find((item) => item.id === modelId)?.name || modelId}${action === "start" ? "已启动" : "已停止"}`,
       );
-      await load();
+      await loadControl();
     } catch (reason) {
       setMessage(reason instanceof Error ? reason.message : "操作失败");
     } finally {
       if (action === "start") setStartingModels((old) => ({ ...old, [modelId]: false }));
+    }
+  }
+
+  async function openRemotePanel(modelId: string) {
+    setMessage(`正在打开${analytics.model_catalog.find((item) => item.id === modelId)?.name || modelId}操作台…`);
+    try {
+      const response = await fetch(`${apiBase()}/api/control/${modelId}/panel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.error || "操作台启动失败");
+      setMessage(payload.message || "操作台已打开");
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "操作台启动失败");
     }
   }
 
@@ -688,7 +738,7 @@ export function Dashboard() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <span>5 秒自动刷新</span>
+          <span>分析 15 秒 · 状态 5 秒</span>
           <b>{lastRefresh || "等待首次读取"}</b>
         </div>
       </aside>
@@ -707,7 +757,7 @@ export function Dashboard() {
             </h1>
             <p>所有统计按北京时间自然日归档；同一轮同一链接仅计一次。</p>
           </div>
-          <button onClick={() => load()} disabled={loading}>
+          <button onClick={() => loadAnalytics(true)} disabled={loading}>
             {loading ? "读取中" : "刷新数据"}
           </button>
         </header>
@@ -1241,7 +1291,7 @@ export function Dashboard() {
                           {account
                             ? account.message
                             : remote
-                              ? "账号校验在远端豆包控制端执行，本机显示校验状态"
+                              ? `账号校验在${item.name}操作台执行，本机显示回传状态`
                               : "启动前建议执行账号一致性校验"}
                         </b>
                         {account?.mobile && (
@@ -1282,10 +1332,10 @@ export function Dashboard() {
                         </button>
                         <button
                           className="start"
-                          disabled={remote || starting || state?.running || !state?.ready}
-                          onClick={() => controlAction(item.id, "start")}
+                          disabled={!remote && (starting || state?.running || !state?.ready)}
+                          onClick={() => remote ? openRemotePanel(item.id) : controlAction(item.id, "start")}
                         >
-                          {remote ? "请在远端启动" : starting ? "正在启动…" : "启动采集"}
+                          {remote ? `打开${item.name}操作台` : starting ? "正在启动…" : "启动采集"}
                         </button>
                         <button
                           className="stop"

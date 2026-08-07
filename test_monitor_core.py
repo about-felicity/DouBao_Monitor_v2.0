@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from unittest import mock
 
-from monitor_core.analytics import build_analytics, prepare_analytics
+from monitor_core.analytics import build_analytics, keyword_counts, prepare_analytics
 from monitor_core.cdp_chat import CDPPage, external_sources
 from monitor_core.owned_products import OWN_PRODUCT_RULES, own_product_mentions
 from monitor_core.plugins import discover_plugins
@@ -315,6 +315,24 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(model["product_daily"][0]["items"][0]["rank"], 1)
         self.assertTrue(model["top_videos"][0]["own_brand"])
         self.assertEqual(model["source_brand_daily"][0]["owned_source_rate"], 100.0)
+
+
+class KeywordAnalyticsTests(unittest.TestCase):
+    def test_keyword_counts_drops_equally_frequent_subterm(self):
+        with mock.patch(
+            "monitor_core.analytics._title_terms",
+            side_effect=[("护发", "护发精油"), ("护发", "护发精油")],
+        ):
+            rows = keyword_counts(("a", "b"))
+        self.assertEqual(rows, [{"term": "护发精油", "count": 2}])
+
+    def test_keyword_counts_keeps_more_frequent_subterm(self):
+        with mock.patch(
+            "monitor_core.analytics._title_terms",
+            side_effect=[("护发", "护发精油"), ("护发", "护发精油"), ("护发",)],
+        ):
+            rows = keyword_counts(("a", "b", "c"))
+        self.assertEqual(rows[0], {"term": "护发", "count": 3})
 
 
 class PluginCommandTests(unittest.TestCase):

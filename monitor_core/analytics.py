@@ -238,12 +238,19 @@ def keyword_counts(titles: Iterable[str], limit: int = 18) -> list[dict[str, Any
         for term in per_title:
             if term not in KEYWORD_STOP and not any(stop in term for stop in ("推荐一", "排行榜", "怎么样")):
                 counts[term] += 1
+    dominated: dict[str, int] = {}
+    for longer, longer_count in counts.items():
+        length = len(longer)
+        for start in range(length):
+            for end in range(start + 2, length + 1):
+                fragment = longer[start:end]
+                if fragment != longer and longer_count > dominated.get(fragment, 0):
+                    dominated[fragment] = longer_count
     result = []
     for term, count in counts.most_common():
         if count < 2 or term[0] in PARTICLES or term[-1] in PARTICLES:
             continue
-        if any(term != longer and term in longer and count <= longer_count
-               for longer, longer_count in counts.items() if len(longer) > len(term)):
+        if dominated.get(term, 0) >= count:
             continue
         result.append({"term": term, "count": count})
         if len(result) >= limit:

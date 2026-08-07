@@ -993,9 +993,6 @@ button {
 @keyframes startup-spin {
   to { transform: rotate(360deg); }
 }
-.control-card[data-model-id="doubao"] {
-  grid-column: 1 / -1;
-}
 .control-card > header {
   display: flex;
   align-items: center;
@@ -1235,7 +1232,7 @@ button {
   color: var(--danger);
 }
 .remote-event-list {
-  max-height: 520px;
+  max-height: 320px;
   overflow: auto;
 }
 .remote-event {
