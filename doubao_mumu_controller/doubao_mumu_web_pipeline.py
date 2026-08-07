@@ -424,19 +424,26 @@ def adb_command(
 
 
 def wait_adb(adb: Path, serial: str, timeout: float = 30) -> None:
-    run_text([str(adb), "connect", serial], timeout=8, check=False)
     deadline = time.monotonic() + timeout
     last_reconnect = 0.0
     consecutive_ready = 0
+    last_error = ""
     while time.monotonic() < deadline:
-        state = adb_command(
-            adb,
-            serial,
-            ["get-state"],
-            timeout=5,
-            check=False,
-        )
-        if state.returncode == 0 and state.stdout.strip() == "device":
+        try:
+            run_text([str(adb), "connect", serial], timeout=8, check=False)
+            state = adb_command(
+                adb,
+                serial,
+                ["get-state"],
+                timeout=5,
+                check=False,
+            )
+            state_text = f"{state.stdout} {state.stderr}".lower()
+        except PipelineError as exc:
+            last_error = str(exc)
+            state = None
+            state_text = last_error.lower()
+        if state is not None and state.returncode == 0 and state.stdout.strip() == "device":
             consecutive_ready += 1
             # adb root/unroot can briefly report "device" before adbd restarts
             # again. Require a stable window so Appium is not started in that
@@ -446,22 +453,24 @@ def wait_adb(adb: Path, serial: str, timeout: float = 30) -> None:
             time.sleep(0.6)
             continue
         consecutive_ready = 0
-        state_text = f"{state.stdout} {state.stderr}".lower()
         now = time.monotonic()
         if "offline" in state_text and now - last_reconnect >= 2:
             # MuMu can leave its localhost ADB alias offline while the same
             # emulator remains healthy. Recreate that TCP transport so all
             # later Appium and account calls can keep the manager serial.
-            run_text(
-                [str(adb), "disconnect", serial],
-                timeout=8,
-                check=False,
-            )
+            try:
+                run_text(
+                    [str(adb), "disconnect", serial],
+                    timeout=8,
+                    check=False,
+                )
+            except PipelineError as exc:
+                last_error = str(exc)
             time.sleep(0.4)
             last_reconnect = now
-        run_text([str(adb), "connect", serial], timeout=8, check=False)
         time.sleep(1)
-    raise PipelineError(f"ADB 无法连接 MuMu：{serial}")
+    detail = f"；最后错误：{last_error}" if last_error else ""
+    raise PipelineError(f"ADB 无法连接 MuMu：{serial}{detail}")
 
 
 def read_mobile_account(
