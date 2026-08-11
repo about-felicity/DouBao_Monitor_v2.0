@@ -1096,6 +1096,7 @@ class DoubaoMuMuControlPanel:
             "ready": "账号一致",
             "waiting_manual_check": "等待手动检测",
             "mobile_not_logged_in": "手机端未登录",
+            "mobile_check_failed": "ADB/账号检测失败",
             "web_not_logged_in": "网页未登录",
             "capture_not_ready": "抓取器未就绪",
             "account_mismatch": "账号不一致",
@@ -1110,6 +1111,7 @@ class DoubaoMuMuControlPanel:
                 else "error"
                 if state in {
                     "mobile_not_logged_in",
+                    "mobile_check_failed",
                     "account_mismatch",
                     "web_check_failed",
                 }
@@ -1773,6 +1775,7 @@ class DoubaoMuMuControlPanel:
                         "未发现实例：" + "、".join(sorted(missing))
                     )
             adb = pipeline.resolve_adb()
+            pipeline.ensure_adb_shells_ready(logger, adb, devices)
         except Exception as exc:
             result = {
                 "ok": False,
@@ -1834,19 +1837,34 @@ class DoubaoMuMuControlPanel:
                     )
                 except Exception as exc:
                     self.cached_mobile_accounts.pop(serial, None)
+                    error = str(exc)
+                    actually_logged_out = (
+                        "账号数据库中没有有效 UID" in error
+                        or "MuMu 豆包尚未登录" in error
+                    )
                     instance_results.append(
                         {
                             "index": index,
                             "device": device,
                             "ready": False,
-                            "state": "mobile_not_logged_in",
-                            "mobile": "未登录",
-                            "web": "等待 MuMu 端登录",
+                            "state": (
+                                "mobile_not_logged_in"
+                                if actually_logged_out
+                                else "mobile_check_failed"
+                            ),
+                            "mobile": "未登录" if actually_logged_out else "检测失败",
+                            "web": (
+                                "等待 MuMu 端登录"
+                                if actually_logged_out
+                                else "等待 ADB 自动恢复"
+                            ),
                             "message": (
                                 f"实例 {index} 的 MuMu 端未登录："
                                 "请在该模拟器的豆包 App 登录账号。"
+                                if actually_logged_out
+                                else f"实例 {index} 的 ADB/账号数据库检测失败：{error}"
                             ),
-                            "error": str(exc),
+                            "error": error,
                         }
                     )
                     continue

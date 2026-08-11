@@ -271,6 +271,9 @@ def ensure_sync_agent_running() -> bool:
     config = load_config()
     if not config.get("enabled") or sync_agent_running():
         return False
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
     log_handle = SYNC_AGENT_LOG.open("ab")
     try:
         subprocess.Popen(
@@ -279,6 +282,7 @@ def ensure_sync_agent_running() -> bool:
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            env=child_env,
             creationflags=(
                 subprocess.CREATE_NO_WINDOW
                 if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")

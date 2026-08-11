@@ -70,6 +70,7 @@ JAVA_HOME_CANDIDATES = [
     Path(r"C:\Program Files\Eclipse Adoptium"),
 ]
 ANDROID_SDK_CANDIDATES = [
+    BASE_DIR / "runtime" / "android-sdk",
     BASE_DIR / "portable_runtime" / "AndroidSDK",
     Path(os.environ.get("ANDROID_SDK_ROOT", "")),
     Path(os.environ.get("ANDROID_HOME", "")),

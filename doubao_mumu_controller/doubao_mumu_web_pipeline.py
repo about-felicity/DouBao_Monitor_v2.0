@@ -423,6 +423,75 @@ def adb_command(
     )
 
 
+ADB_SHELL_READY_MARKER = "__doubao_adb_shell_ready__"
+
+
+def adb_shell_ready(adb: Path, serial: str, timeout: float = 5) -> bool:
+    """Reject MuMu transports that say device but cannot execute shell calls."""
+    try:
+        result = adb_command(
+            adb,
+            serial,
+            ["shell", "echo", ADB_SHELL_READY_MARKER],
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return False
+    return (
+        result.returncode == 0
+        and ADB_SHELL_READY_MARKER in str(result.stdout or "")
+    )
+
+
+def restart_adb_connections(
+    logger: logging.Logger,
+    adb: Path,
+    serials: list[str],
+    timeout: float = 45,
+) -> None:
+    """Restart the local ADB server and restore every selected MuMu alias."""
+    unique_serials = list(dict.fromkeys(str(item) for item in serials if item))
+    logger.warning(
+        "检测到 MuMu ADB 假在线，正在自动重启 ADB 并重连 %d 个实例。",
+        len(unique_serials),
+    )
+    run_text([str(adb), "kill-server"], timeout=12, check=False)
+    run_text([str(adb), "start-server"], timeout=20, check=True)
+    deadline = time.monotonic() + max(10.0, timeout)
+    pending = set(unique_serials)
+    while pending and time.monotonic() < deadline:
+        for serial in list(pending):
+            run_text([str(adb), "connect", serial], timeout=8, check=False)
+            if adb_shell_ready(adb, serial, timeout=5):
+                pending.discard(serial)
+        if pending:
+            time.sleep(1)
+    if pending:
+        raise PipelineError(
+            "ADB 自动恢复后仍无法执行 shell：" + "、".join(sorted(pending))
+        )
+    logger.info("ADB 自动恢复完成，%d 个 MuMu 实例均可执行 shell。", len(unique_serials))
+
+
+def ensure_adb_shells_ready(
+    logger: logging.Logger,
+    adb: Path,
+    devices: list[dict[str, Any]],
+) -> bool:
+    """Repair all selected transports once when any instance is falsely online."""
+    serials = [str(item.get("serial") or "") for item in devices]
+    unhealthy = [
+        serial for serial in serials
+        if serial and not adb_shell_ready(adb, serial)
+    ]
+    if not unhealthy:
+        return False
+    logger.warning("以下实例 ADB shell 无响应：%s", "、".join(unhealthy))
+    restart_adb_connections(logger, adb, serials)
+    return True
+
+
 def wait_adb(adb: Path, serial: str, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     last_reconnect = 0.0

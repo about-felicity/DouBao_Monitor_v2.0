@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent
@@ -61,6 +62,42 @@ emulator-5554 device
                 self.assertEqual(pipeline.browser_port_for_slot("0"), 9300)
             finally:
                 pipeline.BROWSER_SLOT_MAP_PATH = original_path
+
+    def test_adb_shell_health_requires_a_real_shell_response(self) -> None:
+        ready = pipeline.subprocess.CompletedProcess(
+            [], 0, stdout=pipeline.ADB_SHELL_READY_MARKER + "\n", stderr=""
+        )
+        stuck = pipeline.subprocess.CompletedProcess(
+            [], 0, stdout="", stderr=""
+        )
+        with mock.patch.object(pipeline, "adb_command", return_value=ready):
+            self.assertTrue(pipeline.adb_shell_ready(Path("adb"), "serial"))
+        with mock.patch.object(pipeline, "adb_command", return_value=stuck):
+            self.assertFalse(pipeline.adb_shell_ready(Path("adb"), "serial"))
+
+    def test_multi_instance_health_check_repairs_all_aliases_once(self) -> None:
+        devices = [
+            {"serial": "127.0.0.1:16384"},
+            {"serial": "127.0.0.1:16416"},
+            {"serial": "127.0.0.1:16448"},
+        ]
+        with (
+            mock.patch.object(
+                pipeline,
+                "adb_shell_ready",
+                side_effect=[False, False, True],
+            ),
+            mock.patch.object(pipeline, "restart_adb_connections") as restart,
+        ):
+            repaired = pipeline.ensure_adb_shells_ready(
+                pipeline.logging.getLogger("test"), Path("adb"), devices
+            )
+        self.assertTrue(repaired)
+        restart.assert_called_once_with(
+            mock.ANY,
+            Path("adb"),
+            ["127.0.0.1:16384", "127.0.0.1:16416", "127.0.0.1:16448"],
+        )
 
 
 if __name__ == "__main__":
