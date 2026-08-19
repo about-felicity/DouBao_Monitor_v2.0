@@ -76,6 +76,9 @@
 - GitHub 克隆到新电脑后，先安装并启动 Chrome、逍遥和豆包，再以管理员身份
   双击仓库根目录的 `新电脑首次安装逍遥抓取环境.bat`。脚本会安装/核验 Python 依赖、Java、
   Appium 2.19.0 和 UiAutomator2 4.2.9，并执行完整环境自检。
+- 如果新电脑提示“系统找不到指定的路径”，请确认下载并解压的是整个仓库，
+  然后直接运行纯英文入口 `setup_memu_capture.cmd`；安装通过后运行
+  `open_memu_capture_panel.cmd`。不要只复制桌面的单个 `.bat` 文件。
 
 ## 常用命令
 
