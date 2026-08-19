@@ -61,7 +61,11 @@ CONTROLLER_FILES = [
     "远端豆包一键配置回传.bat",
     "doubao_mumu_panel_config.json",
     "requirements.txt",
+    "launch_control_panel.py",
+    "打开豆包逍遥控制面板.bat",
     "打开豆包MuMu控制面板.bat",
+    "新电脑首次安装逍遥环境.bat",
+    "setup_memu_environment.ps1",
     "open_control_panel.cmd",
     "run_scheduled_doubao_job.bat",
     "远端电脑一键启动.bat",
@@ -197,18 +201,18 @@ def build(
     )
     readme = package_root / "使用说明.txt"
     readme.write_text(
-        "1. 新电脑只需安装 Google Chrome 和 MuMu；包内已带便携 Python、"
+        "1. 新电脑只需安装 Google Chrome 和逍遥模拟器；包内已带便携 Python、"
         "Appium、Android SDK、ADB 和 Java。\n"
-        "2. 启动 MuMu，在豆包 App 中登录账号并保持 MuMu 运行。\n"
-        "   支持同时启动任意多个 MuMu；每台可以登录不同豆包账号。\n"
+        "2. 启动逍遥，在豆包 App 中登录账号并保持逍遥运行。\n"
+        "   支持同时启动任意多个逍遥实例；每台可以登录不同豆包账号。\n"
         "3. 双击“一键启动独立采集.bat”。\n"
-        "4. 程序会为每个 MuMu 实例启动独立调试 Chrome 和独立用户目录；"
+        "4. 程序会为每个逍遥实例启动独立调试 Chrome 和独立用户目录；"
         "无需手动安装插件，抓取器会自动注入豆包网页。第一次请在每个"
-        " Chrome 分别登录对应 MuMu 的豆包账号。\n"
+        " Chrome 分别登录对应逍遥实例的豆包账号。\n"
         "5. 问题与重复次数可在 monitor\\doubao_mumu_controller\\"
         "doubao_mumu_panel_config.json 中修改；也可双击“配置问题与定时.bat”"
         "使用控制面板修改并安装定时任务。“实例”留空会并行运行全部"
-        "已启动 MuMu，也可填写 0,1,3。问题、运行参数、定时参数、"
+        "已启动逍遥实例，也可填写 0,1,3。问题、运行参数、定时参数、"
         "自有品牌和竞品会自动保存，下次打开无需重新输入。\n"
         "6. 若要把豆包结果汇总到主电脑统一面板，请把主电脑生成的"
         "doubao_lan_pairing.json 拖到 monitor\\doubao_mumu_controller\\"

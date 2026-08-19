@@ -19,6 +19,7 @@ import tempfile
 import time
 from typing import Any
 import urllib.request
+import xml.etree.ElementTree as ET
 
 import doubao_mumu_loop as mumu
 try:
@@ -47,6 +48,12 @@ MUMU_MANAGER_CANDIDATES = [
     Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
     / "Netease/MuMuPlayer-12.0/shell/MuMuManager.exe",
 ]
+MEMU_CONSOLE_CANDIDATES = [
+    Path(os.environ.get("MEMU_CONSOLE_PATH", "")),
+    Path(r"C:\Program Files\Microvirt\MEmu\memuc.exe"),
+    Path(r"C:\Program Files (x86)\Microvirt\MEmu\memuc.exe"),
+    Path(r"D:\Program Files\Microvirt\MEmu\memuc.exe"),
+]
 CHROME_CANDIDATES = [
     Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
     / "Google/Chrome/Application/chrome.exe",
@@ -56,6 +63,10 @@ CHROME_CANDIDATES = [
     / "Google/Chrome/Application/chrome.exe",
 ]
 ACCOUNT_DB = "/data/user/0/com.larus.nova/databases/account_db"
+ACCOUNT_PREF = (
+    "/data/user/0/com.larus.nova/shared_prefs/"
+    "com.bytedance.sdk.account_setting.xml"
+)
 CDP_SCAN_PORTS = list(range(9222, 9251)) + list(range(9300, 9400))
 BROWSER_SLOT_MAP_PATH = BASE_DIR / "doubao_browser_slots.json"
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -187,7 +198,7 @@ def _registry_app_path(executable: str) -> Path | None:
     return None
 
 
-def _registry_mumu_manager() -> Path | None:
+def _registry_emulator_manager(emulator: str) -> Path | None:
     if os.name != "nt":
         return None
     try:
@@ -212,7 +223,12 @@ def _registry_mumu_manager() -> Path | None:
                             display_name = str(
                                 winreg.QueryValueEx(child, "DisplayName")[0]
                             )
-                            if "mumu" not in display_name.casefold():
+                            normalized_name = display_name.casefold()
+                            is_mumu = "mumu" in normalized_name
+                            is_memu = "memu" in normalized_name or "逍遥" in display_name
+                            if emulator == "memu" and not is_memu:
+                                continue
+                            if emulator == "mumu" and not is_mumu:
                                 continue
                             values: list[Path] = []
                             for value_name in ("InstallLocation", "DisplayIcon"):
@@ -230,11 +246,19 @@ def _registry_mumu_manager() -> Path | None:
                                 )
                             for base in values:
                                 for root in (base, base.parent):
-                                    for relative in (
-                                        "MuMuManager.exe",
-                                        "nx_main/MuMuManager.exe",
-                                        "shell/MuMuManager.exe",
-                                    ):
+                                    relatives = (
+                                        (
+                                            "memuc.exe",
+                                            "MEmu/memuc.exe",
+                                        )
+                                        if is_memu
+                                        else (
+                                            "MuMuManager.exe",
+                                            "nx_main/MuMuManager.exe",
+                                            "shell/MuMuManager.exe",
+                                        )
+                                    )
+                                    for relative in relatives:
                                         candidate = root / relative
                                         if candidate.is_file():
                                             return candidate
@@ -254,9 +278,15 @@ def _where_executable(name: str) -> Path | None:
 
 def resolve_mumu_manager() -> Path | None:
     return (
-        first_existing(MUMU_MANAGER_CANDIDATES)
+        # Prefer MEmu when both emulators remain installed.  This prevents an
+        # old MuMu installation from silently controlling the wrong devices.
+        first_existing(MEMU_CONSOLE_CANDIDATES)
+        or _registry_app_path("memuc.exe")
+        or _registry_emulator_manager("memu")
+        or _where_executable("memuc.exe")
+        or first_existing(MUMU_MANAGER_CANDIDATES)
         or _registry_app_path("MuMuManager.exe")
-        or _registry_mumu_manager()
+        or _registry_emulator_manager("mumu")
         or _where_executable("MuMuManager.exe")
     )
 
@@ -301,6 +331,39 @@ def parse_mumu_adb_devices(
     return instances
 
 
+def parse_memu_adb_devices(
+    output: str,
+    requested_index: str | None,
+) -> list[dict[str, Any]]:
+    """Build MEmu (逍遥) instance records from its localhost ADB ports."""
+    instances: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        fields = line.strip().split()
+        if len(fields) < 2 or fields[1] != "device":
+            continue
+        match = re.fullmatch(r"127\.0\.0\.1:(\d+)", fields[0])
+        if not match:
+            continue
+        port = int(match.group(1))
+        offset = port - 21503
+        if offset < 0 or offset % 10:
+            continue
+        index = str(offset // 10)
+        if requested_index is not None and index != str(requested_index):
+            continue
+        instances.append(
+            {
+                "index": index,
+                "name": "逍遥模拟器" + (f"-{index}" if index != "0" else ""),
+                "serial": fields[0],
+                "pid": None,
+                "emulator": "memu",
+            }
+        )
+    instances.sort(key=lambda item: int(item["index"]))
+    return instances
+
+
 def discover_mumu_instances_via_adb(
     logger: logging.Logger,
     requested_index: str | None,
@@ -310,11 +373,13 @@ def discover_mumu_instances_via_adb(
     result = run_text([str(adb), "devices"], timeout=10, check=False)
     instances = parse_mumu_adb_devices(result.stdout, requested_index)
     if not instances:
+        instances = parse_memu_adb_devices(result.stdout, requested_index)
+    if not instances:
         raise PipelineError(
-            f"MuMuManager 不可用，ADB 也没有发现在线 MuMu 实例：{reason}"
+            f"模拟器管理器不可用，ADB 也没有发现在线模拟器实例：{reason}"
         )
     logger.warning(
-        "MuMuManager 设备查询异常，已自动改用 ADB 在线设备继续：%s",
+        "模拟器管理器查询异常，已自动改用 ADB 在线设备继续：%s",
         reason,
     )
     return instances
@@ -329,8 +394,25 @@ def discover_mumu_instances(
         return discover_mumu_instances_via_adb(
             logger,
             requested_index,
-            "找不到 MuMuManager.exe",
+            "找不到模拟器管理程序",
         )
+    if manager.name.casefold() == "memuc.exe":
+        # MEmu exposes stable ADB ports (21503 + index * 10).  Reading the
+        # active ADB transports is more reliable than localized console CSV.
+        adb = resolve_adb()
+        result = run_text([str(adb), "devices"], timeout=10, check=False)
+        instances = parse_memu_adb_devices(result.stdout, requested_index)
+        if not instances:
+            raise PipelineError("ADB 没有发现已启动的逍遥模拟器实例。")
+        logger.info(
+            "发现 %s 台已启动的逍遥模拟器：%s",
+            len(instances),
+            "，".join(
+                f"{item['name']}[实例 {item['index']}, {item['serial']}]"
+                for item in instances
+            ),
+        )
+        return instances
     try:
         result = run_text([str(manager), "info", "-v", "all"], timeout=15)
     except Exception as exc:
@@ -393,6 +475,7 @@ def resolve_adb() -> Path:
             install_root.parent / "adb.exe",
             install_root.parent / "shell" / "adb.exe",
             install_root.parent / "nx_main" / "adb.exe",
+            install_root / "adb.exe",
         ]
         nx_device = install_root.parent / "nx_device"
         if nx_device.is_dir():
@@ -427,7 +510,7 @@ ADB_SHELL_READY_MARKER = "__doubao_adb_shell_ready__"
 
 
 def adb_shell_ready(adb: Path, serial: str, timeout: float = 5) -> bool:
-    """Reject MuMu transports that say device but cannot execute shell calls."""
+    """Reject transports that say device but cannot execute shell calls."""
     try:
         result = adb_command(
             adb,
@@ -444,16 +527,41 @@ def adb_shell_ready(adb: Path, serial: str, timeout: float = 5) -> bool:
     )
 
 
+def parse_current_account_preferences(xml_data: bytes | str) -> dict[str, str]:
+    """Read the account SDK's authoritative currently active user."""
+    if isinstance(xml_data, bytes):
+        text = xml_data.decode("utf-8", errors="replace")
+    else:
+        text = str(xml_data)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return {}
+    values: dict[str, str] = {}
+    for element in root:
+        name = str(element.attrib.get("name") or "")
+        if name not in {"user_id", "screen_name", "user_name"}:
+            continue
+        value = str(element.attrib.get("value") or element.text or "").strip()
+        if value:
+            values[name] = value
+    uid = values.get("user_id", "")
+    if not uid.isdigit():
+        return {}
+    return {
+        "uid": uid,
+        "screen_name": values.get("screen_name") or values.get("user_name", ""),
+    }
 def restart_adb_connections(
     logger: logging.Logger,
     adb: Path,
     serials: list[str],
     timeout: float = 45,
 ) -> None:
-    """Restart the local ADB server and restore every selected MuMu alias."""
+    """Restart the local ADB server and restore every selected emulator alias."""
     unique_serials = list(dict.fromkeys(str(item) for item in serials if item))
     logger.warning(
-        "检测到 MuMu ADB 假在线，正在自动重启 ADB 并重连 %d 个实例。",
+        "检测到模拟器 ADB 假在线，正在自动重启 ADB 并重连 %d 个实例。",
         len(unique_serials),
     )
     run_text([str(adb), "kill-server"], timeout=12, check=False)
@@ -471,7 +579,7 @@ def restart_adb_connections(
         raise PipelineError(
             "ADB 自动恢复后仍无法执行 shell：" + "、".join(sorted(pending))
         )
-    logger.info("ADB 自动恢复完成，%d 个 MuMu 实例均可执行 shell。", len(unique_serials))
+    logger.info("ADB 自动恢复完成，%d 个模拟器实例均可执行 shell。", len(unique_serials))
 
 
 def ensure_adb_shells_ready(
@@ -539,7 +647,7 @@ def wait_adb(adb: Path, serial: str, timeout: float = 30) -> None:
             last_reconnect = now
         time.sleep(1)
     detail = f"；最后错误：{last_error}" if last_error else ""
-    raise PipelineError(f"ADB 无法连接 MuMu：{serial}{detail}")
+    raise PipelineError(f"ADB 无法连接模拟器：{serial}{detail}")
 
 
 def read_mobile_account(
@@ -549,7 +657,16 @@ def read_mobile_account(
 ) -> dict[str, str]:
     wait_adb(adb, serial)
     rooted = False
+    was_root = False
     try:
+        initial_id = adb_command(
+            adb,
+            serial,
+            ["shell", "id"],
+            timeout=8,
+            check=False,
+        )
+        was_root = initial_id.returncode == 0 and "uid=0(root)" in initial_id.stdout
         root_result = adb_command(
             adb,
             serial,
@@ -560,10 +677,21 @@ def read_mobile_account(
         root_text = f"{root_result.stdout} {root_result.stderr}".lower()
         if root_result.returncode != 0 or "cannot run as root" in root_text:
             raise PipelineError(
-                "当前 MuMu 没有开放 ADB root，无法可靠读取豆包账号 ID。"
+                "当前模拟器没有开放 ADB root，无法可靠读取豆包账号 ID。"
             )
         rooted = True
         wait_adb(adb, serial)
+        preference = subprocess.run(
+            [str(adb), "-s", serial, "exec-out", "cat", ACCOUNT_PREF],
+            capture_output=True,
+            timeout=20,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        current_account = (
+            parse_current_account_preferences(preference.stdout)
+            if preference.returncode == 0
+            else {}
+        )
         binary = None
         read_deadline = time.monotonic() + 20
         while time.monotonic() < read_deadline:
@@ -581,41 +709,78 @@ def read_mobile_account(
         if binary.returncode != 0 or not binary.stdout.startswith(b"SQLite format 3"):
             detail = binary.stderr.decode("utf-8", errors="replace").strip()
             raise PipelineError(f"读取豆包账号数据库失败：{detail or '不是 SQLite 文件'}")
-        fd, temporary_name = tempfile.mkstemp(prefix="doubao_account_", suffix=".db")
-        os.close(fd)
-        temporary = Path(temporary_name)
-        try:
+        # MEmu commonly keeps the current login row in SQLite's WAL instead
+        # of checkpointing it into account_db immediately.  Copy the complete
+        # SQLite file set so opening the local snapshot sees committed WAL data.
+        with tempfile.TemporaryDirectory(prefix="doubao_account_") as temp_dir:
+            temporary = Path(temp_dir) / "account_db"
             temporary.write_bytes(binary.stdout)
+            for suffix in ("-wal", "-shm"):
+                sidecar = subprocess.run(
+                    [
+                        str(adb),
+                        "-s",
+                        serial,
+                        "exec-out",
+                        "cat",
+                        ACCOUNT_DB + suffix,
+                    ],
+                    capture_output=True,
+                    timeout=20,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                if sidecar.returncode == 0 and sidecar.stdout:
+                    (Path(temp_dir) / f"account_db{suffix}").write_bytes(
+                        sidecar.stdout
+                    )
             connection = sqlite3.connect(str(temporary))
             try:
-                row = connection.execute(
-                    """
-                    SELECT uid, screen_name, type, time
-                    FROM login_info
-                    WHERE COALESCE(uid, '') <> ''
-                    ORDER BY CAST(time AS INTEGER) DESC, rowid DESC
-                    LIMIT 1
-                    """
-                ).fetchone()
+                if current_account.get("uid"):
+                    row = connection.execute(
+                        """
+                        SELECT uid, screen_name, type, time
+                        FROM login_info
+                        WHERE CAST(uid AS TEXT) = ?
+                        LIMIT 1
+                        """,
+                        (current_account["uid"],),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT uid, screen_name, type, time
+                        FROM login_info
+                        WHERE COALESCE(uid, '') <> ''
+                        ORDER BY CAST(time AS INTEGER) DESC, rowid DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
             finally:
                 connection.close()
-        finally:
-            temporary.unlink(missing_ok=True)
+        if current_account.get("uid") and not row:
+            row = (
+                current_account["uid"],
+                current_account.get("screen_name", ""),
+                "",
+                0,
+            )
         if not row or not str(row[0]).strip():
-            raise PipelineError("MuMu 豆包尚未登录，账号数据库中没有有效 UID。")
+            raise PipelineError("模拟器中的豆包尚未登录，账号数据库中没有有效 UID。")
         account = {
             "uid": str(row[0]).strip(),
-            "screen_name": str(row[1] or "").strip(),
+            "screen_name": str(
+                current_account.get("screen_name") or row[1] or ""
+            ).strip(),
             "login_type": str(row[2] or "").strip(),
         }
         logger.info(
-            "已识别 MuMu 账号：UID=%s，昵称=%s",
+            "已识别模拟器账号：UID=%s，昵称=%s",
             mask_uid(account["uid"]),
             account["screen_name"] or "未设置",
         )
         return account
     finally:
-        if rooted:
+        if rooted and not was_root:
             adb_command(
                 adb,
                 serial,
@@ -942,7 +1107,7 @@ def launch_account_browser(
         creationflags=CREATE_NO_WINDOW,
     )
     logger.info(
-        "已为账号 %s / MuMu 实例 %s 启动独立网页会话（调试端口 %s）。",
+        "已为账号 %s / 逍遥实例 %s 启动独立网页会话（调试端口 %s）。",
         mask_uid(uid),
         str(browser_slot if browser_slot is not None else "默认"),
         port,
@@ -988,7 +1153,7 @@ def ensure_matching_browser(
     if existing_identity and existing_identity.get("page"):
         port = preferred_port
         logger.info(
-            "继续使用 MuMu 实例 %s 已打开的调试 Chrome（CDP=%s）。",
+            "继续使用逍遥实例 %s 已打开的调试 Chrome（CDP=%s）。",
             str(browser_slot if browser_slot is not None else "默认"),
             port,
         )
@@ -1020,7 +1185,7 @@ def ensure_matching_browser(
             and identity.get("uid") == uid
             and identity.get("captureReady")
         ):
-            logger.info("网页登录完成并与 MuMu 账号一致：UID=%s", mask_uid(uid))
+            logger.info("网页登录完成并与逍遥 App 账号一致：UID=%s", mask_uid(uid))
             return identity
         now = time.monotonic()
         if not identity.get("loggedIn") or not identity.get("uid"):
@@ -1033,7 +1198,7 @@ def ensure_matching_browser(
             if state == "not_logged_in":
                 logger.warning(
                     "网页端尚未登录；请在已打开的调试 Chrome 登录 "
-                    "MuMu 账号 %s。校验通过前不会发送问题。",
+                    "逍遥 App 账号 %s。校验通过前不会发送问题。",
                     mask_uid(uid),
                 )
             elif state == "capture_not_ready":
@@ -1043,7 +1208,7 @@ def ensure_matching_browser(
                 )
             else:
                 logger.warning(
-                    "账号不一致：网页 UID=%s，MuMu UID=%s。"
+                    "账号不一致：网页 UID=%s，逍遥 App UID=%s。"
                     "请在调试 Chrome 切换账号；一致前不会发送问题。",
                     mask_uid(str(identity["uid"])),
                     mask_uid(uid),
@@ -1052,7 +1217,7 @@ def ensure_matching_browser(
             last_notice_state = state
         if login_wait_seconds and now - started >= login_wait_seconds:
             raise PipelineError(
-                f"等待网页登录超过 {login_wait_seconds} 秒，仍未匹配 MuMu 账号。"
+                f"等待网页登录超过 {login_wait_seconds} 秒，仍未匹配逍遥 App 账号。"
             )
         time.sleep(2)
 
@@ -1656,7 +1821,7 @@ class DeviceLock:
                 now = time.monotonic()
                 if now >= next_notice:
                     self.logger.warning(
-                        "该 MuMu 已被另一个任务控制，继续等待设备锁：%s",
+                        "该逍遥实例已被另一个任务控制，继续等待设备锁：%s",
                         self.path.name,
                     )
                     next_notice = now + 20
@@ -1697,7 +1862,7 @@ def load_questions(args: argparse.Namespace) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MuMu 豆包发送 + 同账号网页同步抓取的一键流水线。"
+        description="安卓模拟器豆包发送 + 同账号网页同步抓取的一键流水线。"
     )
     parser.add_argument("--question", help="只运行一个问题。")
     parser.add_argument(
@@ -1707,10 +1872,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rounds", type=int, default=0, help="轮数；0 表示问题列表各一次。")
     parser.add_argument("--forever", action="store_true", help="循环运行问题列表。")
-    parser.add_argument("--device-index", help="只控制指定 MuMu 实例编号。")
+    parser.add_argument("--device-index", help="只控制指定模拟器实例编号。")
     parser.add_argument(
         "--browser-slot",
-        help="独立 Chrome 会话槽位；多实例运行时使用 MuMu 实例编号。",
+        help="独立 Chrome 会话槽位；多实例运行时使用模拟器实例编号。",
     )
     parser.add_argument("--adb", help="adb.exe 路径。")
     parser.add_argument("--appium-url", default=mumu.DEFAULT_APPIUM_URL)
@@ -1773,7 +1938,7 @@ def main() -> int:
     devices = discover_mumu_instances(logger, args.device_index)
     if len(devices) > 1 and args.device_index is None:
         logger.warning(
-            "检测到多台 MuMu；当前按实例顺序选择第一台。"
+            "检测到多台模拟器；当前按实例顺序选择第一台。"
             "可用 --device-index 指定其他实例，或分别启动多个任务。"
         )
     device = devices[0]
@@ -1866,7 +2031,7 @@ def main() -> int:
                             automation.fill_and_send(question)
                             sent = True
                             question_sent_at = beijing_now()
-                            logger.info("MuMu 发送和消息气泡校验完成。")
+                            logger.info("逍遥 App 发送和消息气泡校验完成。")
                         except Exception:
                             try:
                                 _source, root = automation.source_root()

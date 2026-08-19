@@ -125,7 +125,7 @@ class QuestionDialog(tk.Toplevel):
 class DoubaoMuMuControlPanel:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("豆包 MuMu 批量提问与定时控制台")
+        self.root.title("豆包逍遥模拟器批量提问与定时控制台")
         self.root.geometry("1180x760")
         self.root.minsize(980, 700)
         self.events: queue.Queue[Any] = queue.Queue()
@@ -159,7 +159,7 @@ class DoubaoMuMuControlPanel:
         self.web_account_var = tk.StringVar(value="未检测")
         self.status_var = tk.StringVar(value="就绪")
         self.readiness_var = tk.StringVar(
-            value="正在检查 MuMu、网页登录和账号一致性……"
+            value="正在检查逍遥模拟器、网页登录和账号一致性……"
         )
         self.question_mode_var = tk.StringVar(value="interleaved")
         self.device_index_var = tk.StringVar(value="")
@@ -193,8 +193,9 @@ class DoubaoMuMuControlPanel:
         self.root.after(200, self.drain_events)
         self.root.after(1000, self.refresh_process_status)
         self.root.after(1000, self.poll_job_log)
-        # Open one isolated web session for every running MuMu first.  Account
-        # validation is intentionally manual so the user has time to log in.
+        # Open one isolated web session for every running emulator first.
+        # A background validation runs after the browsers are ready; users can
+        # still click the button after changing a login.
         self.root.after(700, self.prepare_browser_sessions)
         self.root.after(1200, self.refresh_schedule_status)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -210,7 +211,7 @@ class DoubaoMuMuControlPanel:
 
         ttk.Label(
             outer,
-            text="豆包 MuMu 批量提问与定时控制台",
+            text="豆包逍遥模拟器批量提问与定时控制台",
             style="Title.TLabel",
         ).pack(anchor="w")
         ttk.Label(
@@ -226,7 +227,7 @@ class DoubaoMuMuControlPanel:
         identity.pack(fill=tk.X)
         identity.columnconfigure(1, weight=1)
         identity.columnconfigure(3, weight=1)
-        ttk.Label(identity, text="MuMu 设备").grid(row=0, column=0, sticky="w")
+        ttk.Label(identity, text="逍遥模拟器设备").grid(row=0, column=0, sticky="w")
         ttk.Label(identity, textvariable=self.device_var).grid(
             row=0,
             column=1,
@@ -239,7 +240,7 @@ class DoubaoMuMuControlPanel:
             textvariable=self.status_var,
             style="Status.TLabel",
         ).grid(row=0, column=3, sticky="w", padx=(8, 20))
-        ttk.Label(identity, text="MuMu 账号").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(identity, text="逍遥模拟器账号").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(identity, textvariable=self.mobile_account_var).grid(
             row=1,
             column=1,
@@ -255,7 +256,7 @@ class DoubaoMuMuControlPanel:
             padx=(8, 20),
             pady=(8, 0),
         )
-        ttk.Label(identity, text="MuMu 实例编号").grid(
+        ttk.Label(identity, text="逍遥实例编号").grid(
             row=0,
             column=4,
             sticky="e",
@@ -618,7 +619,7 @@ class DoubaoMuMuControlPanel:
         header.pack(fill=tk.X, pady=(0, 9))
         ttk.Label(
             header,
-            text="豆包 MuMu 批量提问控制台",
+            text="豆包逍遥模拟器批量提问控制台",
             style="Title.TLabel",
         ).pack(side=tk.LEFT, anchor="w")
         tk.Label(
@@ -669,9 +670,9 @@ class DoubaoMuMuControlPanel:
             selectmode="none",
         )
         for column, title, width, anchor in (
-            ("instance", "MuMu 实例", 90, tk.CENTER),
+            ("instance", "逍遥实例", 90, tk.CENTER),
             ("device", "设备地址", 190, tk.W),
-            ("mobile", "MuMu 手机账号", 275, tk.W),
+            ("mobile", "逍遥豆包账号", 275, tk.W),
             ("web", "对应网页账号 / Chrome", 310, tk.W),
             ("state", "匹配状态", 145, tk.CENTER),
         ):
@@ -1137,10 +1138,10 @@ class DoubaoMuMuControlPanel:
             return
         self.probe_running = True
         self.probe_button.configure(state=tk.DISABLED)
-        self.status_var.set("正在按 MuMu 数量打开网页")
+        self.status_var.set("正在按逍遥实例数量打开网页")
         self.set_readiness(
             False,
-            "正在识别已启动的 MuMu，并为每个实例打开独立 Chrome……",
+            "正在识别已启动的逍遥模拟器，并为每个实例打开独立 Chrome……",
             state_key="opening_browsers",
         )
         requested = self.device_index_var.get().strip() or None
@@ -1245,7 +1246,7 @@ class DoubaoMuMuControlPanel:
             self.prepared_cdp_ports[str(index)] = int(port)
 
         if not result.get("ok"):
-            self.device_var.set("未检测到已启动的 MuMu")
+            self.device_var.set("未检测到已启动的逍遥模拟器")
             self.mobile_account_var.set("等待手动检测")
             self.web_account_var.set("尚未打开")
             self.show_account_mappings([])
@@ -1287,11 +1288,12 @@ class DoubaoMuMuControlPanel:
         self.set_readiness(
             False,
             (
-                f"已为 {len(devices)} 个 MuMu 实例打开 {len(devices)} 个独立 Chrome。"
+                f"已为 {len(devices)} 个逍遥实例打开 {len(devices)} 个独立 Chrome。"
                 "请分别登录对应账号，完成后点击“重新检测账号”。"
             ),
             state_key="waiting_manual_account_check",
         )
+        self.root.after(250, lambda: self.begin_probe(manual=False))
 
     def drain_events(self) -> None:
         try:
@@ -1781,11 +1783,11 @@ class DoubaoMuMuControlPanel:
                 "ok": False,
                 "manual": manual,
                 "state": "mumu_not_ready",
-                "device": "未检测到已启动的 MuMu",
-                "mobile": "MuMu 端未就绪",
-                "web": "等待 MuMu 端",
+                "device": "未检测到已启动的逍遥模拟器",
+                "mobile": "逍遥端未就绪",
+                "web": "等待逍遥端",
                 "message": (
-                    "MuMu 端未就绪：请启动 MuMu 模拟器，打开豆包 App。"
+                    "逍遥端未就绪：请启动逍遥模拟器，打开豆包 App。"
                 ),
                 "error": str(exc),
             }
@@ -1802,7 +1804,7 @@ class DoubaoMuMuControlPanel:
                         "ok": False,
                         "manual": manual,
                         "state": "grabber_not_ready",
-                        "device": f"已发现 {len(devices)} 台 MuMu",
+                        "device": f"已发现 {len(devices)} 台逍遥模拟器",
                         "mobile": "等待网页抓取模块",
                         "web": "抓取模块加载失败",
                         "message": "网页抓取模块加载失败，程序会自动重试。",
@@ -1840,7 +1842,7 @@ class DoubaoMuMuControlPanel:
                     error = str(exc)
                     actually_logged_out = (
                         "账号数据库中没有有效 UID" in error
-                        or "MuMu 豆包尚未登录" in error
+                        or "模拟器中的豆包尚未登录" in error
                     )
                     instance_results.append(
                         {
@@ -1854,12 +1856,12 @@ class DoubaoMuMuControlPanel:
                             ),
                             "mobile": "未登录" if actually_logged_out else "检测失败",
                             "web": (
-                                "等待 MuMu 端登录"
+                                "等待逍遥端登录"
                                 if actually_logged_out
                                 else "等待 ADB 自动恢复"
                             ),
                             "message": (
-                                f"实例 {index} 的 MuMu 端未登录："
+                                f"实例 {index} 的逍遥端未登录："
                                 "请在该模拟器的豆包 App 登录账号。"
                                 if actually_logged_out
                                 else f"实例 {index} 的 ADB/账号数据库检测失败：{error}"
@@ -1937,7 +1939,7 @@ class DoubaoMuMuControlPanel:
                     web_text = f"未登录 / CDP {port}"
                     message = (
                         f"实例 {index} 的网页端未登录：请在对应调试 Chrome "
-                        f"登录 MuMu UID {pipeline.mask_uid(account['uid'])}。"
+                        f"登录逍遥豆包 UID {pipeline.mask_uid(account['uid'])}。"
                     )
                 elif (
                     str(identity.get("uid") or "") == account["uid"]
@@ -1955,7 +1957,7 @@ class DoubaoMuMuControlPanel:
                         f" / CDP {port}"
                     )
                     message = (
-                        f"实例 {index} 网页账号不一致：请切换为 MuMu UID "
+                        f"实例 {index} 网页账号不一致：请切换为逍遥豆包 UID "
                         f"{pipeline.mask_uid(account['uid'])}。"
                     )
                 instance_results.append(
@@ -2114,7 +2116,7 @@ class DoubaoMuMuControlPanel:
             messagebox.showwarning(
                 "尚未准备完成",
                 self.readiness_var.get()
-                + "\n\nMuMu 端和网页端都登录且数字 UID 完全一致后，"
+                + "\n\n逍遥端和网页端都登录且数字 UID 完全一致后，"
                 "按钮才会变为绿色。",
             )
             return

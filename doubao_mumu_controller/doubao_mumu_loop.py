@@ -40,6 +40,9 @@ ADB_CANDIDATES = [
     / "adb.exe",
     BASE_DIR / "portable_runtime" / "platform-tools" / "adb.exe",
     Path(r"C:\ProgramData\ShadowBot\support_x64\mobile\AndroidSDK\platform-tools\adb.exe"),
+    Path(r"C:\Program Files\Microvirt\MEmu\adb.exe"),
+    Path(r"C:\Program Files (x86)\Microvirt\MEmu\adb.exe"),
+    Path(r"D:\Program Files\Microvirt\MEmu\adb.exe"),
     Path(r"C:\Program Files\Netease\MuMu\nx_device\15.0\shell\adb.exe"),
     Path(r"C:\Program Files\Netease\MuMu\nx_main\adb.exe"),
 ]
@@ -77,6 +80,9 @@ ANDROID_SDK_CANDIDATES = [
     Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk",
 ]
 MUMU_SERIAL_CANDIDATES = [
+    "127.0.0.1:21503",
+    "127.0.0.1:21513",
+    "127.0.0.1:21523",
     "127.0.0.1:5555",
     "127.0.0.1:7555",
     "127.0.0.1:16384",
@@ -321,7 +327,7 @@ class AdbController:
                         ).stdout.strip()
                         self.serial = serial
                         self.logger.info(
-                            "已连接 MuMu：serial=%s model=%s %s",
+                            "已连接安卓模拟器：serial=%s model=%s %s",
                             serial,
                             model_result.stdout.strip() or "?",
                             size or "",
@@ -342,7 +348,7 @@ class AdbController:
             errors.append(
                 f"{serial}: {((state.stderr or state.stdout) if state else '').strip() or 'offline'}"
             )
-        raise AutomationError("无法连接 MuMu ADB；" + " | ".join(errors))
+        raise AutomationError("无法连接安卓模拟器 ADB；" + " | ".join(errors))
 
     def ensure_connected(self) -> str:
         if self.serial:
@@ -592,7 +598,7 @@ class AppiumClient:
                 "platformName": "Android",
                 "automationName": "UiAutomator2",
                 "udid": self.adb.serial,
-                "deviceName": "MuMu",
+                "deviceName": "AndroidEmulator",
                 "systemPort": system_port,
                 "newCommandTimeout": 0,
                 "noReset": True,

@@ -96,11 +96,11 @@ def environment_check() -> dict[str, object]:
         None,
     )
     if mumu_manager is None:
-        raise RuntimeError("找不到 MuMuManager.exe，请先安装并启动 MuMu。")
+        raise RuntimeError("找不到逍遥模拟器管理程序 memuc.exe，请确认逍遥已完整安装。")
     if chrome is None:
         raise RuntimeError("找不到 Google Chrome。")
     if adb is None:
-        raise RuntimeError("找不到 ADB；请确认 MuMu 安装完整。")
+        raise RuntimeError("找不到 ADB；请确认安卓模拟器安装完整。")
     if appium_node is None or appium_main is None:
         global_appium = resolve_global_appium()
         if global_appium is None:
@@ -229,7 +229,7 @@ def main() -> int:
             creationflags=CREATE_NO_WINDOW,
         )
         log(
-            "操作面板已启动；程序会按 MuMu 数量打开独立 Chrome。"
+            "操作面板已启动；程序会按逍遥实例数量打开独立 Chrome。"
             "请分别登录后点击“重新检测账号”，仅在全部 UID 一致时"
             "启用绿色开始按钮。"
         )
@@ -238,7 +238,7 @@ def main() -> int:
         log("开始仅豆包采集并回传；不启动本地数据面板。")
     else:
         log(
-            "开始整批任务。程序将自动识别 MuMu 账号并启动调试 Chrome，"
+            "开始整批任务。程序将自动识别逍遥豆包账号并启动调试 Chrome，"
             "无需手动安装插件，抓取器会自动注入网页；"
             "若网页未登录同一账号，请在自动打开的 Chrome 中完成登录。"
         )

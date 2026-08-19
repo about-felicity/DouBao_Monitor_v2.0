@@ -246,7 +246,7 @@ def selected_devices(config: dict[str, Any]) -> list[dict[str, Any]]:
     missing = sorted(requested - {str(item["index"]) for item in selected})
     if missing:
         raise JobConfigError(
-            "以下 MuMu 实例未启动或不存在：" + "、".join(missing)
+            "以下模拟器实例未启动或不存在：" + "、".join(missing)
         )
     return selected
 
@@ -276,7 +276,7 @@ def run(config_path: Path, dry_run: bool) -> int:
 
     lock = JobLock()
     if not dry_run and not lock.acquire():
-        log("SKIP 已有豆包 MuMu 整体任务在运行，本次定时触发不重叠执行。")
+        log("SKIP 已有豆包逍遥模拟器整体任务在运行，本次定时触发不重叠执行。")
         return 0
     queue_file: Path | None = None
     try:
@@ -315,7 +315,7 @@ def run(config_path: Path, dry_run: bool) -> int:
             return 0
         log(
             "START "
-            f"{len(devices)} 个 MuMu 实例并行；每个实例 "
+            f"{len(devices)} 个逍遥实例并行；每个实例 "
             f"{len(questions)} 个问题，共 {len(schedule)} 轮，"
             f"模式={'交叉' if mode == 'interleaved' else '顺序'}。"
         )
@@ -380,7 +380,7 @@ def run(config_path: Path, dry_run: bool) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="执行面板保存的豆包 MuMu 问题计划。")
+    parser = argparse.ArgumentParser(description="执行面板保存的豆包逍遥模拟器问题计划。")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
