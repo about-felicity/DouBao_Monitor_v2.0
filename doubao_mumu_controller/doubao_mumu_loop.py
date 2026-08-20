@@ -103,6 +103,14 @@ SIDEBAR_NEW_CHAT_ID = "com.larus.nova:id/side_bar_create_conversation"
 MESSAGE_LIST_ID = "com.larus.nova:id/message_list"
 CREATE_NEW_CHAT_TEXT = "创建新对话"
 NEW_CHAT_DESCRIPTIONS = ("创建新对话", "新建对话", "开始新对话")
+CRASH_DIALOG_MARKERS = (
+    "屡次停止运行",
+    "已停止运行",
+    "不断停止运行",
+    "keeps stopping",
+    "has stopped",
+)
+DEFAULT_HEAP_RESTART_MB = 190
 
 
 class AutomationError(RuntimeError):
@@ -114,6 +122,10 @@ class SessionLost(AutomationError):
 
 
 class ManualActionRequired(AutomationError):
+    pass
+
+
+class AppCrashed(AutomationError):
     pass
 
 
@@ -398,6 +410,19 @@ class AdbController:
         time.sleep(0.8)
         self.bring_doubao_foreground()
 
+    def doubao_pid(self) -> str:
+        return self.shell("pidof", PACKAGE, timeout=8, check=False).strip()
+
+    def doubao_heap_alloc_kb(self) -> int | None:
+        output = self.shell(
+            "dumpsys",
+            "meminfo",
+            PACKAGE,
+            timeout=15,
+            check=False,
+        )
+        return parse_dalvik_heap_alloc_kb(output)
+
     def screenshot_bytes(self) -> bytes:
         self.ensure_connected()
         assert self.serial
@@ -512,7 +537,7 @@ class AppiumClient:
                 "--base-path",
                 base_path,
                 "--log-level",
-                "info",
+                "warn",
             ]
         else:
             global_appium = resolve_global_appium()
@@ -530,7 +555,7 @@ class AppiumClient:
                 "--base-path",
                 base_path,
                 "--log-level",
-                "info",
+                "warn",
             ]
         log_path = BASE_DIR / "doubao_mumu_appium.log"
         log_handle = open(log_path, "a", encoding="utf-8")
@@ -847,6 +872,23 @@ def all_texts(root: ET.Element) -> list[str]:
     ]
 
 
+def has_app_crash_dialog(root: ET.Element) -> bool:
+    visible = " ".join(all_texts(root)).casefold()
+    return any(marker.casefold() in visible for marker in CRASH_DIALOG_MARKERS)
+
+
+def parse_dalvik_heap_alloc_kb(meminfo: str) -> int | None:
+    """Read the Java heap allocation from Android's dumpsys meminfo table."""
+    for line in str(meminfo or "").splitlines():
+        if not line.strip().startswith("Dalvik Heap"):
+            continue
+        values = [int(value) for value in re.findall(r"\d+", line)]
+        # Columns end with Heap Size, Heap Alloc and Heap Free.
+        if len(values) >= 3:
+            return values[-2]
+    return None
+
+
 def message_texts(root: ET.Element) -> list[str]:
     message_list = find_node_by_id(root, MESSAGE_LIST_ID)
     if message_list is None:
@@ -928,10 +970,47 @@ class DoubaoAutomation:
         self.adb = adb
         self.appium = appium
         self.diagnostics_dir = diagnostics_dir
+        try:
+            configured_threshold = int(
+                os.environ.get(
+                    "DOUBAO_APP_HEAP_RESTART_MB",
+                    str(DEFAULT_HEAP_RESTART_MB),
+                )
+            )
+        except ValueError:
+            configured_threshold = DEFAULT_HEAP_RESTART_MB
+        self.heap_restart_kb = max(128, configured_threshold) * 1024
+        self.last_memory_restart = 0.0
 
     def source_root(self) -> tuple[str, ET.Element]:
         source = self.appium.source()
-        return source, parse_xml(source)
+        root = parse_xml(source)
+        if has_app_crash_dialog(root):
+            raise AppCrashed("检测到豆包停止运行弹窗")
+        return source, root
+
+    def recover_before_question(self) -> None:
+        """Restart a dead or near-OOM Doubao process before sending."""
+        pid = self.adb.doubao_pid()
+        if not pid:
+            self.logger.warning("豆包进程不存在，正在自动重新启动。")
+            self.adb.force_stop_and_restart()
+            self.last_memory_restart = time.monotonic()
+            return
+        heap_alloc_kb = self.adb.doubao_heap_alloc_kb()
+        if (
+            heap_alloc_kb is not None
+            and heap_alloc_kb >= self.heap_restart_kb
+            and time.monotonic() - self.last_memory_restart >= 60
+        ):
+            self.logger.warning(
+                "豆包 Java 堆已达 %.1fMB（保护阈值 %.1fMB），"
+                "发送前主动重启以避免 OOM 崩溃。",
+                heap_alloc_kb / 1024,
+                self.heap_restart_kb / 1024,
+            )
+            self.adb.force_stop_and_restart()
+            self.last_memory_restart = time.monotonic()
 
     def wait_until(
         self,
@@ -954,8 +1033,15 @@ class DoubaoAutomation:
 
     def ensure_doubao_ready(self) -> None:
         self.adb.ensure_connected()
+        self.recover_before_question()
         self.adb.bring_doubao_foreground()
         self.appium.ensure_session()
+        source = self.appium.source()
+        initial_root = parse_xml(source)
+        if has_app_crash_dialog(initial_root):
+            self.logger.warning("检测到豆包崩溃弹窗，正在关闭并恢复 App。")
+            self.adb.force_stop_and_restart()
+            self.last_memory_restart = time.monotonic()
         _, root = self.wait_until(
             lambda item: page_name(item) in {
                 "chat",

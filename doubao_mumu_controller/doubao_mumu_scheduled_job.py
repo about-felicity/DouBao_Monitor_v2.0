@@ -22,6 +22,9 @@ DEFAULT_CONFIG = BASE_DIR / "doubao_mumu_panel_config.json"
 RUNTIME_DIR = BASE_DIR / "runtime"
 JOB_LOG = BASE_DIR / "doubao_mumu_scheduled_job.log"
 JOB_LOCK = BASE_DIR / ".scheduled_job.lock"
+JOB_LOG_MAX_BYTES = 8 * 1024 * 1024
+JOB_LOG_BACKUPS = 3
+JOB_LOG_WRITE_LOCK = threading.Lock()
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 
@@ -64,13 +67,32 @@ class JobLock:
             self.handle = None
 
 
+def append_job_log(line: str) -> None:
+    JOB_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with JOB_LOG_WRITE_LOCK:
+        encoded_size = len((line + "\n").encode("utf-8"))
+        if (
+            JOB_LOG.exists()
+            and JOB_LOG.stat().st_size + encoded_size > JOB_LOG_MAX_BYTES
+        ):
+            oldest = JOB_LOG.with_name(f"{JOB_LOG.name}.{JOB_LOG_BACKUPS}")
+            oldest.unlink(missing_ok=True)
+            for index in range(JOB_LOG_BACKUPS - 1, 0, -1):
+                source = JOB_LOG.with_name(f"{JOB_LOG.name}.{index}")
+                if source.exists():
+                    source.replace(
+                        JOB_LOG.with_name(f"{JOB_LOG.name}.{index + 1}")
+                    )
+            JOB_LOG.replace(JOB_LOG.with_name(f"{JOB_LOG.name}.1"))
+        with JOB_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
 def log(message: str) -> None:
     stamp = datetime.now(BEIJING_TZ).isoformat(sep=" ", timespec="seconds")
     line = f"{stamp} {message}"
     print(line, flush=True)
-    JOB_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with JOB_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+    append_job_log(line)
 
 
 def positive_number(
@@ -331,8 +353,7 @@ def run(config_path: Path, dry_run: bool) -> int:
                 prefixed = f"[实例 {instance_index}] {line}"
                 with output_lock:
                     print(prefixed, end="", flush=True)
-                    with JOB_LOG.open("a", encoding="utf-8") as job_log:
-                        job_log.write(prefixed)
+                    append_job_log(prefixed.rstrip("\r\n"))
 
         threads = []
         for item in commands:
