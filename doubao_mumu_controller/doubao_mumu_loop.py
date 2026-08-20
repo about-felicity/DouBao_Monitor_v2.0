@@ -107,8 +107,13 @@ CRASH_DIALOG_MARKERS = (
     "屡次停止运行",
     "已停止运行",
     "不断停止运行",
+    "没有响应",
+    "无响应",
     "keeps stopping",
     "has stopped",
+    "isn't responding",
+    "is not responding",
+    "not responding",
 )
 DEFAULT_HEAP_RESTART_MB = 190
 
@@ -422,6 +427,21 @@ class AdbController:
             check=False,
         )
         return parse_dalvik_heap_alloc_kb(output)
+
+    def doubao_not_responding(self) -> bool:
+        """Detect Android's ANR window without relying on Appium/UI access."""
+        output = self.shell(
+            "dumpsys",
+            "window",
+            "windows",
+            timeout=15,
+            check=False,
+        )
+        normalized = str(output or "").casefold()
+        return (
+            PACKAGE.casefold() in normalized
+            and "application not responding" in normalized
+        )
 
     def screenshot_bytes(self) -> bytes:
         self.ensure_connected()
@@ -986,11 +1006,18 @@ class DoubaoAutomation:
         source = self.appium.source()
         root = parse_xml(source)
         if has_app_crash_dialog(root):
-            raise AppCrashed("检测到豆包停止运行弹窗")
+            raise AppCrashed("检测到豆包崩溃或没有响应弹窗")
         return source, root
 
     def recover_before_question(self) -> None:
         """Restart a dead or near-OOM Doubao process before sending."""
+        if self.adb.doubao_not_responding():
+            self.logger.warning(
+                "检测到豆包没有响应（ANR），正在关闭应用并自动重启。"
+            )
+            self.adb.force_stop_and_restart()
+            self.last_memory_restart = time.monotonic()
+            return
         pid = self.adb.doubao_pid()
         if not pid:
             self.logger.warning("豆包进程不存在，正在自动重新启动。")

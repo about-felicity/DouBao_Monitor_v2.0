@@ -55,8 +55,9 @@ class FakeAdb:
 
 
 class MemoryPressureAdb(FakeAdb):
-    def __init__(self, heap_kb):
+    def __init__(self, heap_kb, *, not_responding=False):
         self.heap_kb = heap_kb
+        self.not_responding = not_responding
         self.restarts = 0
         self.shell_calls = []
 
@@ -70,6 +71,9 @@ class MemoryPressureAdb(FakeAdb):
     def doubao_heap_alloc_kb(self):
         return self.heap_kb
 
+    def doubao_not_responding(self):
+        return self.not_responding
+
     def force_stop_and_restart(self):
         self.restarts += 1
 
@@ -79,6 +83,15 @@ class NewChatNavigationTests(unittest.TestCase):
         root = parse_xml(
             '<?xml version="1.0"?><hierarchy>'
             '<node text="豆包屡次停止运行" />'
+            '<node text="关闭应用" />'
+            '</hierarchy>'
+        )
+        self.assertTrue(has_app_crash_dialog(root))
+
+    def test_detects_android_anr_dialog(self):
+        root = parse_xml(
+            '<?xml version="1.0"?><hierarchy>'
+            '<node text="豆包没有响应" />'
             '<node text="关闭应用" />'
             '</hierarchy>'
         )
@@ -117,6 +130,19 @@ class NewChatNavigationTests(unittest.TestCase):
         automation.recover_before_question()
 
         self.assertEqual(adb.restarts, 0)
+
+    def test_restarts_doubao_when_android_reports_anr(self):
+        adb = MemoryPressureAdb(150 * 1024, not_responding=True)
+        automation = DoubaoAutomation(
+            logging.getLogger("test-anr-guard"),
+            adb,
+            FakeAppium([]),
+            Path("."),
+        )
+
+        automation.recover_before_question()
+
+        self.assertEqual(adb.restarts, 1)
 
     def test_releases_app_heap_after_completed_round(self):
         adb = MemoryPressureAdb(150 * 1024)
