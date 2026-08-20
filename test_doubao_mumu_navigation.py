@@ -58,6 +58,11 @@ class MemoryPressureAdb(FakeAdb):
     def __init__(self, heap_kb):
         self.heap_kb = heap_kb
         self.restarts = 0
+        self.shell_calls = []
+
+    def shell(self, *args, **kwargs):
+        self.shell_calls.append(args)
+        return ""
 
     def doubao_pid(self):
         return "1234"
@@ -112,6 +117,19 @@ class NewChatNavigationTests(unittest.TestCase):
         automation.recover_before_question()
 
         self.assertEqual(adb.restarts, 0)
+
+    def test_releases_app_heap_after_completed_round(self):
+        adb = MemoryPressureAdb(150 * 1024)
+        automation = DoubaoAutomation(
+            logging.getLogger("test-memory-release"),
+            adb,
+            FakeAppium([]),
+            Path("."),
+        )
+
+        automation.release_memory_after_round()
+
+        self.assertIn(("am", "force-stop", "com.larus.nova"), adb.shell_calls)
 
     def test_sidebar_takes_precedence_over_chat_root(self):
         root = parse_xml(page(CHAT_ROOT_ID, SIDEBAR_NEW_CHAT_ID))

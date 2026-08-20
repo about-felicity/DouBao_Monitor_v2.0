@@ -1915,6 +1915,11 @@ def parse_args() -> argparse.Namespace:
         help="单轮最大重试；0 表示持续恢复，不因临时异常退出。",
     )
     parser.add_argument(
+        "--keep-app-running-between-rounds",
+        action="store_true",
+        help="调试选项：成功轮次之间不关闭豆包；默认关闭以释放 Java 堆。",
+    )
+    parser.add_argument(
         "--log",
         default=str(BASE_DIR / "doubao_mumu_web_pipeline.log"),
     )
@@ -2104,6 +2109,14 @@ def main() -> int:
                         record["elapsed_seconds"],
                     )
                     has_next = args.forever or completed < target_rounds
+                    if has_next and not args.keep_app_running_between_rounds:
+                        try:
+                            automation.release_memory_after_round()
+                        except Exception as exc:
+                            # The capture is already durable.  Memory cleanup
+                            # is best-effort and must never turn success into a
+                            # duplicate retry of the same question.
+                            logger.warning("本轮完成后的内存释放失败，将继续：%s", exc)
                     if has_next and args.round_delay_max > 0:
                         delay_low = max(0.0, args.round_delay_min)
                         delay_high = max(delay_low, args.round_delay_max)

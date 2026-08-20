@@ -1012,6 +1012,12 @@ class DoubaoAutomation:
             self.adb.force_stop_and_restart()
             self.last_memory_restart = time.monotonic()
 
+    def release_memory_after_round(self) -> None:
+        """Stop Doubao after durable capture so Android releases its heap."""
+        self.logger.info("本轮数据已落位，关闭豆包进程释放 Java 堆。")
+        self.adb.shell("am", "force-stop", PACKAGE, timeout=10, check=False)
+        self.last_memory_restart = time.monotonic()
+
     def wait_until(
         self,
         predicate: Callable[[ET.Element], bool],
