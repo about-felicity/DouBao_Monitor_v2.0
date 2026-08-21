@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from doubao_mumu_controller.doubao_mumu_loop import AppiumClient
+from doubao_mumu_controller.doubao_mumu_loop import AppiumClient, AutomationError
 from doubao_mumu_controller.doubao_mumu_web_pipeline import (
     stale_appium_sessions_for_cleanup,
 )
@@ -76,6 +76,35 @@ class AppiumClientReleaseTests(unittest.TestCase):
             "session/session-to-release",
             timeout=8,
             allow_error=True,
+        )
+
+    def test_failed_health_check_deletes_old_session_before_replacement(self):
+        client = AppiumClient.__new__(AppiumClient)
+        client.session_id = "stale-session"
+        client.logger = Mock()
+        client.adb = Mock()
+        client.ensure_server = Mock()
+        client._create_session = Mock(return_value="replacement-session")
+        client._existing_session = Mock(return_value=None)
+        calls = []
+
+        def request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if method == "GET":
+                raise AutomationError("stale")
+            return {"value": None}
+
+        client._json_request = request
+
+        self.assertEqual(client.ensure_session(), "replacement-session")
+        self.assertEqual(client.session_id, "replacement-session")
+        self.assertIn(
+            (
+                "DELETE",
+                "session/stale-session",
+                {"timeout": 8, "allow_error": True},
+            ),
+            calls,
         )
 
 

@@ -754,7 +754,7 @@ class AppiumClient:
                 )
                 return self.session_id
             except AutomationError:
-                self.session_id = None
+                self.invalidate_session()
 
         if not force_new:
             existing = self._existing_session()
@@ -769,7 +769,7 @@ class AppiumClient:
                     self.logger.info("复用 Appium 会话：%s", existing)
                     return existing
                 except AutomationError:
-                    self.session_id = None
+                    self.invalidate_session()
 
         self.session_id = self._create_session()
         return self.session_id
