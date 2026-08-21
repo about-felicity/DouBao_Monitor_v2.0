@@ -443,6 +443,23 @@ class AdbController:
             and "application not responding" in normalized
         )
 
+    def doubao_system_failure(self) -> str | None:
+        """Return the visible Android failure type without using Appium."""
+        output = self.shell(
+            "dumpsys",
+            "window",
+            "windows",
+            timeout=15,
+            check=False,
+        )
+        normalized = str(output or "").casefold()
+        package = PACKAGE.casefold()
+        if f"application not responding: {package}" in normalized:
+            return "ANR（没有响应）"
+        if f"application error: {package}" in normalized:
+            return "崩溃（屡次停止运行）"
+        return None
+
     def screenshot_bytes(self) -> bytes:
         self.ensure_connected()
         assert self.serial
@@ -1011,9 +1028,11 @@ class DoubaoAutomation:
 
     def recover_before_question(self) -> None:
         """Restart a dead or near-OOM Doubao process before sending."""
-        if self.adb.doubao_not_responding():
+        failure = self.adb.doubao_system_failure()
+        if failure:
             self.logger.warning(
-                "检测到豆包没有响应（ANR），正在关闭应用并自动重启。"
+                "检测到豆包%s，正在关闭应用并自动重启。",
+                failure,
             )
             self.adb.force_stop_and_restart()
             self.last_memory_restart = time.monotonic()
