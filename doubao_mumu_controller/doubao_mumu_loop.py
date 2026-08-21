@@ -415,6 +415,24 @@ class AdbController:
         time.sleep(0.8)
         self.bring_doubao_foreground()
 
+    def clear_doubao_cache_and_restart(self) -> None:
+        """Clear disposable app caches while preserving accounts and databases."""
+        data_dir = f"/data/user/0/{PACKAGE}"
+        self.logger.warning("连续崩溃，清理豆包临时缓存后重启（账号数据保留）。")
+        self.shell("am", "force-stop", PACKAGE, timeout=10, check=False)
+        for cache_dir in (f"{data_dir}/cache", f"{data_dir}/code_cache"):
+            self.shell(
+                "find",
+                cache_dir,
+                "-mindepth",
+                "1",
+                "-delete",
+                timeout=60,
+                check=False,
+            )
+        time.sleep(0.8)
+        self.bring_doubao_foreground()
+
     def doubao_pid(self) -> str:
         return self.shell("pidof", PACKAGE, timeout=8, check=False).strip()
 
@@ -1018,6 +1036,7 @@ class DoubaoAutomation:
             configured_threshold = DEFAULT_HEAP_RESTART_MB
         self.heap_restart_kb = max(128, configured_threshold) * 1024
         self.last_memory_restart = 0.0
+        self.system_failure_times: list[float] = []
 
     def source_root(self) -> tuple[str, ET.Element]:
         source = self.appium.source()
@@ -1030,12 +1049,21 @@ class DoubaoAutomation:
         """Restart a dead or near-OOM Doubao process before sending."""
         failure = self.adb.doubao_system_failure()
         if failure:
+            now = time.monotonic()
+            self.system_failure_times = [
+                seen for seen in self.system_failure_times if now - seen <= 180
+            ]
+            self.system_failure_times.append(now)
             self.logger.warning(
                 "检测到豆包%s，正在关闭应用并自动重启。",
                 failure,
             )
-            self.adb.force_stop_and_restart()
-            self.last_memory_restart = time.monotonic()
+            if len(self.system_failure_times) >= 3:
+                self.adb.clear_doubao_cache_and_restart()
+                self.system_failure_times.clear()
+            else:
+                self.adb.force_stop_and_restart()
+            self.last_memory_restart = now
             return
         pid = self.adb.doubao_pid()
         if not pid:

@@ -59,6 +59,7 @@ class MemoryPressureAdb(FakeAdb):
         self.heap_kb = heap_kb
         self.system_failure = system_failure
         self.restarts = 0
+        self.cache_clears = 0
         self.shell_calls = []
 
     def shell(self, *args, **kwargs):
@@ -76,6 +77,9 @@ class MemoryPressureAdb(FakeAdb):
 
     def force_stop_and_restart(self):
         self.restarts += 1
+
+    def clear_doubao_cache_and_restart(self):
+        self.cache_clears += 1
 
 
 class NewChatNavigationTests(unittest.TestCase):
@@ -162,6 +166,24 @@ class NewChatNavigationTests(unittest.TestCase):
         automation.recover_before_question()
 
         self.assertEqual(adb.restarts, 1)
+
+    def test_clears_only_cache_after_three_rapid_system_failures(self):
+        adb = MemoryPressureAdb(
+            150 * 1024,
+            system_failure="崩溃（屡次停止运行）",
+        )
+        automation = DoubaoAutomation(
+            logging.getLogger("test-crash-loop-guard"),
+            adb,
+            FakeAppium([]),
+            Path("."),
+        )
+
+        for _ in range(3):
+            automation.recover_before_question()
+
+        self.assertEqual(adb.restarts, 2)
+        self.assertEqual(adb.cache_clears, 1)
 
     def test_releases_app_heap_after_completed_round(self):
         adb = MemoryPressureAdb(150 * 1024)

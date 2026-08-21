@@ -57,6 +57,7 @@ def main() -> int:
     ]
     logger.info("看门程序启动：%s", ", ".join(args.serial))
     cooldown_until: dict[str, float] = {}
+    failure_times: dict[str, list[float]] = {}
     while True:
         for adb in controllers:
             serial = adb.requested_serial or "unknown"
@@ -65,12 +66,24 @@ def main() -> int:
             try:
                 failure = adb.doubao_system_failure()
                 if failure:
+                    now = time.monotonic()
+                    recent = [
+                        seen
+                        for seen in failure_times.get(serial, [])
+                        if now - seen <= 180
+                    ]
+                    recent.append(now)
+                    failure_times[serial] = recent
                     logger.warning(
                         "%s 检测到豆包%s，执行关闭并重启。",
                         serial,
                         failure,
                     )
-                    adb.force_stop_and_restart()
+                    if len(recent) >= 3:
+                        adb.clear_doubao_cache_and_restart()
+                        failure_times[serial] = []
+                    else:
+                        adb.force_stop_and_restart()
                     cooldown_until[serial] = time.monotonic() + 15
                     continue
                 if args.restart_missing and not adb.doubao_pid():
