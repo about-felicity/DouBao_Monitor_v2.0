@@ -103,6 +103,19 @@ class InvalidModelAnswer(PipelineError):
     """The model answered with an empty/error response; this round must be skipped."""
 
 
+def is_doubao_ui_thread_stuck(exc: BaseException) -> bool:
+    """Recognize Appium failures caused by Doubao's frozen accessibility UI."""
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "root accessibilitynodeinfo",
+            "active window is not constantly hogging the main ui thread",
+            "等待豆包页面超时（当前页面：unknown）",
+        )
+    )
+
+
 def configure_logging(path: Path, verbose: bool) -> logging.Logger:
     logger = logging.getLogger("doubao_mumu_web_pipeline")
     logger.handlers.clear()
@@ -2183,13 +2196,34 @@ def main() -> int:
                             "question_sent_at": question_sent_at,
                         },
                     )
+                    ui_thread_stuck = (
+                        not sent and is_doubao_ui_thread_stuck(exc)
+                    )
                     mobile_appium.invalidate_session()
-                    mobile_adb.serial = None
+                    # Every recovery must remain pinned to this pipeline's
+                    # emulator. Clearing the serial can make a multi-instance
+                    # ADB reconnect select the first device instead.
+                    mobile_adb.serial = device["serial"]
                     sync_stuck = (
                         sent
                         and isinstance(exc, PipelineError)
                         and "等待网页同步新会话超过" in str(exc)
                     )
+                    if ui_thread_stuck:
+                        logger.warning(
+                            "检测到豆包界面线程/无障碍服务卡死，"
+                            "立即强制关闭并重新启动本实例豆包。"
+                        )
+                        try:
+                            mobile_adb.force_stop_and_restart()
+                        except Exception as recovery_exc:
+                            logger.warning(
+                                "界面卡死后的豆包恢复失败，将继续重试：%s",
+                                recovery_exc,
+                            )
+                        sent = False
+                        baseline_hrefs = set()
+                        question_sent_at = ""
                     if sync_stuck:
                         logger.warning(
                             "手机回答或网页同步已卡死超过 %.0f 秒，"
@@ -2206,7 +2240,9 @@ def main() -> int:
                     if args.max_round_retries and attempt >= args.max_round_retries:
                         logger.error("本轮达到最大重试次数，安全结束任务。")
                         return 2
-                    if sync_stuck:
+                    if ui_thread_stuck:
+                        logger.warning("%.1f 秒后重新进入豆包并发送当前问题。", args.retry_delay)
+                    elif sync_stuck:
                         logger.warning("%.1f 秒后重新发送当前问题。", args.retry_delay)
                     else:
                         logger.warning(

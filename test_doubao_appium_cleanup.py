@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 from doubao_mumu_controller.doubao_mumu_loop import AppiumClient, AutomationError
 from doubao_mumu_controller.doubao_mumu_web_pipeline import (
+    is_doubao_ui_thread_stuck,
     stale_appium_sessions_for_cleanup,
 )
 
@@ -59,6 +60,19 @@ class AppiumCleanupSelectionTests(unittest.TestCase):
             ["newest", "middle"],
         )
         self.assertEqual(skipped, 1)
+
+    def test_accessibility_root_timeout_is_a_frozen_doubao_ui(self):
+        error = AutomationError(
+            "Timed out waiting for the root AccessibilityNodeInfo "
+            "in the active window; main UI thread"
+        )
+
+        self.assertTrue(is_doubao_ui_thread_stuck(error))
+        self.assertFalse(
+            is_doubao_ui_thread_stuck(
+                AutomationError("Chrome debug port is unavailable")
+            )
+        )
 
 
 class AppiumClientReleaseTests(unittest.TestCase):
