@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial", action="append", required=True)
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument(
+        "--restart-missing",
+        action="store_true",
+        help="Restart Doubao when its process disappears (for legacy running jobs).",
+    )
+    parser.add_argument(
         "--log",
         type=Path,
         default=BASE_DIR / "doubao_mumu_watchdog.log",
@@ -59,11 +64,19 @@ def main() -> int:
                 continue
             try:
                 failure = adb.doubao_system_failure()
-                if not failure:
+                if failure:
+                    logger.warning(
+                        "%s 检测到豆包%s，执行关闭并重启。",
+                        serial,
+                        failure,
+                    )
+                    adb.force_stop_and_restart()
+                    cooldown_until[serial] = time.monotonic() + 15
                     continue
-                logger.warning("%s 检测到豆包%s，执行关闭并重启。", serial, failure)
-                adb.force_stop_and_restart()
-                cooldown_until[serial] = time.monotonic() + 15
+                if args.restart_missing and not adb.doubao_pid():
+                    logger.warning("%s 豆包进程消失，正在自动拉起。", serial)
+                    adb.bring_doubao_foreground()
+                    cooldown_until[serial] = time.monotonic() + 10
             except Exception as exc:  # Keep protecting the other instances.
                 logger.warning("%s 检查失败：%s", serial, exc)
         time.sleep(max(2.0, args.interval))
