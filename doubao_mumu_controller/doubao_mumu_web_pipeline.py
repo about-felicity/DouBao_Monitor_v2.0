@@ -1871,6 +1871,12 @@ def parse_args() -> argparse.Namespace:
         help="UTF-8 问题文件，一行一个问题。",
     )
     parser.add_argument("--rounds", type=int, default=0, help="轮数；0 表示问题列表各一次。")
+    parser.add_argument(
+        "--start-round",
+        type=int,
+        default=0,
+        help="断点续跑：此前已成功完成的轮数；默认从第 1 轮开始。",
+    )
     parser.add_argument("--forever", action="store_true", help="循环运行问题列表。")
     parser.add_argument("--device-index", help="只控制指定模拟器实例编号。")
     parser.add_argument(
@@ -1940,6 +1946,10 @@ def main() -> int:
     logger = configure_logging(Path(args.log), args.verbose)
     questions = load_questions(args)
     target_rounds = args.rounds if args.rounds > 0 else len(questions)
+    if args.start_round < 0 or args.start_round > target_rounds:
+        raise PipelineError(
+            f"--start-round 必须在 0 到 {target_rounds} 之间。"
+        )
     devices = discover_mumu_instances(logger, args.device_index)
     if len(devices) > 1 and args.device_index is None:
         logger.warning(
@@ -1991,7 +2001,13 @@ def main() -> int:
             mobile_appium,
             Path(args.diagnostics_dir),
         )
-        completed = 0
+        completed = args.start_round
+        if completed:
+            logger.info(
+                "断点续跑：已保留前 %s 轮成功结果，将从第 %s 轮继续。",
+                completed,
+                completed + 1,
+            )
         while args.forever or completed < target_rounds:
             question = questions[completed % len(questions)]
             attempt = 0
@@ -2168,13 +2184,34 @@ def main() -> int:
                     )
                     mobile_appium.invalidate_session()
                     mobile_adb.serial = None
+                    sync_stuck = (
+                        sent
+                        and isinstance(exc, PipelineError)
+                        and "等待网页同步新会话超过" in str(exc)
+                    )
+                    if sync_stuck:
+                        logger.warning(
+                            "手机回答或网页同步已卡死超过 %.0f 秒，"
+                            "关闭豆包并在新对话重试本问题。",
+                            args.sync_timeout,
+                        )
+                        try:
+                            mobile_adb.force_stop_and_restart()
+                        except Exception as recovery_exc:
+                            logger.warning("卡死后的豆包恢复失败，将继续重试：%s", recovery_exc)
+                        sent = False
+                        baseline_hrefs = set()
+                        question_sent_at = ""
                     if args.max_round_retries and attempt >= args.max_round_retries:
                         logger.error("本轮达到最大重试次数，安全结束任务。")
                         return 2
-                    logger.warning(
-                        "%.1f 秒后自动恢复；已确认发送的问题不会重复发送。",
-                        args.retry_delay,
-                    )
+                    if sync_stuck:
+                        logger.warning("%.1f 秒后重新发送当前问题。", args.retry_delay)
+                    else:
+                        logger.warning(
+                            "%.1f 秒后自动恢复；已确认发送的问题不会重复发送。",
+                            args.retry_delay,
+                        )
                     time.sleep(args.retry_delay)
         logger.info("全部完成：%s 轮。", completed)
         return 0

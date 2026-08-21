@@ -411,14 +411,41 @@ class AdbController:
 
     def force_stop_and_restart(self) -> None:
         self.logger.warning("执行豆包前台恢复")
+        self.dismiss_doubao_failure_dialog()
         self.shell("am", "force-stop", PACKAGE, timeout=10, check=False)
         time.sleep(0.8)
         self.bring_doubao_foreground()
+
+    def dismiss_doubao_failure_dialog(self) -> bool:
+        """Dismiss MEmu Android 9's ANR/crash row before restarting the app."""
+        failure = self.doubao_system_failure()
+        if not failure:
+            return False
+        size_output = self.shell("wm", "size", timeout=10, check=False)
+        matches = re.findall(r"(\d+)x(\d+)", str(size_output or ""))
+        width, height = (720, 1280)
+        if matches:
+            width, height = map(int, matches[-1])
+        # Android 9's ANR dialog has Close app above Wait. The crash dialog
+        # has an extra App info row, so its Close app row is slightly lower.
+        y_ratio = 0.57 if failure.startswith("ANR") else 0.64
+        self.logger.warning("关闭豆包系统异常弹窗：%s", failure)
+        self.shell(
+            "input",
+            "tap",
+            str(max(1, int(width * 0.20))),
+            str(max(1, int(height * y_ratio))),
+            timeout=10,
+            check=False,
+        )
+        time.sleep(0.5)
+        return True
 
     def clear_doubao_cache_and_restart(self) -> None:
         """Clear disposable app caches while preserving accounts and databases."""
         data_dir = f"/data/user/0/{PACKAGE}"
         self.logger.warning("连续崩溃，清理豆包临时缓存后重启（账号数据保留）。")
+        self.dismiss_doubao_failure_dialog()
         self.shell("am", "force-stop", PACKAGE, timeout=10, check=False)
         for cache_dir in (f"{data_dir}/cache", f"{data_dir}/code_cache"):
             self.shell(
