@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import Mock
 
+from doubao_mumu_controller.doubao_mumu_loop import AppiumClient
 from doubao_mumu_controller.doubao_mumu_web_pipeline import (
     stale_appium_sessions_for_cleanup,
 )
@@ -57,6 +59,24 @@ class AppiumCleanupSelectionTests(unittest.TestCase):
             ["newest", "middle"],
         )
         self.assertEqual(skipped, 1)
+
+
+class AppiumClientReleaseTests(unittest.TestCase):
+    def test_invalidate_deletes_server_session_before_forgetting_it(self):
+        client = AppiumClient.__new__(AppiumClient)
+        client.session_id = "session-to-release"
+        client.logger = Mock()
+        client._json_request = Mock(return_value={"value": None})
+
+        client.invalidate_session()
+
+        self.assertIsNone(client.session_id)
+        client._json_request.assert_called_once_with(
+            "DELETE",
+            "session/session-to-release",
+            timeout=8,
+            allow_error=True,
+        )
 
 
 if __name__ == "__main__":

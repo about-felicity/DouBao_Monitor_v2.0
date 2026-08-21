@@ -1960,6 +1960,7 @@ def main() -> int:
     lock = DeviceLock(logger, device["serial"])
     lock.acquire()
     logger.info("已取得设备独占锁：%s", device["serial"])
+    mobile_appium: mumu.AppiumClient | None = None
     try:
         adb = Path(args.adb) if args.adb else resolve_adb()
         account = read_mobile_account(logger, adb, device["serial"])
@@ -2219,6 +2220,8 @@ def main() -> int:
         logger.warning("收到人工停止请求，已安全释放设备。")
         return 130
     finally:
+        if mobile_appium is not None:
+            mobile_appium.invalidate_session()
         lock.release()
 
 

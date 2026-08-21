@@ -775,7 +775,22 @@ class AppiumClient:
         return self.session_id
 
     def invalidate_session(self) -> None:
+        session_id = self.session_id
         self.session_id = None
+        if not session_id:
+            return
+        try:
+            self._json_request(
+                "DELETE",
+                f"session/{session_id}",
+                timeout=8,
+                allow_error=True,
+            )
+            self.logger.debug("已释放 Appium 会话：%s", session_id)
+        except AutomationError as exc:
+            # A broken session is already unusable.  Do not let cleanup hide
+            # the original automation error or block the recovery loop.
+            self.logger.debug("释放 Appium 会话失败（可忽略）：%s", exc)
 
     def _session_request(
         self,
