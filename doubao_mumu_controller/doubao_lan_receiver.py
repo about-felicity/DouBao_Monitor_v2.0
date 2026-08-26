@@ -128,7 +128,7 @@ def load_or_create_config() -> dict[str, Any]:
 
 
 def write_pairing(config: dict[str, Any]) -> dict[str, Any]:
-    ip = preferred_lan_ip()
+    ip = str(config.get("advertised_ip") or preferred_lan_ip()).strip()
     port = int(config["port"])
     hostname = socket.gethostname()
     pairing = {
@@ -274,7 +274,15 @@ class CaptureWorker(threading.Thread):
     def __init__(self) -> None:
         super().__init__(name="doubao-lan-capture-worker", daemon=True)
         self.stop_event = threading.Event()
-        self.grabber = import_grabber()
+        monitor_path = str(MONITOR_DIR)
+        if monitor_path not in sys.path:
+            sys.path.insert(0, monitor_path)
+        import save_doubao_refs
+        from monitor_core.database import store_ingested_run
+        from monitor_core.ingestion import normalize_doubao_payload
+        self.saver = save_doubao_refs
+        self.store_ingested_run = store_ingested_run
+        self.normalize_doubao_payload = normalize_doubao_payload
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -302,8 +310,35 @@ class CaptureWorker(threading.Thread):
             payload["receiver_received_at"] = str(
                 envelope.get("received_at") or ""
             )
-            save_result = self.grabber.save_payload(payload)
-            analysis = parse_save_analysis(save_result)
+            answer = str(payload.get("answerText") or payload.get("answer_text") or "")
+            question = str(payload.get("question") or "")
+            products, review_status, method, analysis_model = self.saver.review_products_with_ai(
+                answer, question
+            )
+            run = self.normalize_doubao_payload(
+                payload, products, review_status, analysis_model, method
+            )
+            stored = self.store_ingested_run("doubao", request_id, payload, envelope, run)
+            analysis = {
+                "run_no": stored["sequence"],
+                "source_count": stored["sources"],
+                "expected_source_count": int(payload.get("expectedCount") or payload.get("count") or 0),
+                "source_capture_complete": bool(payload.get("complete")),
+                "answer_present": bool(answer.strip()),
+                "answer_length": len(answer.strip()),
+                "product_count": stored["products"],
+                "product_review_status": review_status,
+                "product_extraction_method": method,
+                "product_analysis_model": analysis_model,
+                "product_parse_complete": review_status == "ai_verified",
+            }
+            save_result = {
+                "deferred": review_status != "ai_verified",
+                "storage": "postgresql",
+                "run_id": stored["run_id"],
+                "run_no": stored["sequence"],
+                "rows_written": stored["sources"],
+            }
             receipt = {
                 "request_id": request_id,
                 "source_device": envelope.get("source_device") or "",

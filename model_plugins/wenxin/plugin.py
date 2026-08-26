@@ -14,9 +14,11 @@ from monitor_core.scheduling import normalize_question_mode
 class Plugin(ModelPlugin):
     id, name, short_name, tone = "wenxin", "文心", "文", "wenxin"
     questions = ROOT / "wenxin_monitor" / "product.txt"
-    runner = ROOT / "wenxin_monitor" / "wenxin_loop.py"
+    runner = ROOT / "wenxin_monitor" / "wenxin_supervisor.py"
     results = ROOT / "wenxin_monitor" / "wenxin_results.jsonl"
     collector_results = ROOT / "runtime" / "remote_workers" / "wenxin_collector_results.jsonl"
+    collector_state = ROOT / "runtime" / "remote_workers" / "wenxin_baidu_state.json"
+    collector_log = ROOT / "runtime" / "remote_workers" / "wenxin_baidu_loop.log"
     dashboard = ROOT / "wenxin_monitor" / "dashboard.json"
     builder = ROOT / "wenxin_monitor" / "build_dashboard_data.py"
     execution = "remote"
@@ -27,22 +29,26 @@ class Plugin(ModelPlugin):
 
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
+        tasks = max(1, min(int(options.get("tasks") or 1), 4))
         mode = normalize_question_mode(options.get("question_mode"))
         return [sys.executable, str(self.runner), "--questions-file", str(self.questions),
                 "--rounds-per-question", str(rounds), "--question-mode", mode,
-                "--resume", "--wait", "30", "--random-wait", "90", "--retry-wait", "15",
+                "--tasks", str(tasks), "--wait", "8", "--random-wait", "20",
+                "--retry-wait", "8", "--timeout", "45",
                 "--results", str(self.collector_results)], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
-        if progress:
-            progress("正在启动文心专用 Chrome")
+        tasks = max(1, min(int(options.get("tasks") or 1), 4))
         from wenxin_monitor.controller import WenxinWebCollector
-        web = WenxinWebCollector(9444)
-        if progress:
-            progress("正在校验文心 App 与网页会话同步")
-        check = self.account_check(web)
-        if not check.get("ok"):
-            raise ValueError(check.get("message") or "文心 App 与网页未同步")
+        for task_id in range(1, tasks + 1):
+            if progress:
+                progress(f"正在启动并校验任务 {task_id}/{tasks} 的 Scrapling 隐身浏览器")
+            profile = ROOT / "runtime" / "remote_workers" / f"wenxin_scrapling_task_{task_id}"
+            web = WenxinWebCollector(9443 + task_id, profile=profile)
+            try:
+                web.ensure_ready()
+            finally:
+                web.close()
 
     def load_questions(self) -> list[str]:
         raw = [line.strip() for line in self.questions.read_text(encoding="utf-8-sig").splitlines()
@@ -54,29 +60,24 @@ class Plugin(ModelPlugin):
         self.questions.write_text("\n".join(values) + "\n", encoding="utf-8")
 
     def account_check(self, collector=None) -> dict[str, Any]:
-        from wenxin_monitor.controller import WenxinAppController, WenxinWebCollector
-        from monitor_core.device_lock import device_session
-        app = WenxinAppController("127.0.0.1:16384")
-        web = collector or WenxinWebCollector(9444)
-        with device_session("127.0.0.1:16384", "文心账号校验", timeout=300):
-            mobile = app.account_identity()
-        browser = web.account_identity()
+        from wenxin_monitor.controller import WenxinWebCollector
+        profile = ROOT / "runtime" / "remote_workers" / "wenxin_scrapling_task_1"
+        web = collector or WenxinWebCollector(9444, profile=profile)
         try:
-            latest = web.latest_reference()
-        except Exception:
-            latest = ""
-        mobile_logged_in = bool(mobile.get("name"))
-        browser_logged_in = bool(browser.get("name"))
-        ready = mobile_logged_in and browser_logged_in
-        if not mobile_logged_in:
-            message = "文心模拟器 App 未登录或未进入可提问页面"
-        elif not browser_logged_in:
-            message = "文心专用 Chrome 未登录；请在打开的 Chrome 中完成登录"
-        else:
-            message = "文心 App 与专用 Chrome 均已登录；采集首轮会用新会话再次确认同步关系"
+            browser = web.account_identity()
+            ready = True
+            message = "百度搜索页面可用；文心采集将直接抓取搜索结果中的 AI 回答，无需模拟器或登录"
+        except Exception as exc:
+            browser = {}
+            ready = False
+            message = f"百度搜索页面检测失败：{exc}"
+        finally:
+            if collector is None:
+                web.close()
         return {"ok": ready, "status": "logged_in" if ready else "login_required",
-                "message": message, "mobile": mobile, "web": browser, "latest": latest,
-                "conversation_sync_ready": "/search/" in latest, "location": "local"}
+                "message": message, "mobile": {}, "web": browser, "latest": WenxinWebCollector.HOME,
+                "conversation_sync_ready": ready, "capture_mode": "baidu_search_ai",
+                "location": "local"}
 
     def stats(self) -> dict[str, Any]:
         if self.results.exists() and (not self.dashboard.exists() or self.results.stat().st_mtime > self.dashboard.stat().st_mtime):

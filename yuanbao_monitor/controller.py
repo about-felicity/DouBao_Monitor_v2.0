@@ -3,8 +3,32 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from typing import Callable
 
 import uiautomator2 as u2
+
+
+class YuanbaoGenerationError(RuntimeError):
+    """The App explicitly reported that it failed to generate this answer."""
+
+
+GENERATION_FAILURE_MARKERS = (
+    "系统异常，回答生成失败",
+    "系统异常,回答生成失败",
+    "回答生成失败",
+    "生成回答失败",
+)
+
+
+def is_generation_failure_text(value: str) -> bool:
+    """Recognize Yuanbao's terminal failure card across XML/text variants."""
+    text = str(value or "")
+    compact = re.sub(r"[\s，,。.!！：:]+", "", text)
+    return (
+        any(marker in text for marker in GENERATION_FAILURE_MARKERS)
+        or "回答生成失败" in compact
+        or ("系统异常" in compact and "生成失败" in compact)
+    )
 
 
 class YuanbaoController:
@@ -15,6 +39,7 @@ class YuanbaoController:
     SEND_DESC = "发送消息"
     NEW_CHAT_DESC = "新建对话"
     CHAT_LIST_ID = f"{PKG}:id/chat_recycler_view"
+    PLUS_ID = f"{PKG}:id/ivConversationInputPlus"
 
     def __init__(self, serial: str = "127.0.0.1:16384", connect_timeout: int = 15):
         print(f"正在连接模拟器 {serial}...")
@@ -140,21 +165,36 @@ class YuanbaoController:
         if current.get("package") != self.PKG:
             self.d.app_start(self.PKG, stop=False)
             time.sleep(2)
-        if self.d(resourceId=self.INPUT_ID).exists(timeout=4):
-            return
-        if self.d(textStartsWith="引用来源").exists:
-            self.d.click(55, 86)
-            time.sleep(1)
-        for _ in range(2):
-            if self.d(resourceId=self.INPUT_ID).exists(timeout=1):
+        input_box = self.d(resourceId=self.INPUT_ID)
+        for stage in range(4):
+            # Voice/text mode is remembered independently by every instance.
+            voice_toggle = self.d(
+                resourceId=f"{self.PKG}:id/ivConversationInputWay",
+                description="切换成文字输入",
+            )
+            if voice_toggle.exists(timeout=1):
+                voice_toggle.click()
+                time.sleep(0.8)
+            if input_box.exists(timeout=5):
                 return
-            self.d.press("back")
-            time.sleep(0.7)
-        if not self.d(resourceId=self.INPUT_ID).exists(timeout=3):
-            self.d.app_start(self.PKG, stop=True)
-            time.sleep(3)
-        if not self.d(resourceId=self.INPUT_ID).exists(timeout=5):
-            raise RuntimeError("元宝已启动，但聊天输入框仍不可用")
+            if stage == 0:
+                # Account checks finish on the "我们" page. Explicitly select
+                # the chat tab instead of relying on one Back press and timing.
+                chat_tab = self.d(description="问元宝")
+                if chat_tab.exists(timeout=2):
+                    chat_tab.click()
+                    time.sleep(2)
+                    continue
+            elif stage == 1:
+                self.d.press("back")
+                time.sleep(1.5)
+                continue
+            elif stage == 2:
+                self.d.app_start(self.PKG, stop=True)
+                time.sleep(4)
+                continue
+        if not input_box.exists(timeout=8):
+            raise RuntimeError("元宝已启动并已尝试返回问元宝页，但聊天输入框仍不可用")
 
     @staticmethod
     def extract_visible_reply(xml: str, question: str = "") -> str:
@@ -201,12 +241,20 @@ class YuanbaoController:
         if error:
             (target / f"{safe}.txt").write_text(error, encoding="utf-8")
 
-    def _wait_for_reply(self, question: str = "", max_wait: int = 120, poll_interval: float = 1.5) -> str:
+    def _wait_for_reply(
+        self,
+        question: str = "",
+        max_wait: int = 120,
+        poll_interval: float = 0.5,
+        on_generation_complete: Callable[[], None] | None = None,
+    ) -> str:
         """轮询等待回复生成完成，返回最终的xml"""
         print("等待回复生成...")
         last_xml = ""
         last_reply = ""
         stable_count = 0
+        saw_generating_state = False
+        completion_notified = False
         start = time.time()
         loading_markers = (
             "正在搜索", "正在生成", "正在思考", "正在分析", "正在整理",
@@ -217,9 +265,15 @@ class YuanbaoController:
             time.sleep(poll_interval)
             current_xml = self.d.dump_hierarchy()
 
+            if is_generation_failure_text(current_xml):
+                raise YuanbaoGenerationError("元宝明确提示：系统异常，回答生成失败")
+
             visible_reply = self.extract_visible_reply(current_xml, question)
             is_loading = any(marker in current_xml for marker in loading_markers)
             has_answer = len(visible_reply) >= 30
+            plus_ready = self.PLUS_ID in current_xml
+            if is_loading or not plus_ready:
+                saw_generating_state = True
             input_ready = False
             try:
                 root = ET.fromstring(current_xml)
@@ -231,7 +285,22 @@ class YuanbaoController:
             except ET.ParseError:
                 pass
 
-            if visible_reply == last_reply and has_answer and input_ready and not is_loading:
+            reply_is_stable = visible_reply == last_reply and has_answer and input_ready and not is_loading
+            if (
+                not completion_notified
+                and on_generation_complete is not None
+                and plus_ready
+                and not is_loading
+                and (saw_generating_state or (has_answer and reply_is_stable))
+            ):
+                completion_notified = True
+                print(f"检测到停止方块已恢复为＋，立即启动网页抓取（{time.time()-start:.1f} 秒）")
+                try:
+                    on_generation_complete()
+                except Exception as exc:
+                    print(f"启动网页抓取线程失败：{exc}")
+
+            if reply_is_stable:
                 stable_count += 1
                 if stable_count >= 3:
                     print(f"检测到内容已稳定，用时 {time.time()-start:.1f} 秒")
@@ -242,6 +311,8 @@ class YuanbaoController:
             last_xml = current_xml
             last_reply = visible_reply
 
+        if is_generation_failure_text(last_xml):
+            raise YuanbaoGenerationError("元宝明确提示：系统异常，回答生成失败")
         print("等待超时，返回当前状态")
         return last_xml
 
@@ -256,23 +327,63 @@ class YuanbaoController:
             self.d.click(434, 920)
         else:
             raise RuntimeError("元宝 App 没有找到“我们”账号页入口")
-        time.sleep(1)
-        root = ET.fromstring(self.d.dump_hierarchy(compressed=False))
+        ignored = {
+            "立即更新", "立即登录", "登录", "未登录", "元宝", "我们",
+            "福利中心", "任务", "个性化", "主题色", "朗读设置",
+            "派邀请码", "消息中心", "设置", "快速思考", "深度思考",
+            "工具", "发现", "问元宝",
+        }
         candidates = []
-        for node in root.iter():
-            text = str(node.attrib.get("text") or "").strip()
-            resource_id = str(node.attrib.get("resource-id") or "")
-            bounds = [int(value) for value in re.findall(r"\d+", node.attrib.get("bounds") or "")]
-            if (text and not resource_id.startswith("com.android.systemui:")
-                    and len(bounds) == 4 and bounds[1] < 180 and 2 <= len(text) <= 40):
-                candidates.append(text)
-        self.d.press("back")
-        if not candidates:
-            raise RuntimeError("元宝 App 账号页没有识别到昵称")
-        name = candidates[-1]
-        return {"name": name, "masked": name[:2] + "***"}
+        profile_loaded = False
+        deadline = time.time() + 10
+        try:
+            while time.time() < deadline:
+                root = ET.fromstring(self.d.dump_hierarchy(compressed=False))
+                visible_texts = {
+                    str(node.attrib.get("text") or "").strip()
+                    for node in root.iter()
+                }
+                profile_loaded = bool(
+                    visible_texts & {"福利中心", "个性化", "主题色", "朗读设置", "派邀请码", "消息中心"}
+                )
+                current = []
+                for node in root.iter():
+                    text = str(node.attrib.get("text") or "").strip()
+                    resource_id = str(node.attrib.get("resource-id") or "")
+                    bounds = [int(value) for value in re.findall(r"\d+", node.attrib.get("bounds") or "")]
+                    if (
+                        text and text not in ignored
+                        and not resource_id.startswith("com.android.systemui:")
+                        and len(bounds) == 4 and bounds[1] < 220
+                        and 2 <= len(text) <= 40
+                    ):
+                        current.append(text)
+                candidates = current or candidates
+                default_name = next(
+                    (value for value in reversed(current) if re.fullmatch(r"用户[0-9A-Za-z]+", value)),
+                    "",
+                )
+                if default_name:
+                    return {"name": default_name, "masked": default_name[:2] + "***"}
+                if profile_loaded and current:
+                    name = current[-1]
+                    return {"name": name, "masked": name[:2] + "***"}
+                time.sleep(0.5)
+        finally:
+            self.d.press("back")
+        raise RuntimeError(
+            "元宝 App 账号页加载超时，未识别到昵称"
+            if not profile_loaded else
+            "元宝 App 账号页没有识别到昵称"
+        )
 
-    def ask(self, question: str, save_xml_path: str = "yuanbao_ui_reply.xml") -> str:
+    def ask(
+        self,
+        question: str,
+        save_xml_path: str = "yuanbao_ui_reply.xml",
+        on_sent: Callable[[], None] | None = None,
+        on_generation_complete: Callable[[], None] | None = None,
+    ) -> str:
         """
         完整流程：新建对话 -> 输入问题 -> 发送 -> 等待回复 -> 返回最终xml
 
@@ -290,8 +401,13 @@ class YuanbaoController:
         self._open_new_conversation()
         print("[模拟器] 输入并发送...")
         self._type_and_send(question)
+        if on_sent is not None:
+            on_sent()
         print("[模拟器] 等待回复...")
-        xml = self._wait_for_reply(question=question)
+        xml = self._wait_for_reply(
+            question=question,
+            on_generation_complete=on_generation_complete,
+        )
 
         with open(save_xml_path, "w", encoding="utf-8") as f:
             f.write(xml)

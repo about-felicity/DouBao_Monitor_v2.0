@@ -156,6 +156,11 @@ def build(
     shutil.copytree(MONITOR_DIR / "model_plugins", monitor_target / "model_plugins")
     for name in CONTROLLER_FILES:
         copy_required(BASE_DIR / name, controller_target / name)
+    # Ship the current main-machine callback pairing so a newly extracted
+    # package can upload immediately without a separate drag-and-drop step.
+    pairing_source = BASE_DIR / "doubao_lan_pairing.json"
+    if pairing_source.exists():
+        shutil.copy2(pairing_source, controller_target / pairing_source.name)
 
     if include_appium:
         if not SHADOWBOT_NODE.exists():

@@ -23,7 +23,7 @@ _AGENTS: set[str] = set()
 _AGENT_LOCK = threading.Lock()
 DISCOVERY_PORT = 8792
 DISCOVERY_SERVICE = "monitor-lan-result-v1"
-ALLOWED_MODELS = frozenset({"deepseek", "yuanbao", "wenxin", "afu"})
+ALLOWED_MODELS = frozenset({"deepseek", "yuanbao", "wenxin", "afu", "quark"})
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:

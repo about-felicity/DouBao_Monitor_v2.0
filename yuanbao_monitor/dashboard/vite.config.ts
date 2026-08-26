@@ -54,9 +54,23 @@ export default defineConfig(async () => {
       ];
 
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    server: {
+      ...(isCodexSeatbeltSandbox
+        ? { watch: { useFsEvents: false, usePolling: true } }
+        : {}),
+      // Vite 8 auto-enables browser-console forwarding when it detects an
+      // agent. During a dev-server restart the forwarding transport can send
+      // before its WebSocket exists, producing the recursive "reading send"
+      // rejection overlay seen in the dashboard. Local logs remain available
+      // in the browser and terminal without this forwarding bridge.
+      forwardConsole: false,
+      proxy: {
+        "/api": {
+          target: "http://127.0.0.1:8765",
+          changeOrigin: true,
+        },
+      },
+    },
     plugins: [
       vinext(),
       sites(),

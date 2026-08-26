@@ -1,4 +1,6 @@
 uiautomator2>=3.0
+adbutils>=2.8
+apkutils>=2.0
 requests>=2.31
 websocket-client>=1.7
 selenium>=4.20

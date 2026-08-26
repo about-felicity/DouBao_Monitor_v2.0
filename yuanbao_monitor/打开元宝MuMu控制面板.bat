@@ -1,2 +1,4 @@
 @echo off
-call "%~dp0dashboard.bat"
+cd /d "%~dp0.."
+python remote_model_control_panel.py --model yuanbao
+if errorlevel 1 pause

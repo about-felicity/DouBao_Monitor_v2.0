@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
+import urllib.error
 import urllib.request
 
 import doubao_env_loader  # noqa: F401  loads API keys from local .env file
@@ -173,7 +174,7 @@ OFFICIAL_HINTS = (
 SOURCE_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_cache.json")
 SOURCE_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_source_ai_cache.json")
 PRODUCT_AI_CACHE_JSON = os.path.join(BASE_DIR, "doubao_product_ai_cache.json")
-PRODUCT_AI_ANALYZER_VERSION = "compact-grounded-v3"
+PRODUCT_AI_ANALYZER_VERSION = "question-grounded-v5-complete"
 DEEPSEEK_THINKING_MODE = {"type": "disabled"}
 
 
@@ -790,6 +791,20 @@ def normalize_ai_products(parsed):
             "rank": rank,
             "rank_type": rank_type,
         })
+    appearance_rank = 0
+    for product in products:
+        if product["rank_type"] == "appearance_order":
+            appearance_rank += 1
+            product["rank"] = appearance_rank
+    # Explicit numbering is often local to a subsection while unnumbered
+    # recommendations use global appearance order.  Mixing both can yield two
+    # products with the same final rank; in that ambiguous case the only stable
+    # ordering is their actual appearance in the answer.
+    ranks = [product["rank"] for product in products]
+    if len(ranks) != len(set(ranks)):
+        for rank, product in enumerate(products, 1):
+            product["rank"] = rank
+            product["rank_type"] = "appearance_order"
     return products
 
 
@@ -850,6 +865,12 @@ def ensure_complete_ai_products(answer_text, parsed, products):
             "answer claimed %d products but explicitly named/model-extracted %d; "
             "accepting the explicit names" % (claimed, len(products or []))
         )
+    expected_numbered = numbered_product_block_count(answer_text)
+    if expected_numbered > len(products or []):
+        raise ValueError(
+            "incomplete product extraction: extracted=%d numbered_blocks=%d"
+            % (len(products or []), expected_numbered)
+        )
     return products
 
 
@@ -907,16 +928,20 @@ def strip_reference_prefix(text):
     return result
 
 
-def build_product_prompt(answer_text):
+def build_product_prompt(answer_text, question=""):
     cleaned = strip_reference_prefix(answer_text)
     return {
-        "task": "Extract every explicitly recommended commercial product from the text. Never infer missing products.",
+        "task": "Extract all explicitly recommended commercial products; infer nothing.",
+        "question": str(question or "").strip(),
+        "minimum_products": numbered_product_block_count(cleaned),
         "rules": [
-            "Ignore references, related-content titles, generic categories and advice. Deduplicate by first appearance.",
-            "Shopping cards repeat the narrative recommendation; merge them and never count a card as another product.",
-            "Use the stable parent brand; keep series/sub-brand in product_name.",
-            "evidence must be the shortest exact quote proving that recommendation. Output JSON only.",
-            "Use explicit_rank only for a numbered ranking; otherwise appearance_order.",
+            "Only the requested category. Ignore references, advice, services and unrelated cards.",
+            "Merge duplicate narrative/card mentions; preserve first appearance.",
+            "Use parent brand; keep series in product_name; evidence is the shortest exact quote.",
+            "Words describing concentration, ratio or combinations (for example 黄金浓度/黄金组合) are not brands.",
+            "explicit_rank only for rankings, else appearance_order. Include each named recommendation once.",
+            "minimum_products is a hard lower bound when above zero; never return fewer matching products.",
+            "Empty only if no matching named product. Return JSON only.",
         ],
         "schema": {
             "products": [{
@@ -931,6 +956,48 @@ def build_product_prompt(answer_text):
     }
 
 
+def numbered_product_block_count(answer_text):
+    """Count numbered recommendation blocks, excluding numbered usage advice."""
+    lines = [line.strip() for line in strip_reference_prefix(answer_text).splitlines() if line.strip()]
+    detail_markers = ("核心", "特点", "亮点", "适合", "质地", "价格", "成分", "功效", "定型")
+    detail_headings = (
+        "核心优势", "核心亮点", "主要优势", "适用人群", "适合人群", "性价比",
+        "使用方法", "注意事项", "推荐理由", "选购建议", "搭配建议",
+    )
+    instruction_markers = (
+        "只涂", "只洗", "不要", "避免", "每天", "每晚", "先在", "先把", "少量",
+        "坚持", "充分", "距离", "涂完", "用前", "使用时", "孕期", "敏感肌先",
+    )
+    count = 0
+    try:
+        from monitor_core.owned_products import own_product_mentions
+    except ImportError:
+        own_product_mentions = lambda _value: []
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*\d{1,2}\s*[.、）)]\s*(.+)$", line)
+        if not match:
+            continue
+        heading = match.group(1).strip()
+        if not heading or len(heading) > 100:
+            continue
+        if any(heading.startswith(marker) for marker in detail_headings):
+            continue
+        if any(marker in heading for marker in instruction_markers):
+            continue
+        # A numbered prose/detail paragraph is not a product block.  Requiring
+        # an actual category word prevents sections such as “2. 核心优势” from
+        # forcing the reviewer to hallucinate four products.
+        if (
+            not any(keyword in heading for keyword in PRODUCT_NAME_KEYWORDS)
+            and not own_product_mentions(heading)
+        ):
+            continue
+        nearby = " ".join(lines[index + 1:index + 5])
+        if any(marker in nearby for marker in detail_markers):
+            count += 1
+    return count
+
+
 def product_ai_max_tokens(answer_text):
     """Bound model output to the size of the actual recommendation list."""
     cleaned = strip_reference_prefix(answer_text)
@@ -943,33 +1010,100 @@ def product_ai_max_tokens(answer_text):
     }
     numbered_count = max(numbered) if numbered else 0
     expected = min(20, max(4, claimed, rule_count, numbered_count))
-    return 1200
+    return min(1200, max(500, 140 + expected * 90))
 
 
-def product_ai_cache_key(answer_text):
+def credible_empty_product_result(answer_text):
+    text = strip_reference_prefix(answer_text)
+    if extract_structured_product_headings(text):
+        return False
+    commerce_signal = bool(re.search(r"(?:￥|售价|旗舰店|支持.{0,8}退|消费者保障)", text))
+    recommendation_signal = any(marker in text for marker in ("推荐", "首推", "选择", "备选"))
+    category_signal = any(keyword in text for keyword in PRODUCT_NAME_KEYWORDS)
+    return not (commerce_signal and recommendation_signal and category_signal)
+
+
+PRODUCT_CATEGORY_TERMS = {
+    "护发精油": ("护发精油", "润发精油", "护发油", "发油", "护发精华油", "瞬柔精油"),
+    "护发素": ("护发素", "润发乳", "护发乳", "发膜"),
+    "控油蓬松洗发水": ("洗发水", "洗发露", "洗发乳"),
+    "沐浴精油": ("沐浴精油", "沐浴油", "沐浴精华油", "芳香沐浴露"),
+    "眉毛增长液": ("眉毛", "密眉", "眉部", "眉睫"),
+    "祛痘精华液": ("精华", "祛痘", "净痘", "痘啫喱", "痘印"),
+    "美白面霜": ("面霜", "奶罐", "霜"),
+    "造型喷雾": ("喷雾", "定型", "造型"),
+    "染发剂": ("染发", "染膏", "染护膏", "泡泡染"),
+    "睫毛增长液": ("睫毛", "养睫", "睫眉"),
+    "防脱洗发水": ("洗发水", "洗发露", "洗发乳"),
+    "防脱精华液": ("精华", "防脱", "育发", "黑宝瓶"),
+    "面膜": ("面膜", "冷膜", "泥膜", "膜粉"),
+}
+NON_PRODUCT_TERMS = ("检测服务", "养发机构", "博士园")
+FALSE_EYELASH_TERMS = ("假睫毛", "麦穗睫毛", "睫毛书", "簇睫毛")
+
+
+def filter_products_for_question(question, products):
+    normalized_question = str(question or "").strip().replace("推荐一款", "").replace("推荐", "")
+    category_terms = PRODUCT_CATEGORY_TERMS.get(normalized_question, ())
+    filtered = []
+    for item in products or []:
+        if not isinstance(item, dict):
+            continue
+        evidence = str(item.get("evidence") or "").strip()
+        product_text = str(item.get("product_name") or "") + " " + evidence
+        if re.match(r"^\s*\d{1,2}:\d{2}\s+", evidence):
+            continue
+        if any(term in product_text for term in NON_PRODUCT_TERMS):
+            continue
+        if normalized_question in ("睫毛增长液", "眉毛增长液") and any(
+            term in product_text for term in FALSE_EYELASH_TERMS
+        ):
+            continue
+        if (
+            category_terms
+            and not any(term in product_text for term in category_terms)
+            and not item.get("structured_heading")
+        ):
+            continue
+        filtered.append(dict(item))
+    appearance_rank = 0
+    for item in filtered:
+        if item.get("rank_type") == "appearance_order":
+            appearance_rank += 1
+            item["rank"] = appearance_rank
+    return filtered
+
+
+def product_ai_cache_key(answer_text, question=""):
     cleaned = strip_reference_prefix(answer_text)
-    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+    cache_input = str(question or "").strip() + "\n" + cleaned
+    digest = hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
     return PRODUCT_AI_ANALYZER_VERSION + ":" + digest
 
 
-def cached_product_ai_result(answer_text):
+def cached_product_ai_result(answer_text, question=""):
     cache = load_json_cache(PRODUCT_AI_CACHE_JSON)
-    entry = cache.get(product_ai_cache_key(answer_text))
+    entry = cache.get(product_ai_cache_key(answer_text, question))
     if not isinstance(entry, dict) or not isinstance(entry.get("products"), list):
         return None
+    products = filter_products_for_question(question, entry["products"])
+    products = ground_product_brands(answer_text, products)
+    if not products and not credible_empty_product_result(answer_text):
+        return None
     try:
-        validate_grounded_ai_products(answer_text, entry["products"])
+        validate_grounded_ai_products(answer_text, products)
+        ensure_complete_ai_products(answer_text, {"products": products}, products)
     except ValueError:
         return None
-    return entry
+    return {**entry, "products": products}
 
 
-def save_product_ai_result(answer_text, products, method, model):
+def save_product_ai_result(answer_text, products, method, model, question=""):
     # Several browser slots can finish together. Serialize the tiny
     # read-modify-write section so one process cannot overwrite another's hit.
     with product_data_write_lock(timeout_seconds=20):
         cache = load_json_cache(PRODUCT_AI_CACHE_JSON)
-        cache[product_ai_cache_key(answer_text)] = {
+        cache[product_ai_cache_key(answer_text, question)] = {
             "products": products,
             "method": method,
             "model": model,
@@ -1006,41 +1140,95 @@ def _grounded_brand_aliases(brand_name):
     return {_grounding_text(alias) for alias in aliases if _grounding_text(alias)}
 
 
+def ground_product_brands(answer_text, products):
+    answer = _grounding_text(strip_reference_prefix(answer_text))
+    grounded = []
+    for item in products or []:
+        if not isinstance(item, dict):
+            continue
+        product = dict(item)
+        brand = str(product.get("brand_name") or "").strip()
+        if brand:
+            try:
+                import doubao_dashboard_server as dashboard
+                if dashboard.is_invalid_brand_candidate(brand):
+                    brand = ""
+            except Exception:
+                pass
+        aliases = _grounded_brand_aliases(brand) if brand else set()
+        identified = bool(brand and any(alias in answer for alias in aliases))
+        if not identified:
+            product["brand_name"] = ""
+        product["brand_identified"] = identified
+        grounded.append(product)
+    return grounded
+
+
 def _is_subsequence(needle, haystack):
     iterator = iter(haystack)
     return all(any(char == candidate for candidate in iterator) for char in needle)
 
 
+_PRODUCT_NEGATION_MARKERS = (
+    "不推荐", "不建议", "不优先", "不考虑", "不适合", "不要买", "不要选",
+    "别买", "避雷", "排除", "慎选", "未推荐", "不作为推荐",
+)
+
+
+def _evidence_negates_product(evidence_text, product_name):
+    """Detect a negative statement tied to this product, not another list item."""
+    evidence = re.sub(r"\s+", "", str(evidence_text or ""))
+    product = re.sub(r"\s+", "", str(product_name or ""))
+    if not evidence or not product:
+        return False
+    variants = {product}
+    # Model normalization may prepend a parent brand. The last 4+ characters
+    # still give us a conservative anchor for the actual product mention.
+    if len(product) >= 6:
+        variants.add(product[-4:])
+    marker = "(?:" + "|".join(map(re.escape, _PRODUCT_NEGATION_MARKERS)) + ")"
+    separator_free = r"[^，。；;、！？!?\n]"
+    for variant in sorted(variants, key=len, reverse=True):
+        escaped = re.escape(variant)
+        if re.search(marker + separator_free + r"{0,12}" + escaped, evidence):
+            return True
+        if re.search(escaped + separator_free + r"{0,8}" + marker, evidence):
+            return True
+    return False
+
+
 def validate_grounded_ai_products(answer_text, products):
-    """Reject model output whose quoted evidence is not in the captured answer."""
+    """Reject ungrounded or explicitly negated model output before persistence."""
     answer = _grounding_text(strip_reference_prefix(answer_text))
     for item in products or []:
-        evidence = _grounding_text(item.get("evidence"))
+        raw_evidence = str(item.get("evidence") or "")
+        raw_product = str(item.get("product_name") or "")
+        evidence = _grounding_text(raw_evidence)
         if len(evidence) < 2 or evidence not in answer:
             raise ValueError(
                 "product evidence is not grounded in answer: "
-                + str(item.get("product_name") or "")[:80]
+                + raw_product[:80]
             )
-        product = _grounding_text(item.get("product_name"))
-        if product and product not in answer:
-            aliases = _grounded_brand_aliases(item.get("brand_name"))
-            grounded_alias = next((alias for alias in aliases if alias in answer), "")
-            remainder = product
-            canonical_brand = _grounding_text(item.get("brand_name"))
-            if canonical_brand and remainder.startswith(canonical_brand):
-                remainder = remainder[len(canonical_brand):]
-            candidate = remainder if grounded_alias else product
-            if not candidate and grounded_alias:
-                continue
-            if _is_subsequence(candidate, evidence):
-                continue
-            longest = _longest_common_substring_length(candidate, evidence)
-            required = min(6, max(2 if len(candidate) <= 2 else 3, (len(candidate) + 1) // 2))
-            if longest < required:
-                raise ValueError(
-                    "product name is not grounded in evidence: "
-                    + str(item.get("product_name") or "")[:80]
-                )
+        if _evidence_negates_product(raw_evidence, raw_product):
+            raise ValueError("negated product cannot be recommended: " + raw_product[:80])
+        product = _grounding_text(raw_product)
+        aliases = _grounded_brand_aliases(item.get("brand_name"))
+        grounded_alias = next((alias for alias in aliases if alias in answer), "")
+        remainder = product
+        canonical_brand = _grounding_text(item.get("brand_name"))
+        if canonical_brand and remainder.startswith(canonical_brand):
+            remainder = remainder[len(canonical_brand):]
+        candidate = remainder if grounded_alias else product
+        if not candidate and grounded_alias:
+            continue
+        if candidate in evidence or _is_subsequence(candidate, evidence):
+            continue
+        longest = _longest_common_substring_length(candidate, evidence)
+        required = min(6, max(2 if len(candidate) <= 2 else 3, (len(candidate) + 1) // 2))
+        if longest < required:
+            raise ValueError(
+                "product name is not grounded in evidence: " + raw_product[:80]
+            )
     return products
 
 
@@ -1062,9 +1250,15 @@ def model_response_text(data):
     return ""
 
 
-def call_anthropic_product_extractor(answer_text):
+_PRODUCT_AI_PAUSED_UNTIL = 0.0
+
+
+def call_anthropic_product_extractor(answer_text, question=""):
+    global _PRODUCT_AI_PAUSED_UNTIL
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
+        return None
+    if time.monotonic() < _PRODUCT_AI_PAUSED_UNTIL:
         return None
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic").rstrip("/")
     model = os.environ.get("DOUBAO_PRODUCT_AI_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
@@ -1078,7 +1272,7 @@ def call_anthropic_product_extractor(answer_text):
             "messages": [
                 {
                     "role": "user",
-                    "content": json.dumps(build_product_prompt(answer_text), ensure_ascii=False),
+                    "content": json.dumps(build_product_prompt(answer_text, question), ensure_ascii=False),
                 }
             ],
         }
@@ -1109,9 +1303,16 @@ def call_anthropic_product_extractor(answer_text):
                 raise ValueError("empty model response")
             parsed = parse_product_json(content)
             products = normalize_ai_products(parsed)
+            products = filter_products_for_question(question, products)
+            products = ground_product_brands(answer_text, products)
             products = ensure_complete_ai_products(answer_text, parsed, products)
             return validate_grounded_ai_products(answer_text, products)
         except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                if exc.code in (401, 402, 403):
+                    _PRODUCT_AI_PAUSED_UNTIL = time.monotonic() + env_int("DOUBAO_PRODUCT_AI_PAUSE_SECONDS", 3600)
+                elif exc.code == 429:
+                    _PRODUCT_AI_PAUSED_UNTIL = time.monotonic() + 60
             debug_log(
                 "AI product extractor attempt %d/%d failed: %r"
                 % (attempt, attempts, exc)
@@ -1121,7 +1322,7 @@ def call_anthropic_product_extractor(answer_text):
     return None
 
 
-def call_openai_product_extractor(answer_text):
+def call_openai_product_extractor(answer_text, question=""):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -1131,7 +1332,7 @@ def call_openai_product_extractor(answer_text):
         "model": model,
         "messages": [
             {"role": "system", "content": "Extract recommended products. Output strict JSON only."},
-            {"role": "user", "content": json.dumps(build_product_prompt(answer_text), ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(build_product_prompt(answer_text, question), ensure_ascii=False)},
         ],
         "temperature": 0,
         "max_tokens": product_ai_max_tokens(answer_text),
@@ -1160,6 +1361,8 @@ def call_openai_product_extractor(answer_text):
         )
         parsed = parse_json_object(data["choices"][0]["message"]["content"])
         products = normalize_ai_products(parsed)
+        products = filter_products_for_question(question, products)
+        products = ground_product_brands(answer_text, products)
         products = ensure_complete_ai_products(answer_text, parsed, products)
         return validate_grounded_ai_products(answer_text, products)
     except Exception as exc:
@@ -1168,16 +1371,11 @@ def call_openai_product_extractor(answer_text):
 
 
 def product_ai_mode():
-    """Use verified AI when configured; stay useful offline with a labeled rule fallback."""
+    """Require verified AI by default so temporary billing failures remain retryable."""
     configured = os.environ.get("DOUBAO_PRODUCT_AI_MODE", "").strip().lower()
     if configured:
         return configured if configured in ("required", "fallback", "off") else "required"
-    has_model_key = bool(
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    mode = "required" if has_model_key else "fallback"
-    return mode if mode in ("required", "fallback", "off") else "required"
+    return "required"
 
 
 def product_ai_model_label():
@@ -1188,7 +1386,7 @@ def product_ai_model_label():
     return ""
 
 
-def review_products_with_ai(answer_text):
+def review_products_with_ai(answer_text, question=""):
     """Return (products, status, method, model).
 
     A successful empty list is an AI-reviewed result: it means the answer did
@@ -1209,9 +1407,9 @@ def review_products_with_ai(answer_text):
         products = historical_products if historical_products else rule_products
         return products, "rule_unverified", "rule", ""
 
-    cached = cached_product_ai_result(text)
+    cached = cached_product_ai_result(text, question)
     if cached is not None:
-        debug_log("AI product cache hit: " + product_ai_cache_key(text))
+        debug_log("AI product cache hit: " + product_ai_cache_key(text, question))
         return (
             cached["products"],
             "ai_verified",
@@ -1224,11 +1422,15 @@ def review_products_with_ai(answer_text):
         + " rule_count=" + str(len(rule_products))
         + " historical_count=" + str(len(historical_products))
     )
-    result = call_anthropic_product_extractor(text)
+    result = call_anthropic_product_extractor(text, question)
     method = "anthropic"
     if result is None:
-        result = call_openai_product_extractor(text)
+        result = call_openai_product_extractor(text, question)
         method = "openai"
+    if result is not None:
+        if not result and not credible_empty_product_result(text):
+            debug_log("AI product review rejected an implausible empty result")
+            result = None
     if result is not None:
         # A model response can contain a valid product while omitting its
         # brand. Fill only names present in the curated canonical vocabulary;
@@ -1256,7 +1458,8 @@ def review_products_with_ai(answer_text):
                     item["brand_name"] = canonical
         except Exception:
             pass
-        save_product_ai_result(text, result, method, product_ai_model_label())
+        result = ground_product_brands(text, result)
+        save_product_ai_result(text, result, method, product_ai_model_label(), question)
         debug_log("AI product review completed; ai_count=" + str(len(result)))
         return result, "ai_verified", method, product_ai_model_label()
 
@@ -1335,6 +1538,9 @@ def split_answer_product_lines(answer_text):
     text = str(answer_text or "").replace("\r", "\n")
     if not text.strip():
         return []
+    # Wenxin and Yuanbao frequently wrap headings in zero-width/bidi format
+    # characters. They are invisible in the UI but break start-of-line rules.
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
     text = re.sub(r"(?<!\n)(?=(?:\d+|[一二三四五六七八九十])[\.\、]\s*)", "\n", text)
     text = re.sub(r"(?<!\n)(?=[✨🌿🛡🏆💡⚠✅⭐💧🔥💰]\s*)", "\n", text)
     text = re.sub(r"(?<!\n)(?=(?:综合推荐|首选|推荐|低敏优选|入门性价比|成分党优选|院线级激活|经典香氛|日常保湿|干皮|油皮|敏感肌)\s*[：:])", "\n", text)
@@ -1483,6 +1689,108 @@ def infer_brand_from_product_name(product_name):
     return _normalize_brand(brand)
 
 
+STRUCTURED_PRODUCT_DETAIL_RE = re.compile(
+    r"^[✅✨🌿🛡🏆💡⚠⭐💧🔥💰❗🌟🔴🟡🟢🔵👍💪🧴\s]*"
+    r"(?:核心(?:成分|优势|亮点)?|主要成分|成分|特点|亮点|适合(?:人群)?|适用(?:人群)?|质地|"
+    r"价格|参考价|规格|容量|功效|主打|优势|配方|定位|洗感|香型|注意|提醒|"
+    r"修护逻辑|温和安全|使用感受|安全温和|深层修护|多效一体|轻盈不油|水感质地)\s*[：:]"
+)
+STRUCTURED_PRODUCT_HEADING_RE = re.compile(
+    r"^(?:#{1,6}\s*|\*{1,2}\s*)?(?:"
+    r"(?:\d{1,2}|[一二三四五六七八九十]{1,3})[.、．)]\s*|"
+    r"[✅🏆✨🌿🛡⭐💧🔥💰❗🌟🔴🟡🟢🔵👍💪🧴]\s*"
+    r")"
+)
+STRUCTURED_SCENARIO_HEADING_RE = re.compile(
+    r"^[^：:\n]{0,28}(?:首选|推荐|优选|选择|选)[：:]\s*\S+"
+)
+STRUCTURED_GENERIC_HEADINGS = (
+    "平价入门", "平价性价比", "高性价比", "进阶修护", "高端修护",
+    "按发质", "按需求", "分人群", "简单选购", "选购口诀", "小技巧",
+    "正确使用", "使用方法", "注意事项", "日常养护", "敏感头皮",
+)
+
+
+def extract_structured_product_headings(answer_text, question=""):
+    """Extract literal product headings backed by adjacent detail rows.
+
+    Many real Doubao answers name products as ``欧莱雅小金瓶`` or
+    ``沙宣绿钻`` without repeating the category word. The previous parser
+    discarded those headings and then allowed an empty paid-model result to be
+    certified. Requiring an immediately adjacent ``适合/成分/亮点`` row keeps
+    this fallback evidence-grounded and avoids treating section titles as
+    products.
+    """
+    lines = [line.strip() for line in strip_reference_prefix(answer_text).splitlines() if line.strip()]
+    found = []
+    seen = set()
+    for index, original in enumerate(lines[:-1]):
+        if STRUCTURED_PRODUCT_DETAIL_RE.match(original):
+            continue
+        has_heading_marker = bool(STRUCTURED_PRODUCT_HEADING_RE.match(original))
+        has_scenario_marker = bool(STRUCTURED_SCENARIO_HEADING_RE.match(original))
+        if not (has_heading_marker or has_scenario_marker):
+            continue
+        adjacent_detail = bool(STRUCTURED_PRODUCT_DETAIL_RE.match(lines[index + 1]))
+        # An emoji/scenario heading containing a colon is already strongly
+        # structured. Numbered prose still needs an adjacent detail row.
+        if not adjacent_detail and not (
+            (has_scenario_marker or re.match(r"^[✅🏆✨🌿🛡⭐💧🔥💰❗🌟🔴🟡🟢🔵👍💪🧴]", original))
+            and re.search(r"[：:]", original)
+        ):
+            continue
+        candidate = _line_after_leading_markers(original)
+        candidate = re.sub(r"^[✅✨🌿🛡🏆💡⚠⭐💧🔥💰❗🌟🔴🟡🟢🔵👍💪🧴]\s*", "", candidate)
+        candidate = re.sub(r"^(?:综合)?(?:首选|推荐|优选|备选)(?:款)?\s*[：:]\s*", "", candidate)
+        known_brands = _load_historical_brand_registry()
+        if re.search(r"[：:｜|]", candidate):
+            prefix, suffix = re.split(r"[：:｜|]", candidate, maxsplit=1)
+            folded_suffix = suffix.casefold()
+            suffix_is_product = (
+                any(keyword in suffix for keyword in PRODUCT_NAME_KEYWORDS)
+                or any(str(brand).casefold() in folded_suffix for brand in known_brands if len(str(brand)) >= 2)
+            )
+            if suffix_is_product or re.search(
+                r"(?:首选|推荐|优选|选择|选|油头|发质|肌|党|款|专属)$", prefix.strip()
+            ):
+                candidate = suffix.strip()
+        candidate = re.sub(r"[（(][^）)]{0,80}[）)]\s*$", "", candidate).strip(" -—：:，,。；;")
+        if not (2 <= len(candidate) <= 50):
+            continue
+        if re.search(r"[，,。；;！？!?]", candidate):
+            continue
+        if any(candidate.startswith(value) for value in STRUCTURED_GENERIC_HEADINGS):
+            continue
+        if re.search(r"(?:怎么选|选购|口诀|技巧|方法|注意|提醒|适合人群)$", candidate):
+            continue
+        folded_candidate = candidate.casefold()
+        has_known_brand = any(
+            str(brand).casefold() in folded_candidate
+            for brand in known_brands
+            if len(str(brand)) >= 2
+        )
+        # This is a safety net for paid analysis, not a general NLP parser.
+        # Only supplement headings containing a known brand; truly new brands
+        # remain pending for model review instead of being guessed from prose.
+        if not has_known_brand:
+            continue
+        key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", candidate, flags=re.I).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append({
+            "product_name": normalize_known_product_alias(candidate),
+            "brand_name": infer_brand_from_product_name(candidate),
+            "brand_identified": bool(infer_brand_from_product_name(candidate)),
+            "evidence": original[:240],
+            "rank": len(found) + 1,
+            "rank_type": "appearance_order",
+            "structured_heading": True,
+            "question": str(question or ""),
+        })
+    return found
+
+
 def extract_products(answer_text):
     seen = set()
     products = []
@@ -1490,6 +1798,8 @@ def extract_products(answer_text):
         if any(hint in line for hint in ("#", "参考资料", "相关视频", "测评", "指南", "红黑榜", "一句话点评")):
             continue
         stripped = _line_after_leading_markers(line)
+        if re.match(r"^(?:请|为我|给我)?推荐(?:一款|几款|一个|一些)?\s*[^：:]{0,24}$", stripped):
+            continue
         # Skip leading explanation/warning lines that happen to contain product keywords.
         if re.match(r"^(?:选|挑选)\s*(?:睫毛增长液|眉毛增长液|染发剂|沐浴露|洗发水|面膜|面霜|防晒霜)", stripped):
             continue
@@ -1558,6 +1868,19 @@ def extract_products(answer_text):
                 "brand_name": infer_brand_from_product_name(canonical),
                 "evidence": evidence[:240],
             })
+    for item in extract_structured_product_headings(answer_text):
+        name = str(item.get("product_name") or "").strip()
+        folded = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", name, flags=re.I).casefold()
+        if not folded or any(
+            folded == re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(existing.get("product_name") or ""), flags=re.I).casefold()
+            for existing in products
+        ):
+            continue
+        products.append(item)
+    for rank, item in enumerate(products, 1):
+        if item.get("rank_type") == "appearance_order" or item.get("structured_heading"):
+            item["rank"] = rank
+            item["rank_type"] = "appearance_order"
     return products
 
 
@@ -2013,7 +2336,7 @@ def append_products_csv(payload, run_no, run_time, analysis_result=None):
     # Persist first. If a model timeout or process interruption happens below,
     # the background retry worker still has the exact answer body to review.
     answer_hash = append_answer_csv(payload, run_no, run_time, answer_text, "ai_pending", product_ai_model_label())
-    products, review_status, extraction_method, model = review_products_with_ai(answer_text)
+    products, review_status, extraction_method, model = review_products_with_ai(answer_text, question)
     recommendation_question = is_recommendation_question(question)
     if analysis_result is not None:
         analysis_result.update({

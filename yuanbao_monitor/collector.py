@@ -52,14 +52,14 @@ class YuanbaoSourceCollector:
         return WebDriverWait(self.driver, timeout)
 
     def _safe_find(self, by: By, value: str, parent=None) -> Optional[WebElement]:
-        root = parent or self.driver
+        root = parent if parent is not None else self.driver
         try:
             return root.find_element(by, value)
         except NoSuchElementException:
             return None
 
     def _safe_finds(self, by: By, value: str, parent=None) -> List[WebElement]:
-        root = parent or self.driver
+        root = parent if parent is not None else self.driver
         try:
             return root.find_elements(by, value)
         except Exception:
@@ -107,7 +107,7 @@ class YuanbaoSourceCollector:
         start = time.time()
         while time.time() - start < timeout:
             conv_list = self._safe_find(By.CSS_SELECTOR, ".yb-recent-conv-list")
-            if conv_list:
+            if conv_list is not None:
                 cls = conv_list.get_attribute("class") or ""
                 if "loading" not in cls:
                     break
@@ -120,7 +120,7 @@ class YuanbaoSourceCollector:
         ]
         for sel in selectors:
             el = self._safe_find(By.CSS_SELECTOR, sel)
-            if el and el.is_displayed():
+            if el is not None and el.is_displayed():
                 try:
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
                     time.sleep(0.3)
@@ -161,21 +161,46 @@ class YuanbaoSourceCollector:
         deadline = time.time() + timeout
         last_refresh = 0.0
         attempted: set[str] = set()
+        # Yuanbao rewrites conversation titles, but normally keeps the product
+        # phrase. Prefer those rows before probing unrelated conversations.
+        topic = re.sub(
+            r"(?:请|帮我|给我|推荐|介绍|选择|一款|一个|一些|适合的|好用的)",
+            "",
+            str(question or ""),
+        ).strip(" ，。！？?")
         while time.time() < deadline:
             items = self._safe_finds(By.CSS_SELECTOR, ".yb-recent-conv-list__item")
-            for item in items[:12]:
-                reference = self._conversation_reference(item)
-                if not reference or reference == previous_reference or reference in attempted:
-                    continue
-                attempted.add(reference)
+            candidates = items[:60]
+            if topic:
+                candidates = sorted(
+                    candidates,
+                    key=lambda item: self._conversation_topic_priority(item, topic),
+                )
+            for item in candidates:
                 try:
-                    target = self._safe_find(By.CSS_SELECTOR, ".yb-recent-conv-list__item-name", item) or item
+                    reference = self._conversation_reference(item)
+                    if not reference or reference == previous_reference or reference in attempted:
+                        continue
+                    target = self._safe_find(
+                        By.CSS_SELECTOR,
+                        ".yb-recent-conv-list__item-name",
+                        item,
+                    )
+                    if target is None:
+                        target = item
                     self.driver.execute_script("arguments[0].click();", target)
-                    time.sleep(2)
-                    chat = self._safe_find(By.CSS_SELECTOR, "#chat-content")
-                    chat_text = str(chat.text if chat else "")
-                    if not question or question in chat_text:
-                        return reference
+                    # React changes the URL before the chat body is hydrated.
+                    # Wait for the selected CID and question instead of doing
+                    # one fixed two-second read that can miss a valid sync.
+                    load_deadline = min(deadline, time.time() + 12)
+                    while time.time() < load_deadline:
+                        chat = self._safe_find(By.CSS_SELECTOR, "#chat-content")
+                        chat_text = str(chat.text if chat is not None else "")
+                        url_ready = reference in str(self.driver.current_url or "")
+                        if url_ready and (not question or question in chat_text):
+                            return reference
+                        time.sleep(0.5)
+                    attempted.add(reference)
                 except Exception:
                     continue
             if time.time() - last_refresh >= 4:
@@ -184,6 +209,13 @@ class YuanbaoSourceCollector:
                 attempted.clear()
             time.sleep(1)
         return ""
+
+    @staticmethod
+    def _conversation_topic_priority(item: WebElement, topic: str) -> int:
+        try:
+            return 0 if topic in str(item.text or "") else 1
+        except Exception:
+            return 1
 
     def wait_for_chat_loaded(self, timeout: int = 60) -> bool:
         print("等待右侧聊天内容加载...")
@@ -233,7 +265,7 @@ class YuanbaoSourceCollector:
             "[class*='answer-body']",
         ]:
             content = self._safe_find(By.CSS_SELECTOR, sel, msg)
-            if content:
+            if content is not None:
                 text = content.text.strip()
                 if len(text) > 10:
                     return text
@@ -251,17 +283,17 @@ class YuanbaoSourceCollector:
         """
         # 优先：在整个页面找（不在 msg 内部，而是在 msg 下方的 toolbar 里）
         btn = self._safe_find(By.CSS_SELECTOR, "#search-guide-tool")
-        if btn and btn.is_displayed():
+        if btn is not None and btn.is_displayed():
             return btn
 
         # 兜底 1: 按 aria-label 找
         btn = self._safe_find(By.XPATH, "//*[@aria-label and contains(@aria-label, '引用') and contains(@aria-label, '资料')]")
-        if btn and btn.is_displayed():
+        if btn is not None and btn.is_displayed():
             return btn
 
         # 兜底 2: 按 data-toolbar-type=citation 找
         btn = self._safe_find(By.CSS_SELECTOR, "[data-toolbar-type='citation']")
-        if btn and btn.is_displayed():
+        if btn is not None and btn.is_displayed():
             return btn
 
         # 兜底 3: 在 msg 内部找
@@ -271,7 +303,7 @@ class YuanbaoSourceCollector:
         ]
         for xp in xpaths:
             btn = self._safe_find(By.XPATH, xp, msg)
-            if btn and btn.is_displayed():
+            if btn is not None and btn.is_displayed():
                 return btn
         return None
 
@@ -291,7 +323,7 @@ class YuanbaoSourceCollector:
             ]
             for by, val in selectors:
                 el = self._safe_find(by, val)
-                if el and el.is_displayed() and el.size.get("width", 0) > 50:
+                if el is not None and el.is_displayed() and el.size.get("width", 0) > 50:
                     print("引用来源弹出已出现")
                     return el
             time.sleep(0.5)
@@ -352,7 +384,7 @@ class YuanbaoSourceCollector:
         for card in cards:
             url = card.get_attribute("data-url") or ""
             title_el = self._safe_find(By.CSS_SELECTOR, ".hyc-common-markdown__ref_card-title", card)
-            title = title_el.text.strip() if title_el else ""
+            title = title_el.text.strip() if title_el is not None else ""
             if url:
                 sources.append({"title": title, "url": url})
 
@@ -378,130 +410,118 @@ class YuanbaoSourceCollector:
         return unique
 
     def _collect_all_sources(self, msg: WebElement) -> List[Dict[str, str]]:
-        """收集所有信源：点击底部"源"按钮，右侧抽屉弹出，提取所有信源项。"""
-        sources = []
+        """按需打开引用抽屉，等待来源加载完成，提取后关闭抽屉。"""
+        drawer_selector = ".t-drawer.agent-dialogue__drawer.t-drawer--open"
+        drawer = self._safe_find(By.CSS_SELECTOR, drawer_selector)
 
-        # 找到"源"按钮
-        btn = self._safe_find(By.CSS_SELECTOR, "#search-guide-tool")
-        if not btn:
-            print("未找到信源按钮")
-            return sources
+        # 重试时抽屉可能仍然开着；这时再次点击会把它关闭并导致一直 0/N。
+        if drawer is None:
+            btn = self._safe_find(By.CSS_SELECTOR, "#search-guide-tool")
+            if btn is None:
+                print("未找到引用来源按钮")
+                return []
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", msg)
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            self.driver.execute_script(
+                "arguments[0].dispatchEvent(new MouseEvent('click',"
+                "{bubbles:true,cancelable:true,view:window}));",
+                btn,
+            )
+            for _ in range(20):
+                drawer = self._safe_find(By.CSS_SELECTOR, drawer_selector)
+                if drawer is not None:
+                    break
+                time.sleep(0.5)
 
-        # 滚到视口并点击
-        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", msg)
-        time.sleep(0.5)
-        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-        time.sleep(0.5)
-
-        # Yuanbao's React handler currently ignores Selenium's synthetic
-        # element.click() in some builds; a bubbling MouseEvent matches a real
-        # toolbar click and reliably opens the citation drawer.
-        self.driver.execute_script(
-            "arguments[0].dispatchEvent(new MouseEvent('click',"
-            "{bubbles:true,cancelable:true,view:window}));", btn
-        )
-
-        # 等待右侧抽屉出现（真实 DOM: .t-drawer.agent-dialogue__drawer.t-drawer--open）
-        print("等待右侧信源抽屉...")
-        drawer = None
-        for _ in range(20):
-            drawer = self._safe_find(By.CSS_SELECTOR, ".t-drawer.agent-dialogue__drawer.t-drawer--open")
-            if drawer:
-                break
-            time.sleep(0.5)
-
-        if not drawer:
-            print("信源抽屉未出现")
+        if drawer is None:
+            print("引用来源抽屉未打开")
             self._dump_snapshot("drawer_not_opened")
-            return sources
+            return []
 
-        print("信源抽屉已出现，开始收集...")
-
-        # 真实 DOM: 信源卡片是 .hyc-common-markdown__ref_card，data-url 在上面
-        # 标题在 .hyc-common-markdown__ref_card-title 里
-        # 用 JS 直接提取，避免抽屉 CSS 隐藏导致 Selenium 找不到
-        seen_urls = set()
-
-        time.sleep(1)
-
-        # 用 JS 从整个页面提取所有 ref_card（抽屉打开后它们就在 DOM 里）
-        js_result = self.driver.execute_script("""
+        expected = self._expected_source_count()
+        best = []
+        previous_count = -1
+        stable_rounds = 0
+        deadline = time.time() + 10
+        try:
+            while time.time() < deadline:
+                js_result = self.driver.execute_script("""
             function extractTitle(card) {
-                // 1. 优先取专用 title 元素
                 var titleEl = card.querySelector('.hyc-common-markdown__ref_card-title');
                 if (titleEl && titleEl.textContent.trim()) {
                     return titleEl.textContent.trim();
                 }
-                // 2. title 元素内的 span
-                var spanEl = card.querySelector('.hyc-common-markdown__ref_card-title span');
-                if (spanEl && spanEl.textContent.trim()) {
-                    return spanEl.textContent.trim();
-                }
-                // 3. 卡片内的链接文本
                 var aEl = card.querySelector('a[href]');
                 if (aEl) {
                     var aText = (aEl.textContent || aEl.getAttribute('title') || '').trim();
                     if (aText) return aText.substring(0, 120);
                 }
-                // 4. 卡片内任意带文本的子元素
-                var candidates = card.querySelectorAll('[class*="title"], [class*="name"], [class*="desc"], span, p, div');
-                for (var j = 0; j < candidates.length; j++) {
-                    var t = (candidates[j].textContent || '').trim();
-                    if (t && t.length > 2) return t.substring(0, 120);
-                }
-                // 5. 兜底:卡片自身文本
                 var selfText = (card.textContent || '').trim().replace(/\\s+/g, ' ');
                 return selfText.substring(0, 120);
             }
             var results = [];
-            var cards = document.querySelectorAll('.hyc-common-markdown__ref_card');
+            var cards = document.querySelectorAll(
+                '.t-drawer.agent-dialogue__drawer.t-drawer--open .hyc-common-markdown__ref_card[data-url]'
+            );
             for (var i = 0; i < cards.length; i++) {
                 var url = cards[i].getAttribute('data-url') || '';
-                if (url) {
-                    results.push({url: url, title: extractTitle(cards[i])});
-                }
+                if (url) results.push({url: url, title: extractTitle(cards[i])});
             }
-            // 兜底：也从 agent-dialogue-references__item 的 dt-ext6 取
+            // 部分元宝版本使用另一套来源列表 DOM。
             if (results.length === 0) {
-                var items = document.querySelectorAll('.agent-dialogue-references__item');
+                var items = document.querySelectorAll(
+                    '.t-drawer.agent-dialogue__drawer.t-drawer--open .agent-dialogue-references__item[dt-ext6]'
+                );
                 for (var i = 0; i < items.length; i++) {
                     var url = items[i].getAttribute('dt-ext6') || '';
-                    var title = items[i].textContent.trim().split('\\n')[0].substring(0, 100);
-                    if (url) {
-                        results.push({url: url, title: title});
-                    }
+                    var title = (items[i].textContent || '').trim().split('\\n')[0].substring(0, 120);
+                    if (url) results.push({url: url, title: title});
                 }
             }
             return results;
-        """)
+                """) or []
 
-        if js_result:
-            for item in js_result:
-                url = item.get("url", "")
-                title = item.get("title", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    sources.append({"title": title, "url": url})
+                seen_urls = set()
+                current = []
+                for item in js_result:
+                    url = item.get("url", "")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        current.append({"title": item.get("title", ""), "url": url})
+                if len(current) > len(best):
+                    best = current
+                if expected and len(best) >= expected:
+                    break
+                if len(current) == previous_count and len(current) > 0:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                if stable_rounds >= 3:
+                    break
+                previous_count = len(current)
+                time.sleep(0.5)
+        finally:
+            self._close_drawer()
 
-        print(f"共收集 {len(sources)} 条信源")
-        return sources
+        print(f"共收集 {len(best)} 条引用来源（预期 {expected or '未知'}）")
+        return best
 
     def _expected_source_count(self) -> int:
+        # Only the citation toolbar owns the authoritative count. Never scan
+        # answer/drawer text: product copy such as "参考价 69 元" is not a
+        # source count and previously caused an endless 16/69 retry loop.
         texts = self.driver.execute_script("""
             return Array.from(document.querySelectorAll(
-                '#search-guide-tool, .agent-dialogue__drawer.t-drawer--open'
+                '#search-guide-tool, [data-toolbar-type="citation"]'
             )).map(function(el) {
-                return [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
+                return [el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' ');
             }).join('\\n');
         """) or ""
-        matches = re.findall(r"(?:参考|来源|信源)[^\d]{0,8}(\d+)|(\d+)[^\d]{0,4}(?:篇|条|个)?(?:参考|来源|信源)", texts)
-        counts = [
-            value
-            for left, right in matches
-            if left or right
-            for value in [int(left or right)]
-            if 0 < value <= 100
-        ]
+        matches = re.findall(
+            r"(?:引用\s*)?(\d{1,3})\s*篇(?:资料)?(?:作为参考)?",
+            str(texts),
+        )
+        counts = [int(value) for value in matches if 0 < int(value) <= 100]
         return max(counts, default=0)
 
     def _close_drawer(self):
@@ -563,7 +583,7 @@ class YuanbaoSourceCollector:
 
         # 模拟器已等回复完整，直接找最后一条 AI 回复
         last_msg = self._find_last_message()
-        if not last_msg:
+        if last_msg is None:
             print("未找到模型回复")
             self._dump_snapshot("no_reply")
             self._save(result, output_path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
@@ -50,10 +51,16 @@ MUMU_MANAGER_CANDIDATES = [
 ]
 MEMU_CONSOLE_CANDIDATES = [
     Path(os.environ.get("MEMU_CONSOLE_PATH", "")),
+    Path(os.environ.get("MEMUC_PATH", "")),
     Path(r"C:\Program Files\Microvirt\MEmu\memuc.exe"),
     Path(r"C:\Program Files (x86)\Microvirt\MEmu\memuc.exe"),
     Path(r"D:\Program Files\Microvirt\MEmu\memuc.exe"),
+    Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+    / "Microvirt/MEmu/memuc.exe",
+    Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+    / "Microvirt/MEmu/memuc.exe",
 ]
+MEMUC_CANDIDATES = MEMU_CONSOLE_CANDIDATES
 CHROME_CANDIDATES = [
     Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
     / "Google/Chrome/Application/chrome.exe",
@@ -188,6 +195,26 @@ def run_text(
     return result
 
 
+def run_memuc_text(
+    command: list[str],
+    *,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Run MEMUC using the Windows ANSI code page used by its Chinese build."""
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="mbcs" if os.name == "nt" else "utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PipelineError(f"逍遥命令执行失败或超时：{' '.join(command)}；{exc}") from exc
+
+
 def _registry_app_path(executable: str) -> Path | None:
     if os.name != "nt":
         return None
@@ -304,6 +331,15 @@ def resolve_mumu_manager() -> Path | None:
     )
 
 
+def resolve_memuc() -> Path | None:
+    """Locate MEmu's supported multi-instance command line controller."""
+    return (
+        first_existing(MEMUC_CANDIDATES)
+        or _registry_app_path("memuc.exe")
+        or _where_executable("memuc.exe")
+    )
+
+
 def resolve_chrome() -> Path | None:
     return (
         first_existing(CHROME_CANDIDATES)
@@ -377,6 +413,76 @@ def parse_memu_adb_devices(
     return instances
 
 
+def parse_memu_listvms(
+    output: str,
+    requested_index: str | None,
+) -> list[dict[str, Any]]:
+    """Parse ``memuc listvms --running`` CSV output."""
+    instances: list[dict[str, Any]] = []
+    for row in csv.reader(output.splitlines()):
+        if len(row) < 4:
+            continue
+        index = str(row[0]).strip()
+        if not index.isdigit() or str(row[3]).strip() not in {"1", "true", "True"}:
+            continue
+        if requested_index is not None and index != str(requested_index):
+            continue
+        instances.append(
+            {
+                "index": index,
+                "name": str(row[1]).strip() or f"逍遥模拟器-{index}",
+                "serial": "",
+                "pid": int(row[4]) if len(row) > 4 and str(row[4]).isdigit() else None,
+                "emulator": "memu",
+            }
+        )
+    instances.sort(key=lambda item: int(item["index"]))
+    return instances
+
+
+def memu_serial_for_instance(memuc: Path, index: str) -> str:
+    result = run_memuc_text(
+        [str(memuc), "adb", "-i", str(index), "get-serialno"],
+        timeout=15,
+    )
+    matches = re.findall(r"(?:127\.0\.0\.1|localhost):(\d+)", result.stdout)
+    if result.returncode == 0 and matches:
+        return f"127.0.0.1:{matches[-1]}"
+    detail = (result.stderr or result.stdout).strip()
+    raise PipelineError(
+        f"无法读取逍遥实例 {index} 的 ADB 地址：{detail or 'memuc 无返回'}"
+    )
+
+
+def discover_memu_instances(
+    logger: logging.Logger,
+    requested_index: str | None,
+) -> list[dict[str, Any]]:
+    memuc = resolve_memuc()
+    if memuc is None:
+        return []
+    result = run_memuc_text([str(memuc), "listvms", "--running"], timeout=15)
+    if result.returncode != 0:
+        logger.warning(
+            "逍遥实例查询失败，将尝试 MuMu：%s",
+            (result.stderr or result.stdout).strip(),
+        )
+        return []
+    instances = parse_memu_listvms(result.stdout, requested_index)
+    for instance in instances:
+        instance["serial"] = memu_serial_for_instance(memuc, str(instance["index"]))
+    if instances:
+        logger.info(
+            "发现 %s 台已启动的逍遥模拟器：%s",
+            len(instances),
+            "，".join(
+                f"{item['name']}[实例 {item['index']}, {item['serial']}]"
+                for item in instances
+            ),
+        )
+    return instances
+
+
 def discover_mumu_instances_via_adb(
     logger: logging.Logger,
     requested_index: str | None,
@@ -402,6 +508,10 @@ def discover_mumu_instances(
     logger: logging.Logger,
     requested_index: str | None,
 ) -> list[dict[str, Any]]:
+    """Discover MEmu first, retaining MuMu as a compatibility fallback."""
+    memu_instances = discover_memu_instances(logger, requested_index)
+    if memu_instances:
+        return memu_instances
     manager = resolve_mumu_manager()
     if manager is None:
         return discover_mumu_instances_via_adb(
@@ -452,6 +562,7 @@ def discover_mumu_instances(
                 "name": str(item.get("name") or f"MuMu-{index}"),
                 "serial": f"{host}:{port}",
                 "pid": item.get("pid"),
+                "emulator": "mumu",
             }
         )
     if not instances:
@@ -476,6 +587,11 @@ def resolve_adb() -> Path:
     configured = Path(str(os.environ.get("ADB_PATH") or "").strip())
     if str(configured) and configured.is_file():
         return configured
+    memuc = resolve_memuc()
+    if memuc is not None:
+        memu_adb = memuc.parent / "adb.exe"
+        if memu_adb.is_file():
+            return memu_adb
     adb = first_existing(mumu.ADB_CANDIDATES)
     if adb:
         return adb

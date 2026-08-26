@@ -5,7 +5,13 @@ import unittest
 from unittest import mock
 from PIL import Image, ImageDraw
 
-from remote_model_control_panel import account_gate_open, build_worker_command
+from remote_model_control_panel import (
+    RemoteModelPanel,
+    account_gate_open,
+    build_worker_command,
+    console_python_executable,
+)
+from monitor_core.collector_guard import collector_guard_port
 from wenxin_monitor import controller as wenxin_controller
 
 
@@ -61,15 +67,39 @@ class RemoteModelPanelTest(unittest.TestCase):
             result = controller.wait_for_generation_complete(10, already_seen=True)
         self.assertTrue(result["generation_complete"])
 
-    def test_wenxin_and_yuanbao_require_successful_login_check(self):
-        self.assertFalse(account_gate_open("wenxin", False))
+    def test_wenxin_security_verification_is_detected_immediately(self):
+        check = wenxin_controller.WenxinWebCollector._is_security_verification
+        self.assertTrue(check({"url": "https://wappass.baidu.com/static/captcha/example"}))
+        self.assertTrue(check({"url": "https://www.baidu.com/", "pageText": "百度安全验证 请完成下方验证"}))
+        self.assertFalse(check({"url": "https://www.baidu.com/s?wd=test", "pageText": "普通搜索结果"}))
+
+    def test_only_yuanbao_requires_successful_login_check(self):
+        self.assertTrue(account_gate_open("wenxin", False))
         self.assertFalse(account_gate_open("yuanbao", False))
         self.assertTrue(account_gate_open("wenxin", True))
         self.assertTrue(account_gate_open("deepseek", False))
 
+    def test_wenxin_baidu_check_is_allowed_while_another_collector_runs(self):
+        panel = RemoteModelPanel.__new__(RemoteModelPanel)
+        panel.model = "wenxin"
+        panel.account_check_running = False
+        panel.external_worker_running = True
+        panel.process = None
+        panel.status_var = mock.Mock()
+        panel.account_var = mock.Mock()
+        panel.account_button = mock.Mock()
+        panel.start_button = mock.Mock()
+        panel.append_log = mock.Mock()
+        panel.account_worker = mock.Mock()
+        thread = mock.Mock()
+        with mock.patch("remote_model_control_panel.threading.Thread", return_value=thread):
+            panel.check_account()
+        self.assertTrue(panel.account_check_running)
+        thread.start.assert_called_once_with()
+
     def test_worker_command_is_bound_to_one_model(self) -> None:
         command = build_worker_command("deepseek", 20, "interleaved", "D:/pairing.json")
-        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[0], console_python_executable())
         self.assertEqual(command[command.index("--model") + 1], "deepseek")
         self.assertEqual(command[command.index("--rounds") + 1], "20")
         self.assertEqual(command[command.index("--pairing") + 1], "D:/pairing.json")
@@ -78,6 +108,34 @@ class RemoteModelPanelTest(unittest.TestCase):
         command = build_worker_command("yuanbao", 0, "sequential")
         self.assertNotIn("--pairing", command)
         self.assertEqual(command[command.index("--rounds") + 1], "1")
+
+    def test_wenxin_worker_command_accepts_up_to_four_tasks(self) -> None:
+        command = build_worker_command("wenxin", 10, "interleaved", tasks=4)
+        self.assertEqual(command[command.index("--tasks") + 1], "4")
+        clamped = build_worker_command("wenxin", 10, "interleaved", tasks=9)
+        self.assertEqual(clamped[clamped.index("--tasks") + 1], "4")
+
+    def test_worker_uses_console_python_when_panel_runs_under_pythonw(self) -> None:
+        with mock.patch("remote_model_control_panel.sys.executable", r"C:\Python\pythonw.exe"), \
+                mock.patch("remote_model_control_panel.Path.is_file", return_value=True):
+            self.assertEqual(console_python_executable(), r"C:\Python\python.exe")
+
+    def test_web_only_wenxin_has_an_independent_collector_guard(self) -> None:
+        self.assertNotEqual(collector_guard_port("wenxin"), collector_guard_port("yuanbao"))
+        self.assertEqual(collector_guard_port("yuanbao"), collector_guard_port("deepseek"))
+
+    def test_panel_stop_terminates_its_worker_process_tree(self) -> None:
+        panel = RemoteModelPanel.__new__(RemoteModelPanel)
+        panel.process = mock.Mock(pid=4321)
+        panel.process.poll.return_value = None
+        panel.append_log = mock.Mock()
+        with mock.patch("remote_model_control_panel.os.name", "nt"), \
+                mock.patch("remote_model_control_panel.subprocess.run") as run:
+            panel.stop()
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "4321", "/T", "/F"], capture_output=True, check=False
+        )
+        panel.append_log.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ class RemoteModelWorkerTests(unittest.TestCase):
             )
             with mock.patch.object(remote_model_worker, "ROOT", root), \
                     mock.patch.object(remote_model_worker, "start_result_sync") as start_sync, \
+                    mock.patch.object(remote_model_worker, "collector_guard_port", return_value=0), \
                     mock.patch.object(remote_model_worker, "discover_plugins", return_value={"deepseek": Plugin()}), \
                     mock.patch.object(sys, "argv", ["remote_model_worker.py", "--model", "deepseek", "--rounds", "2"]):
                 self.assertEqual(remote_model_worker.main(), 0)

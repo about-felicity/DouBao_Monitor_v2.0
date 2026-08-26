@@ -17,9 +17,66 @@ from pathlib import Path
 from typing import Any
 
 import uiautomator2 as u2
+import adbutils
 
 
 BASE_DIR = Path(__file__).resolve().parent
+MU_MU_ADB_PORTS = tuple(range(16384, 16641, 32))
+LOCAL_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _adb_shell_text(serial: str, command: list[str]) -> str:
+    result = adbutils.adb.device(serial).shell(command)
+    return str(getattr(result, "output", result) or "")
+
+
+def ensure_deepseek_device(serial: str, timeout: float = 60) -> str:
+    """Reconnect a MuMu ADB endpoint and wait until shell + DeepSeek are ready."""
+    deadline = time.monotonic() + max(5.0, float(timeout))
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if ":" in serial:
+                adbutils.adb.connect(serial, timeout=5)
+            marker = _adb_shell_text(serial, ["echo", "DEEPSEEK_DEVICE_READY"])
+            package = _adb_shell_text(serial, ["pm", "path", DeepSeekAppController.PACKAGE])
+            if "DEEPSEEK_DEVICE_READY" in marker and "package:" in package:
+                return serial
+            last_error = RuntimeError("设备在线，但尚未检测到 DeepSeek App")
+        except Exception as exc:
+            last_error = exc
+            try:
+                if ":" in serial:
+                    adbutils.adb.disconnect(serial)
+            except Exception:
+                pass
+        time.sleep(2)
+    raise RuntimeError(f"MuMu ADB {serial} 在 {int(timeout)} 秒内未就绪：{last_error}") from last_error
+
+
+def discover_deepseek_device(preferred: str = "127.0.0.1:16384", timeout: float = 75) -> str:
+    """Prefer configured MuMu, then safely find another instance containing DeepSeek."""
+    candidates = [str(preferred or "127.0.0.1:16384").strip()]
+    for port in MU_MU_ADB_PORTS:
+        candidate = f"127.0.0.1:{port}"
+        if candidate in candidates:
+            continue
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                candidates.append(candidate)
+        except OSError:
+            continue
+    deadline = time.monotonic() + max(10.0, float(timeout))
+    errors = []
+    for serial in candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return ensure_deepseek_device(serial, timeout=min(25.0, remaining))
+        except Exception as exc:
+            errors.append(f"{serial}: {exc}")
+    raise RuntimeError("没有找到已启动且安装 DeepSeek 的 MuMu 实例。" + "；".join(errors))
 
 
 def _chrome_executable() -> Path:
@@ -186,16 +243,38 @@ class DeepSeekAppController:
     BUSY_HINTS = ("停止生成", "停止回答", "正在生成", "思考中", "搜索中")
 
     def __init__(self, serial: str = "127.0.0.1:16384", connect_timeout: int = 15):
-        self.serial = serial
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                self.d = executor.submit(u2.connect, serial).result(timeout=connect_timeout)
-        except FutureTimeoutError as exc:
-            raise RuntimeError(f"连接 MuMu {serial} 超时") from exc
+        # A supplied serial is an isolation boundary. Never fall back to a
+        # different emulator here; multi-instance hosts may be running another
+        # model on the neighboring MuMu port.
+        self.serial = ensure_deepseek_device(serial, timeout=max(45, connect_timeout * 3))
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    self.d = executor.submit(u2.connect, self.serial).result(timeout=connect_timeout)
+                break
+            except FutureTimeoutError as exc:
+                last_error = RuntimeError(f"连接 MuMu {self.serial} 超时")
+            except Exception as exc:
+                last_error = exc
+            if attempt == 0:
+                try:
+                    adbutils.adb.disconnect(self.serial)
+                except Exception:
+                    pass
+                ensure_deepseek_device(self.serial, timeout=30)
+        else:
+            raise RuntimeError(f"连接 MuMu {self.serial} 失败：{last_error}") from last_error
+        self.input_ime_ready = False
         try:
             self.d.set_input_ime(True)
+            self.input_ime_ready = True
         except Exception:
-            self.d.set_fastinput_ime(True)
+            # Some MuMu images block `ime enable` from ADB for security. The
+            # UiObject JSON-RPC set_text path still supports Unicode input and
+            # is verified again immediately before Send, so this is a safe
+            # compatibility fallback rather than a blind input attempt.
+            self.input_ime_ready = False
 
     def ensure_ready(self) -> None:
         self.d.app_start(self.PACKAGE, stop=False)
@@ -357,7 +436,9 @@ class DeepSeekWebCollector:
         self.host = f"http://127.0.0.1:{port}"
 
     def _json(self, path: str) -> Any:
-        with urllib.request.urlopen(self.host + path, timeout=10) as response:
+        # Chrome's debugging endpoint is always local. Bypass HTTP(S)_PROXY so
+        # corporate/system proxies cannot turn 127.0.0.1 requests into 502s.
+        with LOCAL_HTTP_OPENER.open(self.host + path, timeout=10) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))
 
     def _page(self) -> dict[str, Any]:

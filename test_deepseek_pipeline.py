@@ -9,6 +9,22 @@ if str(DEEPSEEK_DIR) not in sys.path:
     sys.path.insert(0, str(DEEPSEEK_DIR))
 
 import controller
+import deepseek_loop
+from model_plugins.deepseek.plugin import Plugin as DeepSeekPlugin
+
+
+class DeepSeekSchedulingTests(unittest.TestCase):
+    def test_interval_is_always_clamped_strictly_between_90_and_120_seconds(self):
+        for requested in ((0, 999), (90, 120), (120, 300), (95, 115)):
+            lower, upper = deepseek_loop.safe_interval_bounds(*requested)
+            self.assertGreater(lower, 90)
+            self.assertLess(upper, 120)
+            self.assertLessEqual(lower, upper)
+
+    def test_remote_plugin_uses_the_safe_interval_window(self):
+        command, _cwd = DeepSeekPlugin().command({"rounds": 1, "question_mode": "interleaved"})
+        self.assertEqual(command[command.index("--min-interval") + 1], "92")
+        self.assertEqual(command[command.index("--max-interval") + 1], "118")
 
 
 class _FakeDevice:

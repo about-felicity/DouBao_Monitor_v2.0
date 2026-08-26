@@ -33,6 +33,8 @@ CREATE_NO_WINDOW = (
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 ADB_CANDIDATES = [
+    Path(r"C:\Program Files\Microvirt\MEmu\adb.exe"),
+    Path(r"C:\Program Files (x86)\Microvirt\MEmu\adb.exe"),
     BASE_DIR
     / "portable_runtime"
     / "AndroidSDK"

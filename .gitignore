@@ -33,6 +33,7 @@ doubao_mumu_controller/portable_runtime/
 /doubao_source_cache.json
 /doubao_brand_ai_cache.json
 /doubao_source_content_index.json
+/doubao_source_content_index*.json
 /doubao_source_content.db
 /doubao_run_counter.txt
 /yuanbao_monitor/yuanbao_results.jsonl
@@ -43,6 +44,9 @@ doubao_mumu_controller/portable_runtime/
 /yuanbao_monitor/dashboard/.next/
 /yuanbao_monitor/dashboard/dist/
 /yuanbao_monitor/dashboard/.wrangler/
+*.tsbuildinfo
+/yuanbao_monitor/instance_*_current.png
+/yuanbao_monitor/yuanbao_browser_assignments.json
 /yuanbao_monitor/snapshot_*.html
 /yuanbao_monitor/create_bat.py
 /yuanbao_monitor/find_drawer*.py

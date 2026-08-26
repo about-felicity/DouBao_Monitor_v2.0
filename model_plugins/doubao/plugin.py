@@ -50,6 +50,9 @@ class Plugin(ModelPlugin):
     config = ROOT / "doubao_mumu_controller" / "doubao_mumu_panel_config.json"
     runner = ROOT / "doubao_mumu_controller" / "doubao_mumu_scheduled_job.py"
     readiness_path = ROOT / "doubao_mumu_controller" / "doubao_panel_readiness.json"
+    # PostgreSQL synchronization must notice analysis-only updates as well as
+    # newly captured answers and source links.
+    results_dependencies = (REFS, ANSWERS, PRODUCTS)
 
     def ready(self) -> bool:
         return self.config.exists() and self.runner.exists()

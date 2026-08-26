@@ -25,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from monitor_core.plugins import ROOT
+from monitor_core.database import store_ingested_run
+from monitor_core.ingestion import normalize_remote_record
 from monitor_core.recommendation_questions import canonical_recommendation_question
 
 
@@ -33,12 +35,13 @@ PAIRING = ROOT / "runtime" / "lan_result_pairing.json"
 QUEUE = ROOT / "runtime" / "lan_result_receiver"
 DISCOVERY_PORT = 8792
 DISCOVERY_SERVICE = "monitor-lan-result-v1"
-MODELS = {"deepseek", "yuanbao", "wenxin", "afu"}
+MODELS = {"deepseek", "yuanbao", "wenxin", "afu", "quark"}
 TARGETS = {
     "deepseek": ROOT / "deepseek_monitor" / "deepseek_results.jsonl",
     "yuanbao": ROOT / "yuanbao_monitor" / "yuanbao_results.jsonl",
     "wenxin": ROOT / "wenxin_monitor" / "wenxin_results.jsonl",
     "afu": ROOT / "afu_monitor" / "afu_results.jsonl",
+    "quark": ROOT / "quark_monitor" / "quark_results.jsonl",
 }
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,9 +50,28 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary = Path(temporary_name)
     try:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        last_error: OSError | None = None
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+                time.sleep(0.05 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _unlink_best_effort(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        # Queue processing is already durable at this point. A transient
+        # Windows file lock may leave a harmless stale receipt for a later pass.
+        pass
 
 
 def load_config() -> dict[str, Any]:
@@ -77,7 +99,7 @@ def preferred_lan_ip() -> str:
 
 def write_pairing(config: dict[str, Any]) -> None:
     port = int(config["port"])
-    ip = preferred_lan_ip()
+    ip = str(config.get("advertised_ip") or preferred_lan_ip()).strip()
     token = str(config["token"])
     fallback_port = 8765
     _atomic_json(PAIRING, {"version": 3, "receiver_url": f"http://{ip}:{port}",
@@ -186,6 +208,11 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
     successful = str(record.get("status") or "success").casefold() == "success"
     expected_source_count = max(len(compact_sources), int(record.get("expected_source_count") or 0))
     capture_complete = bool(record.get("source_capture_complete", len(compact_sources) >= expected_source_count))
+    if model == "wenxin" and not compact_sources:
+        # A 0/0 Wenxin round is a citation-selector/capture failure, not a valid
+        # source-less answer.  Quarantine it even when an outdated collector sent
+        # source_capture_complete=true.
+        capture_complete = False
     return {
         "request_id": request_id,
         "model": model,
@@ -198,6 +225,10 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
             "question_present": bool(question),
             "answer_present": bool(answer),
             "answer_length": len(answer),
+            "task_id": int(record.get("task_id") or 1),
+            "capture_mode": str(record.get("capture_mode") or ""),
+            "capture_label": str(record.get("capture_label") or ""),
+            "body_capture_complete": bool(record.get("body_capture_complete", bool(answer))),
             "source_count": len(compact_sources),
             "expected_source_count": expected_source_count,
             "source_capture_complete": successful and capture_complete and len(compact_sources) >= expected_source_count,
@@ -229,74 +260,99 @@ def analyze_record_products(record: dict[str, Any]) -> None:
         record["product_extraction_method"] = "none"
         record["product_analysis_model"] = ""
         return
-    from save_doubao_refs import review_products_with_ai
-    products, review_status, extraction_method, analysis_model = review_products_with_ai(answer)
-    if review_status == "ai_pending":
-        raise RuntimeError("product analysis is pending; queued result will retry automatically")
+    # Preserve products only when the remote side already completed the same
+    # verified review contract. Otherwise queue enrichment without making an
+    # external model call on the ingestion thread. This keeps answer/source
+    # durability independent from billing, rate limits, and network latency.
+    review_status = str(record.get("product_review_status") or "")
+    products = record.get("products") if isinstance(record.get("products"), list) else []
+    if review_status != "ai_verified":
+        products = []
+        review_status = "ai_pending"
+        record["product_extraction_method"] = "pending"
+        record["product_analysis_model"] = ""
     record["products"] = products
     record["brands"] = sorted({
         str(item.get("brand_name") or "").strip()
         for item in products if isinstance(item, dict) and str(item.get("brand_name") or "").strip()
     })
     record["product_review_status"] = review_status
-    record["product_extraction_method"] = extraction_method
-    record["product_analysis_model"] = analysis_model
-
-
-def target_has_request(target: Path, request_id: str) -> bool:
-    if not target.exists():
-        return False
-    needle = f'"remote_request_id": "{request_id}"'
-    try:
-        with target.open("r", encoding="utf-8") as handle:
-            return any(needle in line for line in handle)
-    except OSError:
-        return False
 
 
 class ResultWorker(threading.Thread):
-    def __init__(self, server: "Server") -> None:
-        super().__init__(name="lan-result-analysis-worker", daemon=True)
+    def __init__(self, server: "Server", models: tuple[str, ...]) -> None:
+        super().__init__(name=f"lan-result-analysis-{'-'.join(models)}", daemon=True)
         self.server = server
+        self.models = models
         self.stop_event = threading.Event()
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             processed = False
-            for model in sorted(MODELS):
+            for model in self.models:
                 inbox = QUEUE / model / "inbox"
                 for path in sorted(inbox.glob("*.json")) if inbox.exists() else []:
                     processed = True
-                    self.process(model, path)
+                    try:
+                        self.process(model, path)
+                    except Exception:
+                        # One corrupt or temporarily locked queue item must not
+                        # terminate ingestion for the entire model.
+                        self.stop_event.wait(0.5)
                     if self.stop_event.is_set():
                         break
             self.stop_event.wait(0.25 if processed else 1.0)
 
     def process(self, model: str, path: Path) -> None:
+        value: dict[str, Any] = {}
+        record: dict[str, Any] = {}
         try:
             value = json.loads(path.read_text(encoding="utf-8-sig"))
             request_id, record = validate_result_envelope(model, value)
             analyze_record_products(record)
+            sources = record.get("sources") if isinstance(record.get("sources"), list) else []
+            record["expected_source_count"] = max(int(record.get("expected_source_count") or 0), len(sources))
             record["model_id"] = model
             record["remote_request_id"] = request_id
             record["remote_source_device"] = str(value.get("source_device") or "")
             record["remote_received_at"] = time.time()
-            target = TARGETS[model]
-            target.parent.mkdir(parents=True, exist_ok=True)
             error_path = QUEUE / model / "errors" / f"{request_id}.json"
             with self.server.write_lock:
-                if not error_path.exists() or not target_has_request(target, request_id):
-                    with target.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                _atomic_json(QUEUE / model / "done" / f"{request_id}.json", result_receipt(model, request_id, value, record))
-                path.unlink(missing_ok=True)
-                error_path.unlink(missing_ok=True)
+                # A response is not acknowledged as complete until its full raw
+                # event and query-ready children commit in the same PostgreSQL
+                # transaction. There is deliberately no CSV/JSONL write here.
+                stored = store_ingested_run(
+                    model, request_id, record, value,
+                    normalize_remote_record(model, record),
+                )
+                receipt = result_receipt(model, request_id, value, record)
+                receipt["stored_run_id"] = str(stored.get("run_id") or "")
+                receipt["analysis"]["duplicate_answer"] = bool(stored.get("deduplicated"))
+                receipt["analysis"]["duplicate_reason"] = str(stored.get("duplicate_reason") or "")
+                receipt["analysis"]["quarantined"] = bool(stored.get("quarantined"))
+                receipt["analysis"]["quarantine_reason"] = str(stored.get("quarantine_reason") or "")
+                _atomic_json(QUEUE / model / "done" / f"{request_id}.json", receipt)
+                _unlink_best_effort(path)
+                _unlink_best_effort(error_path)
         except Exception as exc:
-            _atomic_json(QUEUE / model / "errors" / f"{path.stem}.json", {
+            error = {
                 "request_id": path.stem,
                 "last_error": f"{type(exc).__name__}: {exc}",
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            })
+            }
+            if record:
+                receipt = result_receipt(model, path.stem, value, record)
+                error.update({
+                    "source_device": receipt["source_device"],
+                    "question": receipt["question"],
+                    "received_at": receipt["received_at"],
+                    "rows_written": receipt["rows_written"],
+                    "analysis": receipt["analysis"],
+                })
+            try:
+                _atomic_json(QUEUE / model / "errors" / f"{path.stem}.json", error)
+            except OSError:
+                pass
             self.stop_event.wait(2.0)
 
 
@@ -308,12 +364,15 @@ class Server(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.config = config
         self.write_lock = threading.Lock()
-        self.worker = ResultWorker(self)
-        self.worker.start()
+        self.workers = [ResultWorker(self, (model,)) for model in sorted(MODELS)]
+        for worker in self.workers:
+            worker.start()
 
     def server_close(self) -> None:
-        self.worker.stop_event.set()
-        self.worker.join(timeout=3)
+        for worker in self.workers:
+            worker.stop_event.set()
+        for worker in self.workers:
+            worker.join(timeout=3)
         super().server_close()
 
 

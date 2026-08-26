@@ -59,6 +59,10 @@ export function AfuIcon({ className, size = 24 }: IconProps) {
   return <img alt="蚂蚁阿福" className={className} height={size} src="/afu-icon.png" width={size} />;
 }
 
+export function QuarkIcon({ className, size = 24 }: IconProps) {
+  return <img alt="夸克" className={className} height={size} src="/quark-icon.svg" width={size} />;
+}
+
 export function getIcon(tone: string) {
-  return tone === "deepseek" ? DeepSeekIcon : tone === "doubao" ? DoubaoIcon : tone === "wenxin" ? WenxinIcon : tone === "yuanbao" ? YuanbaoIcon : tone === "afu" ? AfuIcon : null;
+  return tone === "deepseek" ? DeepSeekIcon : tone === "doubao" ? DoubaoIcon : tone === "wenxin" ? WenxinIcon : tone === "yuanbao" ? YuanbaoIcon : tone === "quark" ? QuarkIcon : tone === "afu" ? AfuIcon : null;
 }

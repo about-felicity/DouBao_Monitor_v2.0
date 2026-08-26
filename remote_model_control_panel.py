@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -14,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from monitor_core.plugins import ROOT, discover_plugins
+from monitor_core.collector_guard import collector_guard_port
 
 
 MODELS = {
@@ -21,23 +24,84 @@ MODELS = {
     "yuanbao": "腾讯元宝",
     "wenxin": "文心",
 }
-LOGIN_REQUIRED_MODELS = frozenset({"yuanbao", "wenxin"})
+LOGIN_REQUIRED_MODELS = frozenset({"yuanbao"})
+
+
+def focus_existing_panel(model: str) -> bool:
+    """Restore an existing model panel when its launcher is clicked again."""
+    if os.name != "nt":
+        return False
+    expected_title = f"{MODELS[model]} 远端采集控制面板"
+    found: list[int] = []
+    user32 = ctypes.windll.user32
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def visit(hwnd, _lparam):
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        if buffer.value == expected_title:
+            found.append(int(hwnd))
+            return False
+        return True
+
+    user32.EnumWindows(callback_type(visit), 0)
+    if not found:
+        return False
+    hwnd = found[0]
+    user32.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    return True
 
 
 def account_gate_open(model: str, verified: bool) -> bool:
     return model not in LOGIN_REQUIRED_MODELS or verified
 
 
-def build_worker_command(model: str, rounds: int, question_mode: str, pairing: str = "") -> list[str]:
+def remote_collector_running(model: str) -> bool:
+    """Return whether this model's collector guard is already owned."""
+    guard = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        guard.bind(("127.0.0.1", collector_guard_port(model)))
+        return False
+    except OSError:
+        return True
+    finally:
+        guard.close()
+
+
+def console_python_executable() -> str:
+    """Use console Python for workers so tracebacks reach the panel log."""
+    executable = Path(sys.executable)
+    if executable.name.casefold() == "pythonw.exe":
+        console = executable.with_name("python.exe")
+        if console.is_file():
+            return str(console)
+    return str(executable)
+
+
+def build_worker_command(
+    model: str,
+    rounds: int,
+    question_mode: str,
+    pairing: str = "",
+    tasks: int = 1,
+) -> list[str]:
     command = [
-        sys.executable,
+        console_python_executable(),
         str(ROOT / "remote_model_worker.py"),
         "--model",
         model,
         "--rounds",
         str(max(1, rounds)),
+        "--tasks",
+        str(max(1, min(int(tasks), 4))),
         "--question-mode",
         question_mode,
+        "--restart-completed",
     ]
     if pairing:
         command.extend(["--pairing", pairing])
@@ -45,12 +109,14 @@ def build_worker_command(model: str, rounds: int, question_mode: str, pairing: s
 
 
 class RemoteModelPanel:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, auto_start: bool = False) -> None:
         self.model = model
         self.model_name = MODELS[model]
         self.process: subprocess.Popen[str] | None = None
         self.account_verified = False
         self.account_check_running = False
+        self.auto_start = auto_start
+        self.external_worker_running = False
         self.messages: queue.Queue[str] = queue.Queue()
         self.config_path = ROOT / "runtime" / "remote_workers" / f"{model}_panel.json"
         self.settings = self.load_settings()
@@ -60,17 +126,47 @@ class RemoteModelPanel:
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.status_var = tk.StringVar(value="未启动")
-        self.account_var = tk.StringVar(value="首次启动将自动打开模拟器和专用 Chrome 检测登录")
-        self.pairing_var = tk.StringVar(value=str(self.settings.get("pairing") or ""))
+        account_hint = (
+            "无需模拟器或登录；使用专用 Chrome 抓取百度搜索 AI 回答"
+            if model == "wenxin"
+            else "首次启动将自动打开模拟器和专用 Chrome 检测登录"
+        )
+        self.account_var = tk.StringVar(value=account_hint)
         embedded_sync = ROOT / "runtime" / "remote_workers" / f"{model}_sync.json"
+        local_pairing = ROOT / "runtime" / "lan_result_pairing.json"
+        default_pairing = str(self.settings.get("pairing") or "")
+        if not default_pairing and not embedded_sync.exists() and local_pairing.exists():
+            default_pairing = str(local_pairing)
+        self.pairing_var = tk.StringVar(value=default_pairing)
         self.pairing_hint_var = tk.StringVar(
-            value="已内置主机回传配置，无需选择" if embedded_sync.exists() else "首次启动请选择主机配对文件"
+            value=(
+                "已内置主机回传配置，无需选择"
+                if embedded_sync.exists()
+                else "已自动识别本机主机配对文件"
+                if default_pairing
+                else "首次启动请选择主机配对文件"
+            )
         )
         self.rounds_var = tk.StringVar(value=str(self.settings.get("rounds") or 10))
         self.mode_var = tk.StringVar(value=str(self.settings.get("question_mode") or "interleaved"))
+        self.tasks_var = tk.StringVar(value=str(self.settings.get("tasks") or 1))
         self.build_ui()
         self.root.after(200, self.refresh)
-        if self.model in LOGIN_REQUIRED_MODELS:
+        if remote_collector_running(self.model):
+            self.external_worker_running = True
+            self.status_var.set("运行中（已有采集任务）")
+            self.account_var.set(
+                "本机已有其他采集器运行；仍可检测百度搜索，但暂不能启动文心采集"
+                if self.model == "wenxin"
+                else "已检测到本机采集器正在运行；无需重复点击启动"
+            )
+            self.start_button.configure(state="disabled")
+            self.append_log("已识别正在运行的远端采集器；本窗口不会重复启动第二个任务。")
+        elif self.model in LOGIN_REQUIRED_MODELS:
+            self.root.after(800, self.check_account)
+        elif self.auto_start:
+            # Web-only collectors still need their browser check before an
+            # automatic launch.  The successful check is what calls start().
             self.root.after(800, self.check_account)
 
     def load_settings(self) -> dict[str, Any]:
@@ -89,6 +185,7 @@ class RemoteModelPanel:
                     "model": self.model,
                     "pairing": self.pairing_var.get().strip(),
                     "rounds": self.rounds(),
+                    "tasks": self.tasks(),
                     "question_mode": self.mode_var.get(),
                 },
                 ensure_ascii=False,
@@ -103,6 +200,17 @@ class RemoteModelPanel:
             return max(1, int(self.rounds_var.get().strip()))
         except ValueError:
             raise ValueError("轮数必须是大于 0 的整数")
+
+    def tasks(self) -> int:
+        if self.model != "wenxin":
+            return 1
+        try:
+            value = int(self.tasks_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("并发任务数必须是 1 到 4") from exc
+        if value not in (1, 2, 3, 4):
+            raise ValueError("并发任务数必须是 1 到 4")
+        return value
 
     def build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -131,11 +239,24 @@ class RemoteModelPanel:
             state="readonly",
             width=18,
         ).grid(row=2, column=1, sticky="w", pady=5)
+        if self.model == "wenxin":
+            ttk.Label(settings, text="并发任务数（最多4个）").grid(
+                row=3, column=0, sticky="w", padx=(0, 10), pady=5
+            )
+            ttk.Combobox(
+                settings,
+                textvariable=self.tasks_var,
+                values=("1", "2", "3", "4"),
+                state="readonly",
+                width=18,
+            ).grid(row=3, column=1, sticky="w", pady=5)
 
-        identity = ttk.LabelFrame(container, text="登录与账号检测", padding=12)
+        identity_title = "百度搜索环境检测" if self.model == "wenxin" else "登录与账号检测"
+        identity = ttk.LabelFrame(container, text=identity_title, padding=12)
         identity.pack(fill="x", pady=(12, 0))
         ttk.Label(identity, textvariable=self.account_var).pack(side="left", fill="x", expand=True)
-        self.account_button = ttk.Button(identity, text="打开并重新检测", command=self.check_account)
+        account_button_text = "打开并检测百度搜索" if self.model == "wenxin" else "打开并重新检测"
+        self.account_button = ttk.Button(identity, text=account_button_text, command=self.check_account)
         self.account_button.pack(side="right")
 
         actions = ttk.Frame(container)
@@ -177,11 +298,19 @@ class RemoteModelPanel:
             return
         self.account_check_running = True
         self.account_verified = False
-        self.status_var.set("正在检查账号")
-        self.account_var.set("正在启动模拟器 App 和专用 Chrome，请在打开的窗口中完成登录……")
+        self.status_var.set("正在检查百度搜索" if self.model == "wenxin" else "正在检查账号")
+        self.account_var.set(
+            "正在启动专用 Chrome 并检测百度搜索页面……"
+            if self.model == "wenxin"
+            else "正在启动模拟器 App 和专用 Chrome，请在打开的窗口中完成登录……"
+        )
         self.account_button.configure(state="disabled")
         self.start_button.configure(state="disabled")
-        self.append_log("开始登录检测：请分别登录模拟器 App 与专用 Chrome；登录后点击“打开并重新检测”。")
+        self.append_log(
+            "开始检测百度搜索 AI 采集环境；无需模拟器或账号登录。"
+            if self.model == "wenxin"
+            else "开始登录检测：请分别登录模拟器 App 与专用 Chrome；登录后点击“打开并重新检测”。"
+        )
         threading.Thread(target=self.account_worker, daemon=True).start()
 
     def account_worker(self) -> None:
@@ -205,6 +334,13 @@ class RemoteModelPanel:
     def start(self) -> None:
         if self.process and self.process.poll() is None:
             return
+        if remote_collector_running(self.model):
+            self.external_worker_running = True
+            self.status_var.set("运行中（已有采集任务）")
+            self.start_button.configure(state="disabled")
+            self.stop_button.configure(state="disabled")
+            self.append_log("启动请求未重复执行：本机已有远端采集器正在运行。")
+            return
         if not account_gate_open(self.model, self.account_verified):
             messagebox.showwarning(
                 "请先完成登录检测",
@@ -217,10 +353,17 @@ class RemoteModelPanel:
             sync_config = ROOT / "runtime" / "remote_workers" / f"{self.model}_sync.json"
             if not pairing and not sync_config.exists():
                 raise ValueError("首次启动必须选择主机的 lan_result_pairing.json")
-            command = build_worker_command(self.model, self.rounds(), self.mode_var.get(), pairing)
+            command = build_worker_command(
+                self.model,
+                self.rounds(),
+                self.mode_var.get(),
+                pairing,
+                tasks=self.tasks(),
+            )
             self.save_settings()
             environment = os.environ.copy()
             environment["PYTHONUTF8"] = "1"
+            environment["PYTHONWARNINGS"] = "ignore"
             self.process = subprocess.Popen(
                 command,
                 cwd=ROOT,
@@ -234,7 +377,7 @@ class RemoteModelPanel:
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             )
             threading.Thread(target=self.read_process, daemon=True).start()
-            self.status_var.set("运行中")
+            self.status_var.set(f"运行中（{self.tasks()}个任务）" if self.model == "wenxin" else "运行中")
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
             self.append_log(f"启动命令：{' '.join(command)}")
@@ -266,17 +409,38 @@ class RemoteModelPanel:
             if message == "__ACCOUNT_OK__":
                 self.account_check_running = False
                 self.account_verified = True
-                self.status_var.set("登录检测通过")
-                self.account_var.set("登录检测通过；启动采集时还会再次校验，防止中途退出账号")
+                self.status_var.set("百度搜索检测通过" if self.model == "wenxin" else "登录检测通过")
+                self.account_var.set(
+                    "百度搜索页面可用；正文和信源将直接从 AI 回答板块抓取"
+                    if self.model == "wenxin"
+                    else "登录检测通过；启动采集时还会再次校验，防止中途退出账号"
+                )
                 self.account_button.configure(state="normal")
-                self.start_button.configure(state="normal")
+                self.start_button.configure(state="disabled" if self.external_worker_running else "normal")
+                if self.external_worker_running:
+                    self.append_log("百度搜索检测已通过；本机另一个采集任务仍在运行，文心启动按钮保持禁用。")
+                if self.auto_start and (not self.process or self.process.poll() is not None):
+                    self.auto_start = False
+                    self.root.after(100, self.start)
             elif message == "__ACCOUNT_FAIL__":
                 self.account_check_running = False
                 self.account_verified = False
-                self.status_var.set("账号检查失败")
-                self.account_var.set("未登录或账号不一致；请完成两端登录后重新检测")
+                self.status_var.set("百度搜索检测失败" if self.model == "wenxin" else "账号检查失败")
+                self.account_var.set(
+                    "百度搜索页面不可用；请检查网络或页面风控后重试"
+                    if self.model == "wenxin"
+                    else "未登录或账号不一致；请完成两端登录后重新检测"
+                )
                 self.account_button.configure(state="normal")
                 self.start_button.configure(state="disabled")
+                if self.model == "wenxin":
+                    messagebox.showwarning("百度搜索不可用", "请检查网络、百度搜索页面或风控提示后重新检测。")
+                else:
+                    messagebox.showwarning(
+                        "请完成登录",
+                        "模拟器 App 或专用 Chrome 尚未登录/账号不一致。\n\n"
+                        "请逐个实例完成登录，然后点击“打开并重新检测”。",
+                    )
             else:
                 self.append_log(message)
         if self.process and self.process.poll() is not None:
@@ -287,6 +451,15 @@ class RemoteModelPanel:
             )
             self.stop_button.configure(state="disabled")
             self.process = None
+        if self.external_worker_running and not remote_collector_running(self.model):
+            self.external_worker_running = False
+            self.status_var.set("已有采集任务已结束")
+            if self.model in LOGIN_REQUIRED_MODELS:
+                self.account_verified = False
+                self.start_button.configure(state="disabled")
+                self.root.after(100, self.check_account)
+            else:
+                self.start_button.configure(state="normal")
         self.root.after(200, self.refresh)
 
     def close(self) -> None:
@@ -303,8 +476,11 @@ class RemoteModelPanel:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=tuple(MODELS), required=True)
+    parser.add_argument("--auto-start", action="store_true")
     args = parser.parse_args()
-    RemoteModelPanel(args.model).run()
+    if focus_existing_panel(args.model):
+        return 0
+    RemoteModelPanel(args.model, auto_start=args.auto_start).run()
     return 0
 
 

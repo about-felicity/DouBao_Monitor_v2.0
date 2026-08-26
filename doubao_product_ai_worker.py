@@ -113,7 +113,11 @@ def pending_rows():
     try:
         with open(saver.OUT_ANSWERS_CSV, "r", encoding="utf-8-sig", newline="") as f:
             rows = [
-                row for row in csv.DictReader(f)
+                {
+                    key: (value.replace("\x00", "") if isinstance(value, str) else value)
+                    for key, value in row.items()
+                }
+                for row in csv.DictReader(f)
                 if row.get("review_status") == "ai_pending"
             ]
     except Exception:
@@ -288,8 +292,8 @@ def main():
             log("skip: missing API key")
             return
         batch_size = min(
-            2,
-            max(1, int(os.environ.get("DOUBAO_PRODUCT_AI_RETRY_BATCH", "2") or "2")),
+            10,
+            max(1, int(os.environ.get("DOUBAO_PRODUCT_AI_RETRY_BATCH", "10") or "10")),
         )
         retry_interval = max(30, int(os.environ.get("DOUBAO_PRODUCT_AI_RETRY_INTERVAL", "60") or "60"))
         max_attempts = max(1, int(os.environ.get("DOUBAO_PRODUCT_AI_MAX_RETRIES", "2") or "2"))

@@ -68,9 +68,11 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
             source_seen.add(normalized)
             domain = urlparse(url).netloc.casefold().removeprefix("www.")
             title = str(raw.get("title") or "").strip()
-            kind = source_type(domain, title)
+            kind = str(raw.get("type") or raw.get("source_type") or "").strip() or source_type(domain, title)
             sources.append({"title": title, "url": url, "canonical_url": normalized,
-                            "domain": domain, "media": media_name(domain), "type": kind})
+                            "domain": domain,
+                            "media": str(raw.get("media") or "").strip() or media_name(domain),
+                            "type": kind})
         runs.append({"run_id": run_id, "sequence": len(runs) + 1, "round": int(record.get("round") or 0),
                      "serial": str(record.get("serial") or model_id), "question": question,
                      "reply": answer, "web_body": str(record.get("web_body") or answer),

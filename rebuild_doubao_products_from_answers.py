@@ -95,7 +95,9 @@ def main():
     replacement_rows = []
     normalized_questions = {}
     for answer in selected:
-        products, status, method, model = saver.review_products_with_ai(answer.get("answer_text") or "")
+        products, status, method, model = saver.review_products_with_ai(
+            answer.get("answer_text") or "", answer.get("question") or ""
+        )
         key = (str(answer.get("run_no") or ""), str(answer.get("answer_hash") or ""))
         reviewed[key] = (status, model)
         normalized_question = qa.canonical_question_name(answer.get("question") or answer.get("chat_title") or "")

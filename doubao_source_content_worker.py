@@ -1,5 +1,6 @@
 import argparse
 import csv
+from collections import defaultdict
 import hashlib
 import html as html_module
 import ipaddress
@@ -23,6 +24,8 @@ from lxml import etree, html
 
 import doubao_dashboard_server as dashboard
 import doubao_brand_settings as brand_settings
+from monitor_core import database as monitor_database
+from monitor_core import analytics as monitor_analytics
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,15 +40,24 @@ INDEX_PATH = BASE_DIR / "doubao_source_content_index.json"
 DB_PATH = BASE_DIR / "doubao_source_content.db"
 LOCK_PATH = BASE_DIR / "doubao_source_content_worker.lock"
 LOG_PATH = BASE_DIR / "doubao_source_content_worker.log"
+LOG_MAX_BYTES = max(1_000_000, int(os.environ.get("DOUBAO_CONTENT_LOG_MAX_BYTES", "20000000") or 20000000))
+LOG_BACKUPS = max(1, min(5, int(os.environ.get("DOUBAO_CONTENT_LOG_BACKUPS", "2") or 2)))
+INDEX_PUBLISH_INTERVAL = max(
+    5.0, float(os.environ.get("DOUBAO_CONTENT_INDEX_PUBLISH_INTERVAL", "20") or 20)
+)
 CST = timezone(timedelta(hours=8))
 
 MAX_BYTES = max(500_000, int(os.environ.get("DOUBAO_CONTENT_MAX_BYTES", "4000000") or 4000000))
 MAX_TEXT_CHARS = max(20_000, int(os.environ.get("DOUBAO_CONTENT_MAX_TEXT", "300000") or 300000))
-WORKERS = max(1, min(12, int(os.environ.get("DOUBAO_CONTENT_WORKERS", "6") or 6)))
-BATCH_SIZE = max(1, int(os.environ.get("DOUBAO_CONTENT_BATCH", "12") or 12))
+WORKERS = max(1, min(12, int(os.environ.get("DOUBAO_CONTENT_WORKERS", "3") or 3)))
+BATCH_SIZE = max(1, int(os.environ.get("DOUBAO_CONTENT_BATCH", "24") or 24))
+DYNAMIC_WORKERS = max(
+    1, min(3, int(os.environ.get("DOUBAO_CONTENT_DYNAMIC_WORKERS", "1") or 1))
+)
 REQUEST_TIMEOUT = max(5, int(os.environ.get("DOUBAO_CONTENT_TIMEOUT", "18") or 18))
 HOST_DELAY = max(0.0, float(os.environ.get("DOUBAO_CONTENT_HOST_DELAY", "0.35") or 0.35))
 MIN_CONTENT_CHARS = 80
+SOURCE_CONTENT_SCOPE_SCHEMA_VERSION = 1
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -61,9 +73,11 @@ HEADERS = {
 
 HOST_LOCKS = {}
 HOST_LOCKS_GUARD = threading.Lock()
-DYNAMIC_FETCH_LOCK = threading.Semaphore(3)
+DYNAMIC_FETCH_LOCK = threading.Semaphore(DYNAMIC_WORKERS)
 _BRAND_CACHE = {"mtime": None, "value": None}
 _URL_CACHE = {"mtime": None, "value": None}
+_LOG_LOCK = threading.Lock()
+_INDEX_PUBLISH_LAST = [0.0]
 
 
 def now_str():
@@ -72,8 +86,17 @@ def now_str():
 
 def log(message):
     try:
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(now_str() + " " + str(message) + "\n")
+        with _LOG_LOCK:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size >= LOG_MAX_BYTES:
+                oldest = Path(str(LOG_PATH) + f".{LOG_BACKUPS}")
+                oldest.unlink(missing_ok=True)
+                for index in range(LOG_BACKUPS - 1, 0, -1):
+                    source = Path(str(LOG_PATH) + f".{index}")
+                    if source.exists():
+                        os.replace(source, Path(str(LOG_PATH) + f".{index + 1}"))
+                os.replace(LOG_PATH, Path(str(LOG_PATH) + ".1"))
+            with LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(now_str() + " " + str(message) + "\n")
     except Exception:
         pass
 
@@ -88,6 +111,16 @@ def atomic_json_write(path, payload):
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
+
+
+def publish_index(index, force=False):
+    """Publish labels without rewriting a multi-megabyte file per URL."""
+    now = time.monotonic()
+    if not force and now - _INDEX_PUBLISH_LAST[0] < INDEX_PUBLISH_INTERVAL:
+        return False
+    atomic_json_write(INDEX_PATH, index)
+    _INDEX_PUBLISH_LAST[0] = now
+    return True
 
 
 def load_index():
@@ -176,6 +209,26 @@ def get_db_text(connection, url):
     return str(row[0] or "") if row else ""
 
 
+def get_db_result(connection, url):
+    row = connection.execute(
+        """
+        SELECT final_url, status, fetched_at, content_type, http_status,
+               extraction_method, extraction_quality, title, content_text,
+               text_length, content_hash, error, attempts
+        FROM source_content WHERE url=? AND status='ok'
+        """,
+        (url,),
+    ).fetchone()
+    if not row:
+        return None
+    keys = (
+        "final_url", "status", "fetched_at", "content_type", "http_status",
+        "extraction_method", "extraction_quality", "title", "content_text",
+        "text_length", "content_hash", "error", "attempts",
+    )
+    return dict(zip(keys, row))
+
+
 def safe_public_url(url):
     try:
         parsed = urlparse(str(url or "").strip())
@@ -197,6 +250,42 @@ def normalize_text(value):
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
+
+
+SOURCE_BODY_END_PREFIXES = (
+    "上一篇", "下一篇", "免责声明", "相关阅读", "相关推荐", "相关文章",
+    "相关资讯", "相关内容", "延伸阅读", "猜你喜欢", "热门推荐", "热门文章",
+    "本月阅读榜",
+)
+
+
+def primary_article_text(value):
+    """Remove recommendation/sidebar text appended after the article body.
+
+    Some publishers expose no semantic ``article`` node, so the fallback HTML
+    extractor receives the whole page.  Brand names in ``上一篇``、推荐阅读 or a
+    monthly ranking are navigation, not evidence that the current article
+    mentions an owned product.  Keep the full body archive for diagnostics but
+    classify only the primary article portion.
+    """
+    text = normalize_text(value)
+    if not text:
+        return ""
+    kept = []
+    kept_chars = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        compact = re.sub(r"\s+", "", stripped)
+        is_end_marker = (
+            any(compact.startswith(prefix) for prefix in SOURCE_BODY_END_PREFIXES)
+            or bool(re.fullmatch(r".{0,16}(?:推荐阅读|本月阅读榜|热门阅读榜)[:：]?", compact))
+        )
+        if kept_chars >= 200 and is_end_marker:
+            break
+        kept.append(line)
+        kept_chars += len(stripped)
+    primary = normalize_text("\n".join(kept))
+    return primary or text
 
 
 def decode_bytes(raw, content_type=""):
@@ -448,8 +537,14 @@ def fetch_with_cdp(url, timeout=30):
 
 
 def brand_vocabulary():
+    database_enabled = monitor_database.enabled()
     mtime = (
-        PRODUCTS_CSV.stat().st_mtime_ns if PRODUCTS_CSV.exists() else 0,
+        # The live PostgreSQL pipeline updates the legacy product CSV
+        # continuously. Treating that file as vocabulary configuration forced
+        # every archived body to be re-labelled after nearly every callback.
+        0 if database_enabled else (
+            PRODUCTS_CSV.stat().st_mtime_ns if PRODUCTS_CSV.exists() else 0
+        ),
         brand_settings.SETTINGS_PATH.stat().st_mtime_ns
         if brand_settings.SETTINGS_PATH.exists() else 0,
     )
@@ -458,7 +553,7 @@ def brand_vocabulary():
     brands = set(dashboard.KNOWN_BRANDS)
     configured = brand_settings.load_settings()
     brands.update(item["name"] for item in brand_settings.vocabulary(configured))
-    if PRODUCTS_CSV.exists():
+    if not database_enabled and PRODUCTS_CSV.exists():
         with PRODUCTS_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
                 value = str(row.get("brand_name") or "").strip()
@@ -477,6 +572,8 @@ def brand_vocabulary():
             "\0".join(ordered) + "\0" + own_rule_fingerprint
             + "\0" + brand_settings_fingerprint
             + "\0own-schema:" + str(dashboard.OWN_PRODUCT_SCHEMA_VERSION)
+            + "\0brand-match-schema:" + str(dashboard.BRAND_MATCH_SCHEMA_VERSION)
+            + "\0source-scope-schema:" + str(SOURCE_CONTENT_SCOPE_SCHEMA_VERSION)
         ).encode("utf-8")
     ).hexdigest()[:16]
     value = (ordered, digest)
@@ -487,8 +584,45 @@ def brand_vocabulary():
 def detect_brands(content_text, brands):
     if not content_text:
         return []
+    raw = str(content_text).casefold()
+    compact = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", raw)
+
+    def alias_occurs(alias):
+        alias_folded = str(alias or "").casefold()
+        token = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", alias_folded)
+        if not token:
+            return False
+        if not re.search(r"[\u3400-\u9fff]", token):
+            return bool(re.search(
+                r"(?<![a-z0-9])" + re.escape(alias_folded) + r"(?![a-z0-9])",
+                raw,
+            ))
+        contexts = monitor_analytics.AMBIGUOUS_BRAND_CONTEXTS.get(token)
+        if not contexts:
+            return token in compact
+        if re.search(
+            r"(?<![\u3400-\u9fff])" + re.escape(alias_folded) + r"(?![\u3400-\u9fff])",
+            raw,
+        ):
+            return True
+        start = 0
+        while True:
+            position = compact.find(token, start)
+            if position < 0:
+                return False
+            left = compact[max(0, position - 6):position]
+            right = compact[position + len(token):position + len(token) + 8]
+            if any(left.endswith(cue) for cue in contexts["left"]):
+                return True
+            if any(right.startswith(cue) for cue in contexts["right"]):
+                return True
+            start = position + 1
+
+    def brand_occurs(brand):
+        return any(alias_occurs(alias) for alias in dashboard.aliases_for_brand(brand))
+
     return sorted(
-        (brand for brand in brands if dashboard.title_mentions_brand(content_text, brand)),
+        (brand for brand in brands if brand_occurs(brand)),
         key=lambda value: value.casefold(),
     )
 
@@ -607,6 +741,7 @@ def iso_after(seconds):
 
 def fetch_one(url, previous_attempts=0, source_title=""):
     attempts = previous_attempts + 1
+    allow_dynamic_browser = attempts <= 2
     fetched_at = now_str()
     safe, reason = safe_public_url(url)
     if not safe:
@@ -641,6 +776,7 @@ def fetch_one(url, previous_attempts=0, source_title=""):
                 response = fetch_http_with_scrapling(url)
             if (
                 int(response.get("status_code") or 0) >= 400
+                and allow_dynamic_browser
                 and not dashboard.own_product_mentions(source_title)
             ):
                 try:
@@ -682,6 +818,7 @@ def fetch_one(url, previous_attempts=0, source_title=""):
         if (
             len(content_text) < MIN_CONTENT_CHARS
             and transport != "scrapling_stealth"
+            and allow_dynamic_browser
             and not dashboard.own_product_mentions(source_title)
         ):
             try:
@@ -755,6 +892,7 @@ def _load_jsonl_sources(path):
             if record.get("status") != "success":
                 continue
             run_no = int(record.get("round") or 0)
+            day = str(record.get("day") or dashboard.analytics_beijing_day(record.get("finished_at") or record.get("captured_at") or ""))
             for source in record.get("sources") or []:
                 url = str(source.get("url") or source.get("href") or "").strip()
                 if not url:
@@ -762,19 +900,83 @@ def _load_jsonl_sources(path):
                 title = str(source.get("title") or "")
                 current = result.get(url)
                 if current is None or run_no > current[0]:
-                    result[url] = (run_no, title)
+                    result[url] = (run_no, title, day)
     except Exception as exc:
         log("jsonl sources load failed for %s: %s" % (path, repr(exc)))
     return result
 
 
+def _load_database_sources(days=7):
+    """Read recent PostgreSQL callbacks for body analysis.
+
+    Remote collectors now commit directly to PostgreSQL and deliberately no
+    longer append their main-machine JSONL files.  Without this feed, newly
+    collected Quark/Wenxin/Yuanbao/DeepSeek articles remain ``content pending`` and
+    cannot receive owned-brand labels even when their body names the brand.
+    """
+    buckets = {"doubao": {}, "deepseek": {}, "yuanbao": {}, "wenxin": {}, "afu": {}, "quark": {}}
+    if not monitor_database.enabled():
+        return buckets
+    try:
+        monitor_database.ensure_schema()
+        with monitor_database.connection() as connection:
+            rows = connection.execute(
+                "WITH recent AS ("
+                " SELECT r.model_id,r.sequence_no,r.day,s.source_index,s.payload,"
+                " COALESCE(NULLIF(btrim(s.payload->>'url'),''),"
+                "          NULLIF(btrim(s.payload->>'href'),'')) AS source_url"
+                " FROM monitor_sources s JOIN monitor_runs r"
+                " ON r.model_id=s.model_id AND r.run_id=s.run_id"
+                " WHERE r.day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - %s"
+                "), ranked AS ("
+                " SELECT model_id,sequence_no,day,payload,source_url,"
+                " COUNT(*) OVER (PARTITION BY model_id,source_url) AS frequency,"
+                " ROW_NUMBER() OVER (PARTITION BY model_id,source_url"
+                " ORDER BY day DESC,sequence_no DESC,source_index DESC) AS row_no"
+                " FROM recent WHERE source_url IS NOT NULL"
+                ") SELECT model_id,sequence_no,day,payload,frequency"
+                " FROM ranked WHERE row_no=1",
+                (max(0, int(days) - 1),),
+            ).fetchall()
+        for row in rows:
+            model_id = str(row.get("model_id") or "")
+            if model_id not in buckets:
+                continue
+            source = dict(row.get("payload") or {})
+            url = str(source.get("url") or source.get("href") or "").strip()
+            if not url:
+                continue
+            run_no = int(row.get("sequence_no") or 0)
+            buckets[model_id][url] = (
+                run_no,
+                str(source.get("title") or ""),
+                str(row.get("day") or ""),
+                int(row.get("frequency") or 1),
+            )
+    except Exception as exc:
+        log("database sources load failed: %s" % repr(exc))
+    return buckets
+
+
 def collect_urls():
-    source_files = (REFS_CSV, DEEPSEEK_RESULTS, YUANBAO_RESULTS, WENXIN_RESULTS, AFU_RESULTS)
-    mtime = sum(f.stat().st_mtime_ns if f.exists() else 0 for f in source_files)
-    if _URL_CACHE["mtime"] == mtime and _URL_CACHE["value"] is not None:
+    database_enabled = monitor_database.enabled()
+    # PostgreSQL is the live source of truth.  The legacy CSV/JSONL exports are
+    # large historical snapshots (currently more than 130 MB) and rereading
+    # them on every callback makes the worker look alive while doing no fetches.
+    # Keep them only as an offline fallback when PostgreSQL is unavailable.
+    source_files = () if database_enabled else (
+        REFS_CSV, DEEPSEEK_RESULTS, YUANBAO_RESULTS, WENXIN_RESULTS, AFU_RESULTS
+    )
+    file_mtime = sum(f.stat().st_mtime_ns if f.exists() else 0 for f in source_files)
+    try:
+        database_version = monitor_database.global_version()
+    except Exception:
+        database_version = 0
+    cache_token = (file_mtime, database_version)
+    if _URL_CACHE["mtime"] == cache_token and _URL_CACHE["value"] is not None:
         return _URL_CACHE["value"]
-    buckets = {"doubao": {}, "deepseek": {}, "yuanbao": {}, "wenxin": {}, "afu": {}}
-    if REFS_CSV.exists():
+    buckets = {"doubao": {}, "deepseek": {}, "yuanbao": {}, "wenxin": {}, "afu": {}, "quark": {}}
+    if not database_enabled and REFS_CSV.exists():
         with REFS_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
                 url = str(row.get("href") or "").strip()
@@ -786,16 +988,26 @@ def collect_urls():
                     run_no = 0
                 current = buckets["doubao"].get(url)
                 if current is None or run_no > current[0]:
-                    buckets["doubao"][url] = (run_no, str(row.get("title") or ""))
-    for model_id, jsonl_path in (("deepseek", DEEPSEEK_RESULTS), ("yuanbao", YUANBAO_RESULTS),
-                                 ("wenxin", WENXIN_RESULTS), ("afu", AFU_RESULTS)):
-        for url, (run_no, title) in _load_jsonl_sources(jsonl_path).items():
+                    buckets["doubao"][url] = (run_no, str(row.get("title") or ""), str(row.get("day") or row.get("captured_day") or ""))
+    if not database_enabled:
+        for model_id, jsonl_path in (("deepseek", DEEPSEEK_RESULTS), ("yuanbao", YUANBAO_RESULTS),
+                                     ("wenxin", WENXIN_RESULTS), ("afu", AFU_RESULTS)):
+            for url, (run_no, title, day) in _load_jsonl_sources(jsonl_path).items():
+                current = buckets[model_id].get(url)
+                if current is None or run_no > current[0]:
+                    buckets[model_id][url] = (run_no, title, day)
+    database_buckets = _load_database_sources() if database_enabled else {}
+    for model_id, values in database_buckets.items():
+        for url, meta in values.items():
+            run_no, title, day = meta[:3]
+            frequency = int(meta[3] if len(meta) > 3 else 1)
             current = buckets[model_id].get(url)
             if current is None or run_no > current[0]:
-                buckets[model_id][url] = (run_no, title)
+                buckets[model_id][url] = (run_no, title, day, frequency)
     ordered = {
         model_id: sorted(
-            ({"url": url, "run_no": meta[0], "title": meta[1], "model": model_id}
+            ({"url": url, "run_no": meta[0], "title": meta[1], "day": meta[2],
+              "frequency": int(meta[3] if len(meta) > 3 else 1), "model": model_id}
              for url, meta in values.items()), key=lambda item: (-item["run_no"], item["url"])
         )
         for model_id, values in buckets.items()
@@ -805,13 +1017,13 @@ def collect_urls():
     value, seen = [], set()
     max_len = max((len(rows) for rows in ordered.values()), default=0)
     for index in range(max_len):
-        for model_id in ("deepseek", "yuanbao", "wenxin", "afu", "doubao"):
+        for model_id in ("deepseek", "yuanbao", "wenxin", "afu", "quark", "doubao"):
             rows = ordered[model_id]
             if index >= len(rows) or rows[index]["url"] in seen:
                 continue
             seen.add(rows[index]["url"])
             value.append(rows[index])
-    _URL_CACHE.update({"mtime": mtime, "value": value})
+    _URL_CACHE.update({"mtime": cache_token, "value": value})
     return value
 
 
@@ -828,12 +1040,11 @@ def article_urls(urls):
 def due(entry, vocab_hash):
     if not entry:
         return True
-    if entry.get("vocab_hash") != vocab_hash:
-        return True
-    if entry.get("status") == "ok" and entry.get("vocab_hash") != vocab_hash:
-        return True
     if entry.get("status") == "ok":
-        return False
+        # A vocabulary change only requires re-labelling archived successful
+        # bodies. It must not bypass the retry backoff of thousands of blocked
+        # or script-only historical pages.
+        return entry.get("vocab_hash") != vocab_hash
     if entry.get("status") == "skipped":
         return True
     next_retry = str(entry.get("next_retry_at") or "")
@@ -845,9 +1056,50 @@ def due(entry, vocab_hash):
         return True
 
 
+def prioritize_pending(items, entries):
+    """Put never-seen sources ahead of retries and vocabulary refreshes."""
+    today = datetime.now(CST).date().isoformat()
+    return sorted(items, key=lambda item: (
+        0 if item.get("day") == today and not entries.get(item["url"]) else
+        1 if item.get("day") == today and (entries.get(item["url"]) or {}).get("status") != "ok" else
+        2 if not entries.get(item["url"]) else
+        3 if (entries.get(item["url"]) or {}).get("status") != "ok" else
+        4,
+        -int(item.get("frequency") or 1),
+        -int(item.get("run_no") or 0),
+    ))
+
+
+def fair_pending_selection(items, limit):
+    """Reserve each batch for every model while preserving local priority.
+
+    Yuanbao currently emits many more article links than the other collectors.
+    Taking the first global N rows lets that backlog starve Wenxin and Doubao,
+    which leaves their owned-brand labels pending indefinitely.
+    """
+    groups = defaultdict(list)
+    for item in items:
+        groups[str(item.get("model") or "other")].append(item)
+    order = [name for name in ("wenxin", "yuanbao", "doubao", "deepseek", "afu", "quark", "other") if groups[name]]
+    selected = []
+    index = 0
+    while order and len(selected) < limit:
+        name = order[index % len(order)]
+        rows = groups[name]
+        if rows:
+            selected.append(rows.pop(0))
+        if not rows:
+            order.remove(name)
+            index = 0
+        else:
+            index += 1
+    return selected
+
+
 def public_entry(result, brands, vocab_hash):
     content_text = result.get("content_text", "")
-    hits = detect_brands(content_text, brands) if result.get("status") == "ok" else []
+    analysis_text = primary_article_text(content_text)
+    hits = detect_brands(analysis_text, brands) if result.get("status") == "ok" else []
     configured = brand_settings.load_settings()
     group_lookup = {
         dashboard.canonical_brand_name(item["name"]): item["group"]
@@ -873,9 +1125,10 @@ def public_entry(result, brands, vocab_hash):
         "competitor_brand_mentions": [
             brand for brand in hits if group_lookup.get(brand) == "competitor"
         ],
-        "own_product_mentions": dashboard.own_product_mentions(content_text),
+        "own_product_mentions": dashboard.own_product_mentions(analysis_text),
         "own_product_schema_version": dashboard.OWN_PRODUCT_SCHEMA_VERSION,
-        "excerpt": normalize_text(content_text)[:1200],
+        "source_scope_schema_version": SOURCE_CONTENT_SCOPE_SCHEMA_VERSION,
+        "excerpt": analysis_text[:1200],
         "error": result.get("error", ""),
         "vocab_hash": vocab_hash,
     }
@@ -884,9 +1137,17 @@ def public_entry(result, brands, vocab_hash):
 def refresh_vocab_only(connection, url, entry, brands, vocab_hash):
     content_text = get_db_text(connection, url)
     if not content_text:
-        return None
+        # Some legacy successful rows predate the SQLite body archive. There
+        # is nothing new to analyse for those URLs; repeatedly retrying all of
+        # them on every pass only burns CPU. Preserve their existing evidence
+        # and acknowledge the current vocabulary version.
+        updated = dict(entry)
+        updated["vocab_hash"] = vocab_hash
+        updated["own_product_schema_version"] = dashboard.OWN_PRODUCT_SCHEMA_VERSION
+        return updated
     updated = dict(entry)
-    hits = detect_brands(content_text, brands)
+    analysis_text = primary_article_text(content_text)
+    hits = detect_brands(analysis_text, brands)
     configured = brand_settings.load_settings()
     group_lookup = {
         dashboard.canonical_brand_name(item["name"]): item["group"]
@@ -899,8 +1160,10 @@ def refresh_vocab_only(connection, url, entry, brands, vocab_hash):
     updated["competitor_brand_mentions"] = [
         brand for brand in hits if group_lookup.get(brand) == "competitor"
     ]
-    updated["own_product_mentions"] = dashboard.own_product_mentions(content_text)
+    updated["own_product_mentions"] = dashboard.own_product_mentions(analysis_text)
     updated["own_product_schema_version"] = dashboard.OWN_PRODUCT_SCHEMA_VERSION
+    updated["source_scope_schema_version"] = SOURCE_CONTENT_SCOPE_SCHEMA_VERSION
+    updated["excerpt"] = analysis_text[:1200]
     updated["vocab_hash"] = vocab_hash
     return updated
 
@@ -915,18 +1178,33 @@ def pid_is_running(pid):
     if os.name == "nt":
         try:
             import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+            )
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = (
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
+            )
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            # PROCESS_QUERY_LIMITED_INFORMATION. The previous value was
+            # SYNCHRONIZE, which opens successfully but makes
+            # GetExitCodeProcess fail with access denied on Windows.
+            handle = kernel32.OpenProcess(0x00001000, False, pid)
             if not handle:
                 return False
             try:
-                code = ctypes.c_ulong()
-                if not ctypes.windll.kernel32.GetExitCodeProcess(
-                    handle, ctypes.byref(code)
-                ):
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                     return False
                 return code.value == 259  # STILL_ACTIVE
             finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                kernel32.CloseHandle(handle)
         except Exception:
             return False
     try:
@@ -975,6 +1253,16 @@ def heartbeat():
         pass
 
 
+def owns_lock():
+    """Return false as soon as a replacement worker owns the singleton lock."""
+    try:
+        return LOCK_PATH.read_text(
+            encoding="ascii", errors="ignore"
+        ).strip() == str(os.getpid())
+    except Exception:
+        return False
+
+
 def release_lock():
     try:
         if LOCK_PATH.exists() and LOCK_PATH.read_text(encoding="ascii", errors="ignore").strip() == str(os.getpid()):
@@ -1019,13 +1307,18 @@ def process_batch(index, connection, urls, brands, vocab_hash, limit):
         item for item in candidates
         if due(entries.get(item["url"]), vocab_hash)
     ]
+    # Never let a large historical retry/vocabulary-refresh backlog hide newly
+    # received sources.  ``urls`` is already ordered newest-first with fair
+    # model round-robin; Python's stable sort preserves that ordering inside
+    # each priority class.
+    pending = prioritize_pending(pending, entries)
     if not pending:
         if skipped_now:
             index["vocab_hash"] = vocab_hash
             index["updated_at"] = now_str()
-            atomic_json_write(INDEX_PATH, index)
+            publish_index(index, force=True)
         return skipped_now, 0
-    selected = []
+    network_pending = []
     for item in pending:
         entry = entries.get(item["url"]) or {}
         if entry.get("status") == "ok" and entry.get("vocab_hash") != vocab_hash:
@@ -1033,16 +1326,15 @@ def process_batch(index, connection, urls, brands, vocab_hash, limit):
             if updated:
                 entries[item["url"]] = updated
                 continue
-        selected.append(item)
-        if len(selected) >= limit:
-            break
+        network_pending.append(item)
+    selected = fair_pending_selection(network_pending, limit)
     if not selected:
         index["vocab_hash"] = vocab_hash
         index["updated_at"] = now_str()
-        atomic_json_write(INDEX_PATH, index)
+        publish_index(index, force=True)
         return 0, len(pending)
 
-    results = {}
+    ok = 0
     with ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="source-content") as pool:
         futures = {
             pool.submit(
@@ -1056,34 +1348,50 @@ def process_batch(index, connection, urls, brands, vocab_hash, limit):
         for future in as_completed(futures):
             item = futures[future]
             try:
-                results[item["url"]] = future.result()
+                result = future.result()
             except Exception as exc:
-                results[item["url"]] = {
+                result = {
                     "status": "error", "fetched_at": now_str(), "attempts": 1,
                     "error": repr(exc)[:500], "next_retry_at": iso_after(300),
                     "content_text": "", "text_length": 0,
                 }
-            heartbeat()
-
-    ok = 0
-    for url, result in results.items():
-        save_db_row(connection, url, result)
-        entries[url] = public_entry(result, brands, vocab_hash)
-        if result.get("status") == "ok":
-            ok += 1
-        log(
-            "%s status=%s chars=%s brands=%s url=%s error=%s"
-            % (
-                "done" if result.get("status") == "ok" else "retry",
-                result.get("status"), result.get("text_length", 0),
-                len(entries[url].get("brand_mentions") or []), url,
-                str(result.get("error") or "")[:160],
+            url = item["url"]
+            if result.get("status") != "ok":
+                archived = get_db_result(connection, url)
+                if archived:
+                    # A temporary 403/502 or script-shell response must not erase
+                    # a previously successful article archive or product evidence.
+                    entries[url] = public_entry(archived, brands, vocab_hash)
+                    log(
+                        "retain archived status=ok after refresh=%s url=%s error=%s"
+                        % (result.get("status"), url, str(result.get("error") or "")[:160])
+                    )
+                    heartbeat()
+                    continue
+            save_db_row(connection, url, result)
+            entries[url] = public_entry(result, brands, vocab_hash)
+            if result.get("status") == "ok":
+                ok += 1
+            # Publish near-real-time without serializing the full index after
+            # every single URL.
+            index["vocab_hash"] = vocab_hash
+            index["updated_at"] = now_str()
+            publish_index(index)
+            log(
+                "%s model=%s status=%s chars=%s brands=%s url=%s error=%s"
+                % (
+                    "done" if result.get("status") == "ok" else "retry",
+                    item.get("model") or "unknown",
+                    result.get("status"), result.get("text_length", 0),
+                    len(entries[url].get("brand_mentions") or []), url,
+                    str(result.get("error") or "")[:160],
+                )
             )
-        )
+            heartbeat()
     index["vocab_hash"] = vocab_hash
     index["updated_at"] = now_str()
-    atomic_json_write(INDEX_PATH, index)
-    return skipped_now + len(selected), max(0, len(pending) - len(selected))
+    publish_index(index, force=True)
+    return skipped_now + len(selected), max(0, len(network_pending) - len(selected))
 
 
 def refresh_all_vocab(connection, index, urls, brands, vocab_hash):
@@ -1093,6 +1401,10 @@ def refresh_all_vocab(connection, index, urls, brands, vocab_hash):
         url = item["url"]
         entry = entries.get(url) or {}
         if entry.get("status") != "ok":
+            archived = get_db_result(connection, url)
+            if archived:
+                entries[url] = public_entry(archived, brands, vocab_hash)
+                updated_count += 1
             continue
         updated = refresh_vocab_only(
             connection, url, entry, brands, vocab_hash
@@ -1102,8 +1414,20 @@ def refresh_all_vocab(connection, index, urls, brands, vocab_hash):
             updated_count += 1
     index["vocab_hash"] = vocab_hash
     index["updated_at"] = now_str()
-    atomic_json_write(INDEX_PATH, index)
+    publish_index(index, force=True)
     return updated_count
+
+
+def include_archived_urls(urls, index):
+    """Include archived bodies no longer present in today's collection catalog."""
+    result = list(urls)
+    seen = {str(item.get("url") or "") for item in result}
+    for url, entry in (index.get("entries") or {}).items():
+        if not url or url in seen or entry.get("status") != "ok":
+            continue
+        result.append({"url": url, "title": entry.get("title", ""), "model": "archived"})
+        seen.add(url)
+    return result
 
 
 def main():
@@ -1115,6 +1439,14 @@ def main():
         help="Re-evaluate archived article bodies without making network requests.",
     )
     parser.add_argument("--limit", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=0,
+        help="Exit when the dashboard process that launched this worker exits.",
+    )
+    parser.add_argument("--model", choices=("doubao", "deepseek", "yuanbao", "wenxin", "afu", "quark"))
+    parser.add_argument("--day", help="Only process sources last seen on this Beijing date.")
     parser.add_argument(
         "--articles-only",
         action="store_true",
@@ -1133,19 +1465,36 @@ def main():
             updated = refresh_all_vocab(
                 connection,
                 index,
-                article_urls(collect_urls()),
+                # Re-evaluate every archived body. Some publishers use URL
+                # shapes that the coarse source classifier does not recognize
+                # as articles, but their saved article body is still evidence.
+                include_archived_urls(collect_urls(), index),
                 brands,
                 vocab_hash,
             )
             log("vocab refresh updated=%s" % updated)
             return
-        log("watch start workers=%s batch=%s" % (WORKERS, args.limit))
-        while args.once or dashboard_running():
+        log(
+            "watch start workers=%s dynamic_workers=%s batch=%s parent_pid=%s"
+            % (WORKERS, DYNAMIC_WORKERS, args.limit, args.parent_pid or "none")
+        )
+        while (
+            args.once
+            or (
+                dashboard_running()
+                and owns_lock()
+                and (not args.parent_pid or pid_is_running(args.parent_pid))
+            )
+        ):
             heartbeat()
             brands, vocab_hash = brand_vocabulary()
             # Video ownership is title-only. Browser rendering is reserved for
             # article pages where body text changes the ownership verdict.
             urls = article_urls(collect_urls())
+            if args.model:
+                urls = [item for item in urls if item.get("model") == args.model]
+            if args.day:
+                urls = [item for item in urls if item.get("day") == args.day]
             processed, remaining = process_batch(
                 index, connection, urls, brands, vocab_hash, max(1, args.limit)
             )
@@ -1158,7 +1507,7 @@ def main():
                 break
             # Publish in larger, less frequent batches so the dashboard can
             # finish one statistics refresh before the content index changes.
-            time.sleep(30 if processed else 45)
+            time.sleep(10 if processed and remaining else 30 if processed else 45)
         log("watch stop")
     finally:
         if connection is not None:

@@ -24,6 +24,8 @@ DEFAULT_QUESTION = "推荐一款染发剂"
 DEFAULT_APPIUM_URL = "http://127.0.0.1:4723/wd/hub"
 
 ADB_CANDIDATES = [
+    Path(r"C:\Program Files\Microvirt\MEmu\adb.exe"),
+    Path(r"C:\Program Files (x86)\Microvirt\MEmu\adb.exe"),
     BASE_DIR / "portable_runtime" / "platform-tools" / "adb.exe",
     Path(r"C:\ProgramData\ShadowBot\support_x64\mobile\AndroidSDK\platform-tools\adb.exe"),
     Path(r"C:\Program Files\Netease\MuMu\nx_device\15.0\shell\adb.exe"),

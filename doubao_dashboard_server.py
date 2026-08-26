@@ -8,10 +8,12 @@ import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
@@ -22,10 +24,28 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 import doubao_question_aliases as qa
 import doubao_brand_settings as brand_settings
 from monitor_core.plugins import discover_plugins
-from monitor_core.analytics import build_analytics, prepare_analytics
+from monitor_core import database as monitor_database
+from monitor_core.http_cache import HTTP_JSON_CACHE
+from monitor_core.analytics import (
+    _brand_matcher as analytics_brand_matcher,
+    _mentions as analytics_brand_mentions,
+    BRAND_MATCH_SCHEMA_VERSION,
+    BRAND_CANONICAL_GROUPS,
+    beijing_day as analytics_beijing_day,
+    brand_alias_occurs,
+    canonical_question as analytics_canonical_question,
+    canonical_brand_name as analytics_canonical_brand_name,
+    build_analytics,
+    content_index as analytics_content_index,
+    daily_owned_product_recommendations,
+    owned_brand_vocabulary,
+    prepare_analytics,
+    valid_brand as analytics_valid_brand,
+)
 from monitor_core.owned_products import (
     OWN_PRODUCT_RULES,
     OWN_PRODUCT_SCHEMA_VERSION,
+    brands_for_products,
     own_product_mentions,
 )
 
@@ -71,7 +91,29 @@ _ANALYTICS_LOCK = threading.RLock()
 _ANALYTICS_SNAPSHOT_LOCK = threading.Lock()
 _ANALYTICS_CACHE = {}
 _ANALYTICS_BUILDING = set()
+_ANALYTICS_KEY_LOCKS = defaultdict(threading.Lock)
 _ANALYTICS_SNAPSHOT = None
+_ANALYTICS_CACHE_SCHEMA_VERSION = 33
+_DATABASE_VERSION_CACHE = [0.0, 0]
+_ANALYTICS_LAST_VALIDATED = {}
+_ANALYTICS_VALIDATION_INTERVAL = 15.0
+_ANALYTICS_BUILD_SEMAPHORE = threading.Semaphore(1)
+_ANALYTICS_CACHE_MAX = max(
+    4, min(64, int(os.environ.get("MONITOR_ANALYTICS_MEMORY_CACHE_MAX", "48") or 48))
+)
+_RETAIN_ANALYTICS_SNAPSHOT = (
+    os.environ.get("MONITOR_RETAIN_GLOBAL_SNAPSHOT", "1").strip() != "0"
+)
+_OWNED_BOARD_CACHE = {}
+_OWNED_BOARD_LOCK = threading.Lock()
+_OWNED_BOARD_BUILDING = set()
+_OWNED_BOARD_LAST_VALIDATED = {}
+_OWNED_BOARD_VALIDATION_INTERVAL = 5.0
+_SOURCE_INTERSECTION_CACHE = {}
+_SOURCE_INTERSECTION_LOCKS = defaultdict(threading.Lock)
+_SOURCE_INTERSECTION_BUILDING = set()
+_SOURCE_INTERSECTION_LAST_VALIDATED = {}
+_SOURCE_INTERSECTION_LOCK = threading.Lock()
 
 
 def _process_alive(process):
@@ -242,11 +284,25 @@ def _yuanbao_stats():
     return MODEL_PLUGINS["yuanbao"].stats()
 
 
-def _analytics_data_version():
+def _analytics_data_version(cache_key=None):
+    if monitor_database.enabled():
+        try:
+            if cache_key is not None:
+                scope, scoped_version = monitor_database.scope_version(cache_key)
+                if scoped_version:
+                    return (("postgresql", scope, scoped_version, _analytics_content_token()),)
+            now = time.monotonic()
+            if now - _DATABASE_VERSION_CACHE[0] >= 1.0:
+                _DATABASE_VERSION_CACHE[:] = [now, monitor_database.global_version()]
+            database_version = _DATABASE_VERSION_CACHE[1]
+            if database_version:
+                return (("postgresql", database_version, _analytics_content_token()),)
+        except Exception:
+            pass
     paths = [Path(CSV_PATH), Path(ANSWER_CSV_PATH), Path(PRODUCT_CSV_PATH),
              Path(CONTENT_INDEX_PATH), Path(BRAND_SETTINGS_PATH)]
     for plugin in MODEL_PLUGINS.values():
-        for attribute in ("results", "dashboard"):
+        for attribute in ("results", "collector_results", "dashboard"):
             path = getattr(plugin, attribute, None)
             if path:
                 paths.append(Path(path))
@@ -260,37 +316,261 @@ def _analytics_data_version():
     return tuple(version)
 
 
+def _analytics_content_token():
+    version = [_ANALYTICS_CACHE_SCHEMA_VERSION, BRAND_MATCH_SCHEMA_VERSION,
+               OWN_PRODUCT_SCHEMA_VERSION]
+    # The content worker atomically republishes a multi-megabyte index every
+    # batch. Invalidating every filter cache on every write kept the dashboard
+    # in a permanent rebuild loop. Content enrichment may lag by at most this
+    # small window; newly ingested runs still use their scoped DB versions.
+    content_epoch_seconds = max(
+        60, int(os.environ.get("MONITOR_ANALYTICS_CONTENT_EPOCH_SECONDS", "300") or 300)
+    )
+    try:
+        stat = Path(CONTENT_INDEX_PATH).stat()
+        version.append(stat.st_mtime_ns // (content_epoch_seconds * 1_000_000_000))
+    except OSError:
+        version.append(0)
+    try:
+        stat = Path(BRAND_SETTINGS_PATH).stat()
+        version.extend((stat.st_mtime_ns, stat.st_size))
+    except OSError:
+        version.extend((0, 0))
+    return hashlib.sha256(json.dumps(version).encode("utf-8")).hexdigest()[:24]
+
+
+def _tail_result_days(path, question_filter="", max_bytes=262144):
+    """Read recent JSONL dates without loading a multi-megabyte result file."""
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            raw = handle.read()
+    except OSError:
+        return set()
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    days = set()
+    canonical_filter = analytics_canonical_question(question_filter) if question_filter else ""
+    for line in lines[-400:]:
+        try:
+            value = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if canonical_filter and analytics_canonical_question(
+            value.get("question") or value.get("prompt") or ""
+        ) != canonical_filter:
+            continue
+        day = str(value.get("day") or analytics_beijing_day(
+            value.get("finished_at") or value.get("captured_at") or value.get("run_time") or ""
+        ))
+        if day:
+            days.add(day)
+    return days
+
+
+def _cache_missing_available_day(result, model_filter="", question_filter=""):
+    cached_days = set(result.get("dates") or [])
+    model_ids = (model_filter,) if model_filter in MODEL_PLUGINS else tuple(MODEL_PLUGINS)
+    available_days = set()
+    for model_id in model_ids:
+        path = getattr(MODEL_PLUGINS[model_id], "results", None)
+        if path:
+            available_days.update(_tail_result_days(path, question_filter))
+    return bool(available_days - cached_days)
+
+
 def _analytics_snapshot(version):
     global _ANALYTICS_SNAPSHOT
+    # The snapshot contains every model, question and date. Its identity must
+    # therefore use the global data version, not the active filter's scoped
+    # version. Using a day/question scope here caused a full PostgreSQL reload
+    # and re-enrichment of every archived source whenever the user switched a
+    # filter, even when the underlying data had not changed.
+    snapshot_version = _analytics_data_version()
     with _ANALYTICS_SNAPSHOT_LOCK:
-        if _ANALYTICS_SNAPSHOT and _ANALYTICS_SNAPSHOT[0] == version:
+        if (
+            _RETAIN_ANALYTICS_SNAPSHOT
+            and _ANALYTICS_SNAPSHOT
+            and _ANALYTICS_SNAPSHOT[0] == snapshot_version
+        ):
             return _ANALYTICS_SNAPSHOT
-        runs_by_model = {
-            model_id: plugin.analytics_runs()
-            for model_id, plugin in MODEL_PLUGINS.items()
-        }
+        runs_by_model = None
+        if monitor_database.enabled():
+            try:
+                database_runs = monitor_database.load_runs_by_model()
+                if database_runs:
+                    runs_by_model = {
+                        model_id: database_runs.get(model_id, [])
+                        for model_id in MODEL_PLUGINS
+                    }
+            except Exception:
+                runs_by_model = None
+        if runs_by_model is None:
+            runs_by_model = {
+                model_id: plugin.analytics_runs()
+                for model_id, plugin in MODEL_PLUGINS.items()
+            }
         prepared = prepare_analytics(runs_by_model)
-        _ANALYTICS_SNAPSHOT = (version, runs_by_model, prepared)
-        return _ANALYTICS_SNAPSHOT
+        snapshot = (snapshot_version, runs_by_model, prepared)
+        # PostgreSQL and the persisted payload cache already retain completed
+        # analytics. Keeping the full all-history source corpus in Python as
+        # well costs hundreds of megabytes on production datasets.
+        _ANALYTICS_SNAPSHOT = snapshot if _RETAIN_ANALYTICS_SNAPSHOT else None
+        return snapshot
+
+
+def _remember_analytics_cache_locked(cache_key, value):
+    """Bound large JSON-ready analytics payloads kept in process memory."""
+    _ANALYTICS_CACHE.pop(cache_key, None)
+    _ANALYTICS_CACHE[cache_key] = value
+    while len(_ANALYTICS_CACHE) > _ANALYTICS_CACHE_MAX:
+        oldest_key = next(iter(_ANALYTICS_CACHE))
+        _ANALYTICS_CACHE.pop(oldest_key, None)
+        _ANALYTICS_LAST_VALIDATED.pop(oldest_key, None)
+        _ANALYTICS_KEY_LOCKS.pop(oldest_key, None)
+
+
+def _uses_scoped_database_load(cache_key):
+    return bool(
+        monitor_database.enabled()
+        and cache_key[3] in {"overview", "compare", "sources", "brands", "brand-trends", "runs"}
+    )
 
 
 def _build_unified_analytics(cache_key, version):
+    # Date-scoped dashboard views must not materialize every archived run and
+    # all 400k+ source rows.  Cross-model intersections still need every model,
+    # but only for the selected day/question.  Selector options come from two
+    # indexed DISTINCT queries instead of the heavyweight snapshot.
+    if _uses_scoped_database_load(cache_key):
+        filter_options = monitor_database.analytics_filter_options(
+            model=cache_key[2], question=cache_key[0],
+        )
+        load_scope = {"day": cache_key[1]} if cache_key[1] else {}
+        source_summary = None
+        detail_scope = None
+        if not cache_key[1]:
+            # All-date views use exact database totals for their KPI cards and
+            # a bounded detail window appropriate to the visible component.
+            # This prevents every navigation click from materializing the full
+            # historical source corpus in Python.
+            detail_limits = {
+                "overview": 7, "brands": 2, "runs": 1,
+                "compare": 1, "sources": 1,
+            }
+            detail_days = list(filter_options.get("dates") or [])[
+                :detail_limits.get(cache_key[3], 1)
+            ]
+            if detail_days:
+                load_scope = {
+                    "day_from": min(detail_days),
+                    "day_to": max(detail_days),
+                }
+            source_summary = monitor_database.analytics_source_scope_summary(
+                question=cache_key[0], model=cache_key[2],
+            )
+            if cache_key[3] == "sources":
+                detail_scope = {
+                    "kind": "latest_day",
+                    "dates": detail_days,
+                    "date_from": min(detail_days) if detail_days else "",
+                    "date_to": max(detail_days) if detail_days else "",
+                }
+        if cache_key[3] in {"brands", "brand-trends"} and cache_key[1]:
+            # The cross-model brand overview needs to paint quickly. Loading
+            # four models across the whole trend window makes the first request
+            # contend with the per-model source drill-downs. Keep the combined
+            # overview on the selected day; a selected model still gets the
+            # complete 14-day trend window.
+            selected_day = datetime.strptime(cache_key[1], "%Y-%m-%d").date()
+            history_days = 13 if cache_key[3] == "brand-trends" and cache_key[2] else 0
+            load_scope = {
+                "day_from": (selected_day - timedelta(days=history_days)).isoformat(),
+                "day_to": selected_day.isoformat(),
+            }
+        # Cross-model source intersections need all three models. Every other
+        # single-model view should only materialize the selected model.
+        load_model = cache_key[2] if cache_key[2] and cache_key[3] != "sources" else ""
+        load_options = {**load_scope, "question": cache_key[0]}
+        if load_model:
+            load_options["model"] = load_model
+        runs_by_model = monitor_database.load_runs_by_model(**load_options)
+        runs_by_model = {
+            model_id: runs_by_model.get(model_id, [])
+            for model_id in MODEL_PLUGINS
+        }
+        prepared = prepare_analytics(
+            runs_by_model,
+            enrich_sources=cache_key[3] in {"sources", "brands", "brand-trends"},
+        )
+        return _build_unified_analytics_from_snapshot(
+            cache_key, (version, runs_by_model, prepared),
+            discard_building=True, cache_version=version,
+            filter_options=filter_options,
+            model_summary=source_summary,
+            detail_scope=detail_scope,
+        )
     snapshot_version, runs_by_model, prepared = _analytics_snapshot(version)
+    return _build_unified_analytics_from_snapshot(
+        cache_key, (snapshot_version, runs_by_model, prepared),
+        discard_building=True, cache_version=version,
+    )
+
+
+def _build_unified_analytics_from_snapshot(
+    cache_key, snapshot, *, discard_building, cache_version=None,
+    filter_options=None, model_summary=None, detail_scope=None,
+):
+    snapshot_version, runs_by_model, prepared = snapshot
+    result_version = cache_version if cache_version is not None else snapshot_version
     result = build_analytics(
         MODEL_REGISTRY,
         runs_by_model,
         question=cache_key[0], date=cache_key[1], model=cache_key[2],
+        view=cache_key[3],
         prepared=prepared,
     )
+    if filter_options:
+        result["questions"] = list(filter_options.get("questions") or [])
+        result["dates"] = list(filter_options.get("dates") or [])
+    if model_summary is not None:
+        for model_row in result.get("models") or []:
+            summary = model_summary.get(str(model_row.get("id") or ""), {})
+            for field, value in summary.items():
+                model_row[field] = int(value or 0)
+    if detail_scope is not None:
+        result["detail_scope"] = detail_scope
     with _ANALYTICS_LOCK:
-        _ANALYTICS_CACHE[cache_key] = (snapshot_version, result)
-        _ANALYTICS_BUILDING.discard(cache_key)
+        _remember_analytics_cache_locked(cache_key, (result_version, result))
+        if discard_building:
+            _ANALYTICS_BUILDING.discard(cache_key)
     _persist_unified_analytics(cache_key, result)
+    try:
+        expected_scope_version = None
+        if (
+            len(result_version) == 1
+            and len(result_version[0]) >= 4
+            and result_version[0][0] == "postgresql"
+        ):
+            expected_scope_version = int(result_version[0][2])
+        monitor_database.cache_put(
+            cache_key, _analytics_content_token(), result,
+            expected_scope_version=expected_scope_version,
+        )
+    except Exception:
+        pass
     return result
 
 
 def _unified_analytics_cache_path(cache_key):
-    payload = json.dumps(cache_key, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(
+        (_ANALYTICS_CACHE_SCHEMA_VERSION, cache_key),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
     return Path(BASE_DIR) / "runtime" / "unified_analytics_cache" / f"{digest}.json"
 
@@ -316,10 +596,194 @@ def _load_persisted_unified_analytics(cache_key):
 
 def _refresh_unified_analytics(cache_key, version):
     try:
-        _build_unified_analytics(cache_key, version)
+        with _ANALYTICS_BUILD_SEMAPHORE:
+            _build_unified_analytics(cache_key, version)
     except Exception:
         with _ANALYTICS_LOCK:
             _ANALYTICS_BUILDING.discard(cache_key)
+
+
+def _build_interactive_unified_analytics(cache_key, version):
+    """Prioritize small indexed UI scopes over serialized background warmup."""
+    if _uses_scoped_database_load(cache_key):
+        return _build_unified_analytics(cache_key, version)
+    with _ANALYTICS_BUILD_SEMAPHORE:
+        return _build_unified_analytics(cache_key, version)
+
+
+def _validate_and_refresh_unified_analytics(cache_key):
+    """Validate stale-while-revalidate caches without blocking a UI request."""
+    try:
+        version = _analytics_data_version(cache_key)
+        with _ANALYTICS_LOCK:
+            cached = _ANALYTICS_CACHE.get(cache_key)
+            if cached and cached[0] == version:
+                _ANALYTICS_BUILDING.discard(cache_key)
+                _ANALYTICS_LAST_VALIDATED[cache_key] = time.monotonic()
+                return
+        _refresh_unified_analytics(cache_key, version)
+    except Exception:
+        with _ANALYTICS_LOCK:
+            _ANALYTICS_BUILDING.discard(cache_key)
+
+
+def _schedule_analytics_validation(cache_key):
+    now = time.monotonic()
+    selected_day = cache_key[1]
+    today = datetime.now(CST).date().isoformat()
+    validation_interval = (
+        300.0 if cache_key[3] == "brand-trends" else
+        _ANALYTICS_VALIDATION_INTERVAL if selected_day == today else
+        300.0
+    )
+    with _ANALYTICS_LOCK:
+        if cache_key in _ANALYTICS_BUILDING:
+            return
+        if now - _ANALYTICS_LAST_VALIDATED.get(cache_key, 0.0) < validation_interval:
+            return
+        _ANALYTICS_LAST_VALIDATED[cache_key] = now
+        _ANALYTICS_BUILDING.add(cache_key)
+    threading.Thread(
+        target=_validate_and_refresh_unified_analytics,
+        args=(cache_key,),
+        name="unified-analytics-validate",
+        daemon=True,
+    ).start()
+
+
+def _unified_analytics_without_coalescing(params):
+    cache_key = (
+        (params.get("question") or [""])[0],
+        (params.get("date") or [""])[0],
+        (params.get("model") or [""])[0],
+        (params.get("view") or [""])[0],
+    )
+    # PostgreSQL scope versions are authoritative. Never serve an unversioned
+    # disk snapshot first: ingest-only models (notably Quark) may have no JSONL
+    # tail for `_cache_missing_available_day` to inspect, which previously made
+    # “全部日期” smaller than a single day until a background refresh finished.
+    if monitor_database.enabled():
+        content_token = _analytics_content_token()
+        # A completed date-scoped payload is safe to paint immediately after
+        # a service restart. PostgreSQL remains authoritative: validation and
+        # replacement happen in the background, while the user avoids paying
+        # the 20-40 second cold aggregation cost on every restart or view
+        # switch. All-date payloads keep the stricter database-first path.
+        persisted = _load_persisted_unified_analytics(cache_key)
+        if (
+            (cache_key[1] or cache_key[3] == "sources")
+            and persisted is not None
+            and str((persisted.get("filters") or {}).get("date") or "") == cache_key[1]
+            and str((persisted.get("filters") or {}).get("question") or "") == cache_key[0]
+            and str((persisted.get("filters") or {}).get("model") or "") == cache_key[2]
+            and str((persisted.get("filters") or {}).get("view") or "") == cache_key[3]
+            and not _cache_missing_available_day(
+                persisted, cache_key[2], cache_key[0]
+            )
+        ):
+            with _ANALYTICS_LOCK:
+                _remember_analytics_cache_locked(cache_key, ((), persisted))
+            _schedule_analytics_validation(cache_key)
+            return persisted
+        try:
+            database_cached = monitor_database.cache_get(cache_key, content_token)
+            if isinstance(database_cached, dict) and isinstance(database_cached.get("models"), list):
+                version = _analytics_data_version(cache_key)
+                with _ANALYTICS_LOCK:
+                    _remember_analytics_cache_locked(cache_key, (version, database_cached))
+                    _ANALYTICS_LAST_VALIDATED[cache_key] = time.monotonic()
+                    _ANALYTICS_BUILDING.discard(cache_key)
+                return database_cached
+        except Exception:
+            pass
+        version = _analytics_data_version(cache_key)
+        with _ANALYTICS_LOCK:
+            cached = _ANALYTICS_CACHE.get(cache_key)
+            if cached and cached[0] == version:
+                return cached[1]
+            _ANALYTICS_BUILDING.add(cache_key)
+        return _build_interactive_unified_analytics(cache_key, version)
+
+    # Disk cache is local and cheap. Return it before touching PostgreSQL, then
+    # validate in the background. This keeps a service restart or a busy DB
+    # from turning an already-viewed filter into a cold request.
+    persisted = _load_persisted_unified_analytics(cache_key)
+    if persisted is not None and not _cache_missing_available_day(
+        persisted, cache_key[2], cache_key[0]
+    ):
+        with _ANALYTICS_LOCK:
+            _remember_analytics_cache_locked(cache_key, ((), persisted))
+        _schedule_analytics_validation(cache_key)
+        return persisted
+    content_token = _analytics_content_token()
+    try:
+        database_cached = monitor_database.cache_get(cache_key, content_token)
+        if isinstance(database_cached, dict) and isinstance(database_cached.get("models"), list):
+            version = _analytics_data_version(cache_key)
+            with _ANALYTICS_LOCK:
+                _remember_analytics_cache_locked(cache_key, (version, database_cached))
+                _ANALYTICS_LAST_VALIDATED[cache_key] = time.monotonic()
+            return database_cached
+    except Exception:
+        pass
+    version = _analytics_data_version(cache_key)
+    build_now = False
+    stale_snapshot = None
+    with _ANALYTICS_LOCK:
+        cached = _ANALYTICS_CACHE.get(cache_key)
+        if cached and cached[0] == version:
+            return cached[1]
+        if cached:
+            if _cache_missing_available_day(cached[1], cache_key[2], cache_key[0]):
+                _ANALYTICS_BUILDING.add(cache_key)
+                build_now = True
+            else:
+                if cache_key not in _ANALYTICS_BUILDING:
+                    _ANALYTICS_BUILDING.add(cache_key)
+                    threading.Thread(
+                        target=_refresh_unified_analytics,
+                        args=(cache_key, version),
+                        name="unified-analytics-refresh",
+                        daemon=True,
+                    ).start()
+                return cached[1]
+        if build_now:
+            pass
+        else:
+            persisted = persisted or _load_persisted_unified_analytics(cache_key)
+            if persisted is not None:
+                _remember_analytics_cache_locked(cache_key, ((), persisted))
+                _ANALYTICS_BUILDING.add(cache_key)
+                if _cache_missing_available_day(persisted, cache_key[2], cache_key[0]):
+                    build_now = True
+                else:
+                    threading.Thread(
+                        target=_refresh_unified_analytics,
+                        args=(cache_key, version),
+                        name="unified-analytics-refresh",
+                        daemon=True,
+                    ).start()
+                    return persisted
+            elif _ANALYTICS_SNAPSHOT is not None and not _uses_scoped_database_load(cache_key):
+                _ANALYTICS_BUILDING.add(cache_key)
+                stale_snapshot = _ANALYTICS_SNAPSHOT
+            else:
+                _ANALYTICS_BUILDING.add(cache_key)
+                build_now = True
+    if stale_snapshot is not None:
+        result = _build_unified_analytics_from_snapshot(
+            cache_key, stale_snapshot, discard_building=False
+        )
+        threading.Thread(
+            target=_refresh_unified_analytics,
+            args=(cache_key, version),
+            name="unified-analytics-refresh",
+            daemon=True,
+        ).start()
+        return result
+    if build_now:
+        return _build_interactive_unified_analytics(cache_key, version)
+    raise RuntimeError("analytics build was not scheduled")
 
 
 def _unified_analytics(params):
@@ -327,39 +791,446 @@ def _unified_analytics(params):
         (params.get("question") or [""])[0],
         (params.get("date") or [""])[0],
         (params.get("model") or [""])[0],
+        (params.get("view") or [""])[0],
     )
-    version = _analytics_data_version()
-    build_now = False
+    # A populated in-memory cache is always served immediately. Version checks
+    # and refreshes happen out of band, so model/question switching never waits
+    # behind PostgreSQL or a content-index rebuild.
     with _ANALYTICS_LOCK:
         cached = _ANALYTICS_CACHE.get(cache_key)
-        if cached and cached[0] == version:
-            return cached[1]
-        if cached:
-            if cache_key not in _ANALYTICS_BUILDING:
-                _ANALYTICS_BUILDING.add(cache_key)
+    # Never make a browser request wait for a live aggregation. Collector
+    # callbacks can arrive every few seconds; synchronously rebuilding the
+    # current day caused aborted browser requests to pile up as server threads.
+    # Serve the latest complete snapshot immediately and coalesce one refresh
+    # in the background. The next poll receives the refreshed counters.
+    if cached and not _cache_missing_available_day(cached[1], cache_key[2], cache_key[0]):
+        if monitor_database.enabled():
+            try:
+                if cached[0] == _analytics_data_version(cache_key):
+                    return cached[1]
+            except Exception:
+                pass
+        # Live collectors continuously advance PostgreSQL scope versions. The
+        # visible request must still receive the latest completed payload;
+        # validate and replace it in the background instead of synchronously
+        # rebuilding the brand view on every five-second poll.
+        _schedule_analytics_validation(cache_key)
+        return cached[1]
+    # Collapse a burst of identical cold requests into one aggregation. Requests
+    # for different dates/models still execute in parallel.
+    with _ANALYTICS_KEY_LOCKS[cache_key]:
+        return _unified_analytics_without_coalescing(params)
+
+
+def _source_intersection_cache_path(question, date):
+    token = json.dumps(
+        (_ANALYTICS_CACHE_SCHEMA_VERSION, "full-source-intersections", question, date),
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+    return Path(BASE_DIR) / "runtime" / "source_intersection_cache" / f"{digest}.json"
+
+
+def _source_intersection_version(question, date):
+    return (
+        _analytics_data_version((question, date, "", "sources")),
+        _analytics_content_token(),
+    )
+
+
+def _finalize_intersection_rows(grouped, exact_models, *, competitor=False):
+    rows = []
+    for row in grouped.values():
+        matched = [model_id for model_id, count in row["model_counts"].items() if count]
+        if len(matched) != exact_models:
+            continue
+        item = dict(row)
+        item["matched_models"] = matched
+        item["total_count"] = sum(item["model_counts"].values())
+        if competitor:
+            item["competitor_brands"] = sorted(item.get("competitor_brands") or [])
+            if not item.get("competitor_brand"):
+                item["competitor_brand"] = "、".join(item["competitor_brands"])
+        else:
+            item["owned_brands"] = sorted(item.get("owned_brands") or [])
+            item["own_products"] = sorted(item.get("own_products") or [])
+        rows.append(item)
+    return sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("date") or ""), str(item.get("question") or ""),
+            int(item.get("total_count") or 0), str(item.get("canonical_url") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def _build_source_intersection_payload(question="", date=""):
+    """Build full-filter intersections from unique URLs plus SQL citation counts.
+
+    Source body/title classification runs once per canonical URL, while
+    PostgreSQL counts citations per model/run. This preserves the exact
+    all-date semantics without loading every source payload into Python.
+    """
+    catalog = monitor_database.source_intersection_catalog(question=question, day=date)
+    index = analytics_content_index()
+    eligible_competitors = {
+        analytics_canonical_brand_name(item)
+        for item in monitor_database.source_intersection_product_brands(
+            question=question, day=date,
+        )
+        if analytics_canonical_brand_name(item)
+    }
+    owned_vocab = []
+    brand_aliases = {brand: {brand} for brand in eligible_competitors}
+    for item in owned_brand_vocabulary():
+        name = analytics_canonical_brand_name(item.get("name") or "")
+        if name:
+            aliases = set(item.get("aliases") or []) | {name}
+            owned_vocab.append((name, aliases))
+            brand_aliases.setdefault(name, {name}).update(aliases)
+    for item in brand_settings.vocabulary():
+        name = analytics_canonical_brand_name(item.get("name") or "")
+        if name in brand_aliases:
+            brand_aliases[name].update(item.get("aliases") or [])
+    for name, aliases in BRAND_CANONICAL_GROUPS.items():
+        canonical = analytics_canonical_brand_name(name)
+        if canonical in brand_aliases:
+            brand_aliases[canonical].update(aliases)
+    brand_matcher = analytics_brand_matcher(brand_aliases)
+    labels = {}
+    for raw in catalog:
+        source = dict(raw)
+        canonical_url = str(source.get("canonical_url") or "").strip()
+        url = str(source.get("url") or canonical_url).strip()
+        title = str(source.get("title") or "")
+        is_article = "视频" not in str(source.get("source_type") or "")
+        entry = (index.get(url) or index.get(canonical_url) or {}) if is_article else {}
+        body_ready = bool(
+            entry.get("status") == "ok"
+            and entry.get("extraction_quality") in {"high", "medium"}
+        )
+        title_products = set(own_product_mentions(title))
+        body_products = set(entry.get("own_product_mentions") or []) if body_ready else set()
+        products = title_products | body_products
+        title_brands = set(analytics_brand_mentions(title, brand_matcher))
+        owned_names = {name for name, _aliases in owned_vocab}
+        owned_brands = title_brands & owned_names
+        if is_article:
+            owned_brands.update(
+                canonical
+                for value in entry.get("owned_brand_mentions") or []
+                if (canonical := analytics_canonical_brand_name(value))
+            )
+        owned_brands.update(
+            analytics_canonical_brand_name(value)
+            for value in brands_for_products(products)
+            if analytics_canonical_brand_name(value)
+        )
+        competitor_brands = set()
+        if body_ready:
+            body_brands = {
+                canonical
+                for value in (
+                    list(entry.get("brand_mentions") or [])
+                    + list(entry.get("owned_brand_mentions") or [])
+                )
+                if (canonical := analytics_canonical_brand_name(value))
+            }
+            if not body_brands and entry.get("excerpt"):
+                body_brands.update(
+                    analytics_brand_mentions(str(entry.get("excerpt") or ""), brand_matcher)
+                )
+            owned_brands.update(body_brands & owned_names)
+            competitor_brands = {
+                brand for brand in body_brands
+                if brand in eligible_competitors and brand not in owned_brands
+            }
+        if owned_brands or products or competitor_brands:
+            labels[canonical_url] = {
+                "owned_brands": owned_brands,
+                "own_products": products,
+                "competitor_brands": competitor_brands,
+            }
+    citations = monitor_database.source_intersection_citations(
+        labels, question=question, day=date,
+    )
+    owned_grouped = {}
+    competitor_grouped = {}
+    all_competitor_grouped = {}
+    model_ids = ("doubao", "yuanbao", "wenxin")
+    for raw in citations:
+        row = dict(raw)
+        url = str(row.get("canonical_url") or "")
+        label = labels.get(url) or {}
+        base = {
+            "date": str(row.get("date") or ""),
+            "question": str(row.get("question") or ""),
+            "title": str(row.get("title") or url),
+            "url": str(row.get("url") or url),
+            "canonical_url": url,
+            "media": str(row.get("media") or ""),
+            "type": str(row.get("source_type") or "文章"),
+            "model_counts": {item: 0 for item in model_ids},
+        }
+        model_id = str(row.get("model_id") or "")
+        count = int(row.get("citation_count") or 0)
+        if label.get("owned_brands") or label.get("own_products"):
+            key = (base["date"], base["question"], url)
+            target = owned_grouped.setdefault(key, {
+                **base, "owned_brands": set(), "own_products": set(),
+            })
+            target["model_counts"][model_id] += count
+            target["owned_brands"].update(label.get("owned_brands") or [])
+            target["own_products"].update(label.get("own_products") or [])
+        competitors = set(label.get("competitor_brands") or [])
+        if competitors:
+            all_key = (base["date"], base["question"], url)
+            all_target = all_competitor_grouped.setdefault(all_key, {
+                **base, "competitor_brands": set(), "body_match_scope": "正文",
+            })
+            all_target["model_counts"][model_id] += count
+            all_target["competitor_brands"].update(competitors)
+            for brand in competitors:
+                key = (base["date"], base["question"], brand, url)
+                target = competitor_grouped.setdefault(key, {
+                    **base, "competitor_brand": brand, "competitor_brands": {brand},
+                    "body_match_scope": "正文",
+                })
+                target["model_counts"][model_id] += count
+    payload = {
+        "generated_at": datetime.now(CST).isoformat(timespec="seconds"),
+        "filters": {"question": question, "date": date, "view": "source-intersections"},
+        "competitor_brands": sorted({
+            brand for label in labels.values()
+            for brand in label.get("competitor_brands") or []
+        }),
+        "common_owned_sources": _finalize_intersection_rows(owned_grouped, 3),
+        "two_model_owned_sources": _finalize_intersection_rows(owned_grouped, 2),
+        "common_competitor_sources": _finalize_intersection_rows(competitor_grouped, 3, competitor=True),
+        "two_model_competitor_sources": _finalize_intersection_rows(competitor_grouped, 2, competitor=True),
+        "common_all_competitor_sources": _finalize_intersection_rows(all_competitor_grouped, 3, competitor=True),
+        "two_model_all_competitor_sources": _finalize_intersection_rows(all_competitor_grouped, 2, competitor=True),
+    }
+    return payload
+
+
+def _persist_source_intersections(question, date, payload):
+    path = _source_intersection_cache_path(question, date)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        pass
+
+
+def _refresh_source_intersections(question, date, version):
+    key = (question, date)
+    try:
+        payload = _build_source_intersection_payload(question, date)
+        with _SOURCE_INTERSECTION_LOCK:
+            _SOURCE_INTERSECTION_CACHE[key] = (version, payload)
+            _SOURCE_INTERSECTION_LAST_VALIDATED[key] = time.monotonic()
+        _persist_source_intersections(question, date, payload)
+    finally:
+        with _SOURCE_INTERSECTION_LOCK:
+            _SOURCE_INTERSECTION_BUILDING.discard(key)
+
+
+def _source_intersection_payload(params):
+    question = str((params.get("question") or [""])[0]).strip()
+    date = str((params.get("date") or [""])[0]).strip()
+    key = (question, date)
+    version = _source_intersection_version(question, date)
+    with _SOURCE_INTERSECTION_LOCK:
+        cached = _SOURCE_INTERSECTION_CACHE.get(key)
+    if cached and cached[0] == version:
+        return cached[1]
+    if cached:
+        with _SOURCE_INTERSECTION_LOCK:
+            due = time.monotonic() - _SOURCE_INTERSECTION_LAST_VALIDATED.get(key, 0.0) >= 300.0
+            if due and key not in _SOURCE_INTERSECTION_BUILDING:
+                _SOURCE_INTERSECTION_BUILDING.add(key)
+                _SOURCE_INTERSECTION_LAST_VALIDATED[key] = time.monotonic()
                 threading.Thread(
-                    target=_refresh_unified_analytics,
-                    args=(cache_key, version),
-                    name="unified-analytics-refresh",
-                    daemon=True,
+                    target=_refresh_source_intersections,
+                    args=(question, date, version), daemon=True,
+                    name="source-intersections-refresh",
                 ).start()
-            return cached[1]
-        persisted = _load_persisted_unified_analytics(cache_key)
-        if persisted is not None:
-            _ANALYTICS_CACHE[cache_key] = ((), persisted)
-            _ANALYTICS_BUILDING.add(cache_key)
-            threading.Thread(
-                target=_refresh_unified_analytics,
-                args=(cache_key, version),
-                name="unified-analytics-refresh",
-                daemon=True,
-            ).start()
-            return persisted
-        _ANALYTICS_BUILDING.add(cache_key)
-        build_now = True
-    if build_now:
-        return _build_unified_analytics(cache_key, version)
-    raise RuntimeError("analytics build was not scheduled")
+        return cached[1]
+    path = _source_intersection_cache_path(question, date)
+    try:
+        persisted = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        persisted = None
+    if isinstance(persisted, dict):
+        with _SOURCE_INTERSECTION_LOCK:
+            # The persisted full-history aggregate is safe to paint at once.
+            # Treat it as current for five minutes; live ingestion otherwise
+            # advances the global version every few seconds and would keep a
+            # CPU-heavy historical regroup running continuously.
+            _SOURCE_INTERSECTION_CACHE[key] = (version, persisted)
+            _SOURCE_INTERSECTION_LAST_VALIDATED[key] = time.monotonic()
+        return persisted
+    with _SOURCE_INTERSECTION_LOCKS[key]:
+        payload = _build_source_intersection_payload(question, date)
+        with _SOURCE_INTERSECTION_LOCK:
+            _SOURCE_INTERSECTION_CACHE[key] = (version, payload)
+            _SOURCE_INTERSECTION_LAST_VALIDATED[key] = time.monotonic()
+        _persist_source_intersections(question, date, payload)
+        return payload
+
+
+def _analytics_payload_for_client(result, include_runs=False, view=""):
+    if view == "overview":
+        result = _with_fresh_owned_product_board(result)
+    owned_brands = [dict(item) for item in brand_settings.load_settings().get("owned_brands") or []]
+    safe_models = []
+    for raw_model in result.get("models") or []:
+        model = dict(raw_model)
+        for field in ("brand_daily", "brand_trend_daily"):
+            days = []
+            for raw_day in model.get(field) or []:
+                day = dict(raw_day)
+                day["items"] = [
+                    item for item in day.get("items") or []
+                    if analytics_valid_brand(item.get("name") or "")
+                ]
+                days.append(day)
+            model[field] = days
+        safe_models.append(model)
+    result = {**result, "models": safe_models}
+    if include_runs and not view:
+        return {**result, "owned_brands": owned_brands}
+    view_fields = {
+        "overview": {"daily", "source_types"},
+        "compare": {"source_types", "media", "top_articles", "top_videos"},
+        "sources": {"top_articles", "top_videos", "owned_sources", "article_keywords", "video_keywords", "daily_source_top"},
+        "brands": {"brand_trend_daily", "product_trend_daily", "brand_source_daily", "source_brand_daily", "article_keywords", "video_keywords"},
+        "runs": {"recent_runs"},
+        "control": set(),
+    }
+    selected_fields = view_fields.get(view)
+    large_fields = {
+        "daily", "questions", "source_types", "media", "top_articles", "top_videos",
+        "owned_sources", "article_keywords", "video_keywords", "brand_daily", "product_daily",
+        "brand_trend_daily", "product_trend_daily", "brand_source_daily",
+        "source_brand_daily", "daily_source_top", "recent_runs",
+    }
+    models = []
+    for model in result.get("models") or []:
+        if selected_fields is None:
+            models.append({key: value for key, value in model.items() if key != "recent_runs"})
+            continue
+        projected = {
+            key: value
+            for key, value in model.items()
+            if key not in large_fields or key in selected_fields
+        }
+        # Keep a stable client shape while sending only the arrays used by the
+        # active view. This prevents transient view changes from dereferencing
+        # a missing field before the next response arrives.
+        for field in large_fields:
+            projected.setdefault(field, [])
+        models.append(projected)
+    return {**result, "models": models, "owned_brands": owned_brands}
+
+
+def _brand_source_links_payload(params):
+    model_id = str((params.get("model") or [""])[0]).strip()
+    brand = str((params.get("brand") or [""])[0]).strip()
+    question = str((params.get("question") or [""])[0]).strip()
+    focus_date = str((params.get("date") or [""])[0]).strip()
+    if model_id not in MODEL_PLUGINS:
+        raise ValueError("请选择有效模型")
+    if not brand:
+        raise ValueError("请选择品牌")
+    # Link drill-down is a read-only interaction and must stay responsive while
+    # the content index is being refreshed. Reuse the already-enriched snapshot
+    # shown by the dashboard; a background analytics refresh will replace it
+    # atomically when new source content is ready.
+    if monitor_database.enabled():
+        load_options = {"model": model_id, "question": question}
+        if focus_date:
+            load_options.update({
+                "day_from": focus_date,
+                "day_to": focus_date,
+            })
+        runs_by_model = monitor_database.load_runs_by_model(**load_options)
+        runs_by_model = {model_id: runs_by_model.get(model_id, [])}
+        prepare_analytics(runs_by_model)
+    else:
+        snapshot = _ANALYTICS_SNAPSHOT
+        if snapshot is None:
+            snapshot = _analytics_snapshot(_analytics_data_version())
+        _snapshot_version, runs_by_model, _prepared = snapshot
+    selected_runs = [
+        run for run in runs_by_model.get(model_id, [])
+        if not question or run.get("question") == question
+    ]
+    if focus_date:
+        selected_runs = [
+            run for run in selected_runs
+            if str(run.get("day") or "") == focus_date
+        ]
+    days = []
+    for day in sorted({run.get("day") for run in selected_runs if run.get("day")}, reverse=True):
+        day_runs = [run for run in selected_runs if run.get("day") == day]
+        observed_sources = {}
+        evaluable_sources = {}
+        matched_sources = {}
+        for run in day_runs:
+            for source in run.get("sources") or []:
+                key = str(source.get("canonical_url") or source.get("url") or "").strip()
+                if not key:
+                    continue
+                observed_sources.setdefault(key, source)
+                title_hit = brand in set(source.get("title_brand_mentions") or [])
+                evaluable = bool(
+                    source.get("type") == "视频"
+                    or source.get("body_analysis_ready")
+                    or title_hit
+                )
+                if evaluable:
+                    evaluable_sources.setdefault(key, source)
+                if brand in set(source.get("brand_mentions") or []):
+                    matched_sources.setdefault(key, source)
+        links = []
+        for source in matched_sources.values():
+            title_hit = brand in set(source.get("title_brand_mentions") or [])
+            body_hit = brand in set(source.get("body_brand_mentions") or [])
+            scope = "标题+正文" if title_hit and body_hit else "标题" if title_hit else "正文" if body_hit else "已识别"
+            links.append({
+                "title": source.get("title") or source.get("url") or "未命名信源",
+                "url": source.get("url") or source.get("canonical_url") or "",
+                "canonical_url": source.get("canonical_url") or source.get("url") or "",
+                "media": source.get("media") or "",
+                "type": source.get("type") or "",
+                "match_scope": scope,
+                "own_products": source.get("own_products") or [],
+            })
+        links.sort(key=lambda item: (item["type"], item["media"], item["title"]))
+        total = len(observed_sources)
+        eligible = len(evaluable_sources)
+        failed = sum(
+            key not in evaluable_sources
+            and source.get("content_analysis_status") == "failed"
+            for key, source in observed_sources.items()
+        )
+        matched = len(matched_sources)
+        days.append({
+            "date": day,
+            "sources": total,
+            "eligible_sources": eligible,
+            "pending_sources": max(0, total - eligible - failed),
+            "failed_sources": failed,
+            "mentions": matched,
+            "mention_rate": round(matched * 100 / eligible, 2) if eligible else 0,
+            "links": links,
+        })
+    return {"ok": True, "model": model_id, "brand": brand, "question": question, "days": days}
 
 
 def _open_remote_model_panel(model):
@@ -733,6 +1604,143 @@ def rank_counter_items(counter, ranks_by_name, limit=None, runs_by_name=None, to
         }
         result.append(item)
     return result
+
+
+def _build_owned_product_board(cache_key, selected_models, question, live_day, model):
+    version = monitor_database.scope_version(cache_key)
+    database_cached = monitor_database.cache_get(
+        cache_key, _analytics_content_token(),
+    )
+    live_board = (
+        list(database_cached.get("owned_product_daily") or [])
+        if isinstance(database_cached, dict) else None
+    )
+    if live_board is None:
+        runs_by_model = monitor_database.load_owned_product_runs(
+            day=live_day, question=question, model=model,
+        )
+        live_board = daily_owned_product_recommendations(
+            runs_by_model, selected_models, question=question, date=live_day,
+        )
+        monitor_database.cache_put(
+            cache_key, _analytics_content_token(),
+            {"owned_product_daily": live_board},
+            expected_scope_version=int(version[1]),
+        )
+    with _OWNED_BOARD_LOCK:
+        _OWNED_BOARD_CACHE[cache_key] = (version, live_board)
+    return live_board
+
+
+def _refresh_owned_product_board(cache_key, selected_models, question, live_day, model):
+    try:
+        _build_owned_product_board(
+            cache_key, selected_models, question, live_day, model,
+        )
+    except Exception:
+        pass
+    finally:
+        with _OWNED_BOARD_LOCK:
+            _OWNED_BOARD_BUILDING.discard(cache_key)
+
+
+def _schedule_owned_product_board_refresh(
+    cache_key, selected_models, question, live_day, model,
+):
+    now = time.monotonic()
+    with _OWNED_BOARD_LOCK:
+        if cache_key in _OWNED_BOARD_BUILDING:
+            return
+        if now - _OWNED_BOARD_LAST_VALIDATED.get(cache_key, 0.0) < _OWNED_BOARD_VALIDATION_INTERVAL:
+            return
+        _OWNED_BOARD_LAST_VALIDATED[cache_key] = now
+        _OWNED_BOARD_BUILDING.add(cache_key)
+    threading.Thread(
+        target=_refresh_owned_product_board,
+        args=(cache_key, selected_models, question, live_day, model),
+        name="owned-product-board-refresh",
+        daemon=True,
+    ).start()
+
+
+def _with_fresh_owned_product_board(result):
+    """Overlay the live owned-product matrix on a possibly stale full snapshot.
+
+    Archive KPIs are intentionally served stale-while-revalidate so filter
+    changes stay responsive.  The owned-product board is small and operationally
+    time-sensitive, so it uses a source-free indexed query and its own scoped
+    version instead of waiting for the heavyweight all-date snapshot.
+    """
+    if not monitor_database.enabled():
+        return result
+    filters = dict(result.get("filters") or {})
+    question = str(filters.get("question") or "")
+    requested_day = str(filters.get("date") or "")
+    model = str(filters.get("model") or "")
+    try:
+        if requested_day:
+            visible_days = [requested_day]
+        else:
+            # The complete snapshot already carries the date selector.  Reading
+            # it here avoids an extra PostgreSQL query on every UI switch while
+            # collectors may be writing.  Fall back only for a truly cold cache.
+            visible_days = [
+                str(item) for item in (result.get("dates") or [])[:7] if item
+            ]
+            if not visible_days:
+                options = monitor_database.analytics_filter_options(
+                    model=model, question=question,
+                )
+                visible_days = [
+                    str(item) for item in (options.get("dates") or [])[:7] if item
+                ]
+        if not visible_days:
+            return result
+        selected_models = (
+            [model] if model and model in MODEL_REGISTRY else list(MODEL_REGISTRY)
+        )
+        stale_board = list(result.get("owned_product_daily") or [])
+        board = []
+        for day_index, live_day in enumerate(visible_days):
+            historical = [
+                row for row in stale_board if str(row.get("date") or "") == live_day
+            ]
+            # For an all-date view, only the newest day changes continuously.
+            # Reuse complete historical rows and refresh a historical day only
+            # when the cached snapshot has no matrix for it.
+            if not requested_day and day_index > 0 and historical:
+                board.extend(historical)
+                continue
+            cache_key = (question, live_day, model, "owned_product_board")
+            with _OWNED_BOARD_LOCK:
+                cached = _OWNED_BOARD_CACHE.get(cache_key)
+            if cached is not None:
+                live_board = cached[1]
+                _schedule_owned_product_board_refresh(
+                    cache_key, selected_models, question, live_day, model,
+                )
+            elif historical:
+                # The analytics payload already contains a complete matrix.
+                # Paint it immediately and validate in the background; live
+                # collection must never make a five-second UI poll wait on DB.
+                live_board = historical
+                with _OWNED_BOARD_LOCK:
+                    _OWNED_BOARD_CACHE[cache_key] = ((), live_board)
+                _schedule_owned_product_board_refresh(
+                    cache_key, selected_models, question, live_day, model,
+                )
+            else:
+                # A truly cold payload has no safe board to show yet. This path
+                # runs once; subsequent requests use stale-while-revalidate.
+                live_board = _build_owned_product_board(
+                    cache_key, selected_models, question, live_day, model,
+                )
+            board.extend(live_board)
+        return {**result, "owned_product_daily": board}
+    except Exception:
+        # A transient database problem must not take down the rest of the
+        # dashboard; the last complete archive result remains auditable.
+        return result
 
 
 QUESTION_RULES = [
@@ -1200,6 +2208,13 @@ INVALID_BRAND_TERMS = {
     "祛痘", "红肿痘", "痘", "痘痘", "敏感红", "油痘", "淡化痘", "突发红肿",
     "油敏痘", "使用小贴士", "植祛小", "小提示", "小提醒", "小贴士", "面膜每周", "面膜每周2", "面膜一周",
     "高端沙龙卡诗", "高端沙龙级卡诗", "内蒙古", "韩愢单剂", "橡树",
+    # AI/product-card descriptors and shop names are not brands.  These values
+    # occurred in grounded recommendation text, so grounding alone cannot tell
+    # them apart from a real brand.
+    "12种氨基酸", "俄罗斯睫毛营养液", "新升级通用", "植萃", "植物精华",
+    "泡泡染发剂", "高端理发店同款", "端享优选店铺", "专攻", "美白祛斑霜",
+    "韩国三文鱼", "粉水光", "草本", "草本育发", "苗族传承", "水晶", "紫苏",
+    "黄金", "黄金面膜", "黄金胶原蛋白", "黄金胶原蛋白面膜", "黄金胶原蛋白多肽发光面膜",
 }
 
 INVALID_PRODUCT_TERMS = {
@@ -1346,7 +2361,7 @@ def brand_for_product(product_name):
 @lru_cache(maxsize=8192)
 def canonical_brand_name(brand):
     """Merge confirmed spelling variants before aggregating the leaderboard."""
-    text = str(brand or "").strip()
+    text = analytics_canonical_brand_name(brand)
     if not text:
         return ""
     # Explicit model brands should use the same case-insensitive alias table as
@@ -1405,9 +2420,15 @@ def canonical_source_url(href):
         path = re.sub(r"/{2,}", "/", parsed.path or "/")
         if path != "/":
             path = path.rstrip("/")
+        scheme = (parsed.scheme or "https").casefold()
+        netloc = parsed.netloc.casefold()
+        if scheme in {"http", "https"}:
+            scheme = "https"
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
         return urlunparse((
-            (parsed.scheme or "https").casefold(),
-            parsed.netloc.casefold(),
+            scheme,
+            netloc,
             path,
             "",
             urlencode(sorted(query)),
@@ -1421,6 +2442,11 @@ def canonical_source_url(href):
 def aliases_for_brand(brand):
     canonical = canonical_brand_name(brand)
     aliases = {canonical}
+    # Keep extraction/grounding aliases in sync with analytics canonicalization.
+    # Previously a canonical value such as "TALIKA 塔莉卡" was known to the
+    # dashboard, but its answer-side alias "塔莉卡" was not considered grounded,
+    # which incorrectly cleared the brand after successful extraction.
+    aliases.update(BRAND_CANONICAL_GROUPS.get(canonical, ()))
     for values, target in BRAND_ALIAS_RULES:
         if canonical_brand_name(target) == canonical:
             aliases.update(str(value or "").strip() for value in values)
@@ -1436,13 +2462,12 @@ def aliases_for_brand(brand):
 def title_mentions_brand(title, brand):
     text = str(title or "")
     folded = text.casefold()
-    compact = re.sub(r"[\s\-_—·&＆'’]+", "", folded)
     for alias in aliases_for_brand(brand):
         alias_folded = str(alias or "").casefold()
         if not alias_folded:
             continue
         if re.search(r"[\u3400-\u9fff]", alias_folded):
-            if re.sub(r"[\s\-_—·&＆'’]+", "", alias_folded) in compact:
+            if brand_alias_occurs(text, alias_folded):
                 return True
             continue
         if re.search(r"(?<![a-z0-9])" + re.escape(alias_folded) + r"(?![a-z0-9])", folded):
@@ -2539,7 +3564,7 @@ def brand_source_daily_analytics(
             "source_av_ref_share": "当日文章或视频的标题、正文、页面描述任一处命中所选品牌的信源行数 ÷ 当日该品类全部信源行数；同一链接跨轮重复出现仍逐行计数。正文尚未成功归档的链接不当作未命中。",
             "content_only_ref_share": "标题未命中、但正文或视频页面描述命中所选品牌的信源行数 ÷ 当日该品类全部信源行数。",
             "content_fetch_coverage": "正文或视频页面描述已成功归档且质量达到中/高的信源行数 ÷ 当日全部信源行数。正文相关性分析仅纳入归档覆盖率达到95%的完整日。",
-            "mention_rate": "品牌出现轮次÷当日已完成AI商品审核的答案轮次；同品牌每轮最多计一次。",
+            "mention_rate": "结构化产品品牌出现轮次÷当日已完成AI商品审核的答案轮次；仅供旧版产品审核分析，新版回答品牌率直接按全部有效回答正文计算。",
             "title_av_ref_share": "当日文章或视频标题命中所选品牌的信源链接行数÷当日该品类全部信源链接行数；同一URL跨轮再次出现会再次计数。",
             "source_title_coverage": "标题中可识别该品牌的信源出现轮次÷当日有信源的运行轮次；这是标题可见下限，不等于正文或视频内容命中。",
             "correlation": "比较当日品牌产品提及率与当日标题命中信源份额；属于跨日聚合相关，不证明标题命中导致品牌被推荐。",
@@ -3000,6 +4025,107 @@ def owned_product_source_analytics(
     }
 
 
+def owned_video_source_share_by_category(source_rows, ai_cache, meta_cache, content_index):
+    """Return unique owned-brand video links as a share of each category's links."""
+    buckets = {}
+    match_cache = {}
+    kind_cache = {}
+    observation_dates = set()
+    product_brands = {
+        str(rule.get("name") or "").strip(): canonical_brand_name(rule.get("brand") or "")
+        for rule in OWN_PRODUCT_RULES
+        if str(rule.get("name") or "").strip()
+    }
+    for row in source_rows or []:
+        if is_quarantined_source_row(row):
+            continue
+        question = question_for(row)
+        href = str(row.get("href") or "").strip()
+        canonical = canonical_source_url(href) or href
+        if not question or question == ALL_QUESTIONS or not canonical:
+            continue
+        bucket = buckets.setdefault(question, {
+            "question": question,
+            "all_refs": 0,
+            "video_refs": 0,
+            "owned_video_refs": 0,
+            "all_urls": set(),
+            "video_urls": set(),
+            "owned_video_urls": set(),
+            "owned_brands": set(),
+            "dates": set(),
+        })
+        day = date_for(row)
+        if day and day != "未知日期":
+            bucket["dates"].add(day)
+            observation_dates.add(day)
+        bucket["all_refs"] += 1
+        bucket["all_urls"].add(canonical)
+        title = str(row.get("title") or "").strip()
+        source_key = (href, title)
+        kind = kind_cache.get(source_key)
+        if kind is None:
+            kind = _owned_source_kind(row, ai_cache, meta_cache)
+            kind_cache[source_key] = kind
+        if kind != "video":
+            continue
+        bucket["video_refs"] += 1
+        bucket["video_urls"].add(canonical)
+        matched = match_cache.get(source_key)
+        if matched is None:
+            products, _product_scope = owned_source_products(href, title, content_index)
+            brands, _brand_scope = owned_source_brands(href, title, content_index)
+            matched = (products, brands)
+            match_cache[source_key] = matched
+        products, brands = matched
+        resolved_brands = {
+            canonical_brand_name(brand)
+            for brand in brands
+            if canonical_brand_name(brand)
+        }
+        resolved_brands.update(
+            product_brands.get(product, "")
+            for product in products
+            if product_brands.get(product, "")
+        )
+        if not products and not resolved_brands:
+            continue
+        bucket["owned_video_refs"] += 1
+        bucket["owned_video_urls"].add(canonical)
+        bucket["owned_brands"].update(resolved_brands)
+
+    rows = []
+    for question, bucket in buckets.items():
+        all_urls = len(bucket["all_urls"])
+        video_urls = len(bucket["video_urls"])
+        owned_video_urls = len(bucket["owned_video_urls"])
+        rows.append({
+            "question": question,
+            "all_refs": bucket["all_refs"],
+            "video_refs": bucket["video_refs"],
+            "owned_video_refs": bucket["owned_video_refs"],
+            "all_unique_urls": all_urls,
+            "video_unique_urls": video_urls,
+            "owned_video_unique_urls": owned_video_urls,
+            "owned_video_link_share": owned_video_urls / all_urls if all_urls else None,
+            "owned_within_video_link_share": owned_video_urls / video_urls if video_urls else None,
+            "owned_brands": sorted(bucket["owned_brands"]),
+            "first_date": min(bucket["dates"]) if bucket["dates"] else "",
+            "last_date": max(bucket["dates"]) if bucket["dates"] else "",
+        })
+    rows.sort(key=lambda item: item["question"])
+    return {
+        "rows": rows,
+        "first_date": min(observation_dates) if observation_dates else "",
+        "last_date": max(observation_dates) if observation_dates else "",
+        "definitions": {
+            "primary": "命中自有品牌或自有产品的视频唯一链接数 ÷ 该品类全部唯一信源链接数。",
+            "within_video": "命中自有品牌或自有产品的视频唯一链接数 ÷ 该品类全部视频唯一链接数。",
+            "deduplication": "链接按标准化URL去重；同一链接跨轮重复抓取只计一个链接。",
+        },
+    }
+
+
 def product_review_coverage(source_rows, product_rows, answer_rows):
     """Explain every source run that is absent from product statistics."""
     source_by_run = {}
@@ -3117,7 +4243,7 @@ _VIEW_CACHE = {}
 _VIEW_CACHE_LOCK = threading.Lock()
 _VIEW_REFRESHING = set()
 _VIEW_CACHE_TTL_SECONDS = 30.0
-_VIEW_CACHE_SCHEMA_VERSION = 1
+_VIEW_CACHE_SCHEMA_VERSION = 2
 
 
 def _load_persisted_view_cache():
@@ -3526,6 +4652,12 @@ def _compute_stats(selected_question=None, selected_device=None):
             selected_question,
             answer_rows=answer_rows_for_stats,
         )
+        owned_video_category_share = owned_video_source_share_by_category(
+            rows,
+            ai_cache,
+            meta_cache,
+            content_index,
+        )
         owned_product_source_analytics_data = owned_product_source_analytics(
             rows_for_stats,
             ai_cache,
@@ -3657,6 +4789,7 @@ def _compute_stats(selected_question=None, selected_device=None):
             "per_question_sources": per_question_sources,
             "daily_question_sources": daily_question_sources,
             "daily_question_products": daily_question_products,
+            "owned_video_source_share_by_category": owned_video_category_share,
             "owned_product_source_analytics": owned_product_source_analytics_data,
             "brand_source_daily_analytics": brand_source_daily_analytics_data,
             "question_count": len(questions),
@@ -4618,6 +5751,20 @@ body.compact .latest-product-card { padding:7px 9px; }
           <div class="strategy-list" id="strategySignals"></div>
         </section>
       </div>
+
+      <section class="card" aria-labelledby="ownedVideoCategoryTitle">
+        <div class="card-header">
+          <span class="card-title" id="ownedVideoCategoryTitle">各产品品类 · 自有品牌视频信源链接占比</span>
+          <span class="card-hint" id="ownedVideoCategoryHint">按唯一链接统计，跟随设备筛选</span>
+        </div>
+        <div class="analysis-note">主占比＝命中自有品牌或自有产品的视频唯一链接 ÷ 该品类全部唯一信源链接；同一链接跨轮重复出现只计一次。</div>
+        <div class="data-table-wrap" data-scroll-key="owned-video-category-share" tabindex="0" role="region" aria-label="各产品品类自有品牌视频信源链接占比">
+          <table class="data-table">
+            <thead><tr><th>产品品类</th><th>自有品牌</th><th>全部唯一链接</th><th>全部视频链接</th><th>自有品牌视频链接</th><th>占品类全部链接</th><th>占品类视频链接</th></tr></thead>
+            <tbody id="ownedVideoCategoryRows"><tr><td colspan="7" class="empty">等待统计数据</td></tr></tbody>
+          </table>
+        </div>
+      </section>
 
       <details class="methodology-summary" data-detail-key="overview-methodology">
         <summary>查看统计口径与使用边界</summary>
@@ -5712,6 +6859,27 @@ function scheduleAnalysisRender(){
   if(!_ownedResizeObserver&&window.ResizeObserver){_ownedResizeObserver=new ResizeObserver(()=>{if(activeView==="daily")scheduleAnalysisRender()});["ownedMixChartFrame","ownedKeywordTrendFrame","ownedThemeChartFrame"].forEach(id=>{const node=$(id);if(node)_ownedResizeObserver.observe(node)})}
 }
 
+function renderOwnedVideoCategoryShare(payload){
+  const body=$("ownedVideoCategoryRows"),rows=[...(payload?.rows||[])];
+  if(!body)return;
+  rows.sort((a,b)=>(b.owned_video_link_share||0)-(a.owned_video_link_share||0)||String(a.question||"").localeCompare(String(b.question||""),"zh-CN"));
+  const ownedLinks=rows.reduce((sum,row)=>sum+(+row.owned_video_unique_urls||0),0);
+  const period=payload?.first_date&&payload?.last_date?`${payload.first_date} 至 ${payload.last_date}`:"全部观测期";
+  setText("ownedVideoCategoryHint",`${period} · ${rows.length}个品类 · 共${ownedLinks}个品类内自有品牌视频链接 · 按唯一URL统计`);
+  body.innerHTML=rows.map(row=>{
+    const brands=(row.owned_brands||[]).join("、")||"—";
+    return`<tr data-filter-text="${esc(`${row.question||""} ${brands}`)}">
+      <td><b>${esc(row.question||"未知品类")}</b></td>
+      <td>${esc(brands)}</td>
+      <td>${esc(row.all_unique_urls||0)}个</td>
+      <td>${esc(row.video_unique_urls||0)}个</td>
+      <td><b>${esc(row.owned_video_unique_urls||0)}个</b><span class="daily-abs">${esc(row.owned_video_refs||0)}次引用</span></td>
+      <td><span class="daily-pct">${esc(formatRate(row.owned_video_link_share,2))}</span><span class="daily-abs">${esc(row.owned_video_unique_urls||0)}/${esc(row.all_unique_urls||0)}</span></td>
+      <td><span class="daily-pct">${esc(formatRate(row.owned_within_video_link_share,2))}</span><span class="daily-abs">${esc(row.owned_video_unique_urls||0)}/${esc(row.video_unique_urls||0)}</span></td>
+    </tr>`;
+  }).join("")||'<tr><td colspan="7" class="empty">当前设备范围暂无产品品类信源</td></tr>';
+}
+
 function renderHero(data){
   const question=data.selected_question||"全部问题";
   const device=(data.device_options||[]).find(item=>String(item.instance)===String(data.selected_device));
@@ -6185,6 +7353,7 @@ function paintData(d,force){
     renderBars("typeBars",d.by_type||[],d.total_refs||0);
     renderBars("mediaBars",d.by_media||[],d.total_refs||0);
     renderBars("domainBars",d.by_domain||[],d.total_refs||0);
+    renderOwnedVideoCategoryShare(d.owned_video_source_share_by_category||null);
     renderQuestionSources(d.per_question_sources||[]);
     renderProducts(d);
     renderDaily(d.daily_question_sources||[]);
@@ -6355,12 +7524,119 @@ document.addEventListener("visibilitychange",()=>{if(document.hidden){if(_pollTi
 """
 
 
+class HighConcurrencyHTTPServer(ThreadingHTTPServer):
+    request_queue_size = max(
+        128, min(4096, int(os.environ.get("MONITOR_HTTP_BACKLOG", "1024") or 1024))
+    )
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        cpu_count = os.cpu_count() or 4
+        self.max_workers = max(
+            16,
+            min(512, int(os.environ.get("MONITOR_HTTP_WORKERS", str(min(256, cpu_count * 16))) or 64)),
+        )
+        self.max_pending = max(
+            self.max_workers,
+            min(8192, int(os.environ.get("MONITOR_HTTP_MAX_PENDING", "2048") or 2048)),
+        )
+        self._request_slots = threading.BoundedSemaphore(self.max_pending)
+        self._request_state_lock = threading.Lock()
+        self._active_requests = 0
+        self._accepted_requests = 0
+        self._rejected_requests = 0
+        self._request_executor = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="dashboard-http",
+        )
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            with self._request_state_lock:
+                self._rejected_requests += 1
+            try:
+                body = b'{"ok":false,"error":"busy"}'
+                request.sendall(
+                    b"HTTP/1.0 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json; charset=utf-8\r\n"
+                    b"Retry-After: 1\r\nConnection: close\r\nContent-Length: "
+                    + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        with self._request_state_lock:
+            self._accepted_requests += 1
+        try:
+            self._request_executor.submit(self._process_request_in_pool, request, client_address)
+        except Exception:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def _process_request_in_pool(self, request, client_address):
+        with self._request_state_lock:
+            self._active_requests += 1
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._request_state_lock:
+                self._active_requests -= 1
+            self._request_slots.release()
+
+    def concurrency_stats(self):
+        with self._request_state_lock:
+            return {
+                "active_requests": self._active_requests,
+                "accepted_requests": self._accepted_requests,
+                "rejected_requests": self._rejected_requests,
+            }
+
+    def server_close(self):
+        super().server_close()
+        self._request_executor.shutdown(wait=False, cancel_futures=True)
+
+    def handle_error(self, request, client_address):
+        # Rapid filter changes intentionally abort an obsolete browser fetch.
+        # On Windows this surfaces as 10053/10054 while the completed response
+        # is being written; it is not a server or data failure.
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(
+            max(2.0, float(os.environ.get("MONITOR_HTTP_SOCKET_TIMEOUT", "15") or 15))
+        )
+
     def log_message(self, _format, *_args):
         return
 
-    def send_bytes(self, content, content_type, status=200):
+    def request_cache_key(self, prefix):
+        parsed = urlparse(self.path)
+        pairs = sorted(
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "_"
+        )
+        query = urlencode(pairs)
+        return f"{prefix}:{parsed.path}?{query}" if query else f"{prefix}:{parsed.path}"
+
+    def send_bytes(
+        self, content, content_type, status=200, *, cache_control="no-store",
+        etag="", content_encoding="", extra_headers=None,
+    ):
         use_gzip = (
+            not content_encoding
+            and
             len(content) >= 1024
             and "gzip" in (self.headers.get("Accept-Encoding") or "").casefold()
             and (
@@ -6369,22 +7645,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
         )
         if use_gzip:
-            content = gzip.compress(content, compresslevel=5)
+            content = gzip.compress(content, compresslevel=1)
+            content_encoding = "gzip"
+        if etag and status == 200 and self.headers.get("If-None-Match", "").strip() == etag:
+            status = 304
+            content = b""
+            content_encoding = ""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
         self.send_header("Content-Length", str(len(content)))
-        if use_gzip:
-            self.send_header("Content-Encoding", "gzip")
-            self.send_header("Vary", "Accept-Encoding")
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+        if etag:
+            self.send_header("ETag", etag)
         origin = self.headers.get("Origin", "")
         if origin and self.is_allowed_dashboard_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Expose-Headers", "ETag, X-Monitor-Cache")
+        self.send_header("Vary", "Accept-Encoding, Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(str(key), str(value))
         self.end_headers()
-        self.wfile.write(content)
+        if content:
+            self.wfile.write(content)
 
     def is_allowed_dashboard_origin(self, origin):
         try:
@@ -6403,6 +7689,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_bytes(
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             "application/json; charset=utf-8", status,
+        )
+
+    def send_cached_json(self, cache_key, builder, *, ttl=3.0, stale_ttl=30.0):
+        entry, cache_status = HTTP_JSON_CACHE.get_or_build(
+            cache_key, builder, ttl=ttl, stale_ttl=stale_ttl,
+        )
+        accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "").casefold()
+        content = entry.gzip_body if accepts_gzip else entry.body
+        self.send_bytes(
+            content,
+            "application/json; charset=utf-8",
+            cache_control=(
+                f"private, max-age={max(0, int(ttl))}, "
+                f"stale-while-revalidate={max(0, int(stale_ttl - ttl))}"
+            ),
+            etag=entry.etag,
+            content_encoding="gzip" if accepts_gzip else "",
+            extra_headers={"X-Monitor-Cache": cache_status},
         )
 
     def proxy_doubao_receiver(self, port=8790):
@@ -6459,7 +7763,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/captures":
             self.proxy_doubao_receiver()
             return
-        if re.fullmatch(r"/api/v1/models/(deepseek|yuanbao|wenxin|afu)/results", path):
+        if re.fullmatch(r"/api/v1/models/(deepseek|yuanbao|wenxin|afu|quark)/results", path):
             self.proxy_doubao_receiver(8791)
             return
         panel_route = re.fullmatch(r"/api/control/(deepseek|yuanbao|wenxin)/panel", path)
@@ -6519,6 +7823,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, 400)
 
     def do_GET(self):
+        if self.path.startswith("/api/health"):
+            self.send_json({
+                "ok": True,
+                "generated_at": beijing_now(),
+                "http": {
+                    "max_workers": getattr(self.server, "max_workers", 0),
+                    "max_pending": getattr(self.server, "max_pending", 0),
+                    "backlog": getattr(self.server, "request_queue_size", 0),
+                    **(
+                        self.server.concurrency_stats()
+                        if hasattr(self.server, "concurrency_stats") else {}
+                    ),
+                    "response_cache": HTTP_JSON_CACHE.stats(),
+                },
+                "database": {
+                    "enabled": monitor_database.enabled(),
+                    "pool": monitor_database.pool_stats() if monitor_database.enabled() else {},
+                },
+            })
+            return
         path = self.path.split("?", 1)[0]
         if path == "/api/v1/health" or path.startswith("/api/v1/status/"):
             self.proxy_doubao_receiver()
@@ -6558,9 +7882,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/control/status"):
             self.send_json(_control_status())
             return
+        if self.path.startswith("/api/analytics/brand-sources"):
+            try:
+                params = parse_qs(urlparse(self.path).query)
+                self.send_cached_json(
+                    self.request_cache_key("brand-sources"),
+                    lambda: _brand_source_links_payload(params),
+                    ttl=5.0,
+                    stale_ttl=60.0,
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if self.path.startswith("/api/analytics/source-intersections"):
+            try:
+                params = parse_qs(urlparse(self.path).query)
+                self.send_cached_json(
+                    self.request_cache_key("source-intersections"),
+                    lambda: _source_intersection_payload(params),
+                    ttl=5.0,
+                    stale_ttl=60.0,
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         if self.path.startswith("/api/analytics"):
             try:
-                self.send_json(_unified_analytics(parse_qs(urlparse(self.path).query)))
+                params = parse_qs(urlparse(self.path).query)
+                include_runs = (params.get("include_runs") or [""])[0] == "1"
+                view = (params.get("view") or [""])[0]
+                self.send_cached_json(
+                    self.request_cache_key("analytics"),
+                    lambda: _analytics_payload_for_client(
+                        _unified_analytics(params), include_runs, view,
+                    ),
+                    ttl=3.0,
+                    stale_ttl=30.0,
+                )
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 500)
             return
@@ -6639,7 +7997,12 @@ def start_content_worker():
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.Popen(
-            [worker_python, CONTENT_WORKER_PATH],
+            [
+                worker_python,
+                CONTENT_WORKER_PATH,
+                "--parent-pid",
+                str(os.getpid()),
+            ],
             cwd=BASE_DIR,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -6664,28 +8027,102 @@ def supervise_content_worker():
 
 
 def main():
-    # Finish the default heavy aggregation before opening the listening socket.
-    # The launcher already waits for the port, so the first page paint receives
-    # a hot snapshot instead of showing "switching" for several seconds.
+    # Load only cheap persisted state before opening the socket. Full analytics
+    # preparation touches the entire source corpus and previously kept 8765
+    # unavailable for tens of seconds after every restart.
     _load_persisted_view_cache()
-    with _VIEW_CACHE_LOCK:
-        has_initial = _view_key(ALL_QUESTIONS, ALL_DEVICES) in _VIEW_CACHE
-    if not has_initial:
-        try:
-            initial = _compute_stats(ALL_QUESTIONS, ALL_DEVICES)
-            _store_view_cache(ALL_QUESTIONS, ALL_DEVICES, initial)
-        except Exception as exc:
-            print("Doubao initial dashboard cache failed:", exc)
-    try:
-        _build_unified_analytics(("", "", ""), _analytics_data_version())
-    except Exception as exc:
-        print("Unified analytics warm-up failed:", exc)
-    server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
+    server = HighConcurrencyHTTPServer((HOST, PORT), DashboardHandler)
+    warmups_enabled = os.environ.get("MONITOR_DASHBOARD_WARMUP_DISABLED", "").strip() != "1"
     threading.Thread(
         target=supervise_content_worker,
         name="doubao-content-worker-supervisor",
         daemon=True,
     ).start()
+    # Do not preload the all-history snapshot. It materializes every answer and
+    # source row, consumes gigabytes on a mature dataset, and competes with the
+    # first interactive requests. Date/model scoped analytics load on demand;
+    # all-history views can still build the snapshot when explicitly used.
+    def warm_legacy_stats():
+        with _VIEW_CACHE_LOCK:
+            has_initial = _view_key(ALL_QUESTIONS, ALL_DEVICES) in _VIEW_CACHE
+        if has_initial:
+            return
+        try:
+            initial = _compute_stats(ALL_QUESTIONS, ALL_DEVICES)
+            _store_view_cache(ALL_QUESTIONS, ALL_DEVICES, initial)
+        except Exception as exc:
+            print("Doubao initial dashboard cache failed:", exc)
+
+    if warmups_enabled:
+        threading.Thread(
+            target=warm_legacy_stats,
+            name="doubao-legacy-stats-initial-warmup",
+            daemon=True,
+        ).start()
+
+    def keep_dashboard_views_warm():
+        """Prebuild the five interactive views once per Beijing day."""
+        warmed_day = ""
+        # Let an immediately opened browser complete its first interactive
+        # request before CPU-heavy background aggregation begins.
+        time.sleep(30)
+        while True:
+            current_day = datetime.now(CST).date().isoformat()
+            if current_day != warmed_day:
+                for view in ("overview", "brands", "compare", "sources", "runs"):
+                    try:
+                        _unified_analytics({"date": [current_day], "view": [view]})
+                    except Exception as exc:
+                        print("Dashboard warmup failed:", view, exc)
+                    time.sleep(2)
+                # The two most common "全部日期" landing pages are expensive
+                # only on their first build. Prepare them once in the
+                # background so the first real user never pays that cost.
+                for view in ("overview", "brands", "sources"):
+                    try:
+                        _unified_analytics({"view": [view]})
+                    except Exception as exc:
+                        print("Dashboard all-date warmup failed:", view, exc)
+                    time.sleep(2)
+                try:
+                    _source_intersection_payload({})
+                except Exception as exc:
+                    print("Dashboard source-intersection warmup failed:", exc)
+                warmed_day = current_day
+            time.sleep(60)
+
+    if warmups_enabled:
+        threading.Thread(
+            target=keep_dashboard_views_warm,
+            name="dashboard-current-day-warmup",
+            daemon=True,
+        ).start()
+
+    def keep_source_filter_caches_warm():
+        """Warm every question's all-date source page without delaying startup."""
+        time.sleep(90)
+        while True:
+            try:
+                questions = monitor_database.analytics_filter_options().get("questions") or []
+            except Exception as exc:
+                print("Source filter warmup options failed:", exc)
+                time.sleep(300)
+                continue
+            for question in questions:
+                try:
+                    _unified_analytics({"question": [question], "view": ["sources"]})
+                    _source_intersection_payload({"question": [question]})
+                except Exception as exc:
+                    print("Source filter warmup failed:", question, exc)
+                time.sleep(1)
+            time.sleep(1800)
+
+    if warmups_enabled:
+        threading.Thread(
+            target=keep_source_filter_caches_warm,
+            name="dashboard-source-filter-warmup",
+            daemon=True,
+        ).start()
     print("Doubao dashboard:", "http://%s:%s" % (HOST, PORT))
     server.serve_forever()
 

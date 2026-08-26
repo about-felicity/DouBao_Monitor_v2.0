@@ -15,6 +15,11 @@ test("统一面板由后端模型目录驱动并提供完整分析工作视图",
   assert.match(source, /回答审计/);
   assert.match(source, /采集控制/);
   assert.doesNotMatch(source, /modelRegistry/);
+  assert.match(source, /item\.id !== "deepseek"/);
+  assert.match(source, /\(!model \|\| item\.id === model\)/);
+  assert.doesNotMatch(source, /item\.ingest_only \|\| item\.id === model \|\| item\.runs > 0/);
+  assert.match(source, /const participatingModelCount = selectedModels\.filter/);
+  assert.match(source, /有数据模型 \/ 设备/);
 });
 
 test("采集控制包含问题计划、账号校验及启停能力", async () => {
@@ -35,19 +40,81 @@ test("采集控制包含问题计划、账号校验及启停能力", async () =>
   assert.match(source, /api\/control\/\$\{modelId\}\/panel/);
 });
 
-test("信源分析区区分文章视频并显示每日 Top 10 与关键词", async () => {
+test("信源分析区显示每日 Top 25、关键词和三模型自有链接交集", async () => {
   const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
-  assert.match(source, /高频文章 Top 10/);
-  assert.match(source, /高频视频 Top 10/);
+  assert.match(source, /高频文章 Top 25/);
+  assert.match(source, /高频视频 Top 25/);
   assert.match(source, /文章文案关键词/);
   assert.match(source, /视频文案关键词/);
   assert.match(source, /自有品牌/);
   assert.match(source, /文章标题关键词每日变化/);
   assert.match(source, /正文产品提及率与每日名次/);
+  assert.match(source, /不等待产品 AI 解析/);
+  assert.match(source, /待解析不计为未提及/);
+  assert.match(source, /个已分析唯一信源提及/);
+  assert.match(source, /个待正文分析/);
+  assert.match(source, /豆包、元宝、文心共同提取的自有信源链接/);
+  assert.match(source, /未同时被三个模型提取的链接不会显示/);
+  assert.match(source, /恰好被两个模型共同提取的自有信源链接/);
+  assert.match(source, /已进入三模型交集的链接不重复展示/);
+  assert.match(source, /选择对象/);
+  assert.match(source, /竞品（文章正文命中）/);
+  assert.match(source, /高\/中质量文章正文/);
+  assert.match(source, /严格服从当前问题和日期口径/);
+  assert.match(source, /common_competitor_sources/);
+  assert.match(source, /two_model_competitor_sources/);
+  assert.match(source, /全部非自有竞品/);
+  assert.match(source, /allCompetitors/);
+  assert.match(source, /api\/analytics\/source-intersections/);
+  assert.match(source, /模型交集均按当前全部日期完整统计/);
+  assert.match(source, /sourceIntersectionsMatch/);
+});
+
+test("总览提供每日自有产品跨模型上榜看板并区分缺数与负样本", async () => {
+  const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
+  assert.match(source, /我的产品每日上榜情况/);
+  assert.match(source, /任意1轮回答正文确认推荐，即记为上榜/);
+  assert.match(source, /已上榜/);
+  assert.match(source, /未上榜/);
+  assert.match(source, /待复核/);
+  assert.match(source, /未采集/);
+  assert.match(source, /owned_product_daily/);
+  assert.match(source, /models\.map\(\(item\) => <th key=\{item\.id\}>\{item\.name\}<\/th>\)/);
+  assert.match(source, /const display = stateText\(row\.models\[item\.id\]\)/);
 });
 
 test("页面元数据使用通用多模型产品名称", async () => {
   const layout = await readFile(new URL("layout.tsx", app), "utf8");
   assert.match(layout, /模型情报台/);
   assert.doesNotMatch(layout, /Starter Project|codex-preview|豆包 × 元宝/);
+});
+
+test("日期筛选首屏按北京时间一次性初始化", async () => {
+  const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
+  assert.match(source, /const \[date, setDate\] = useState\(\(\) => new Intl\.DateTimeFormat/);
+  assert.doesNotMatch(source, /localStorage\.getItem\("monitorSelectedDate"\)/);
+  assert.match(source, /localStorage\.setItem\("monitorSelectedDate", date\)/);
+  assert.match(source, /timeZone: "Asia\/Shanghai"/);
+  assert.match(source, /const filtersReady = true/);
+  assert.match(source, /if \(!filtersReady\) return/);
+  assert.doesNotMatch(source, /setFiltersReady/);
+});
+
+test("分析刷新不做日期预取并使用低开销条件轮询", async () => {
+  const source = await readFile(new URL("Dashboard.tsx", app), "utf8");
+  assert.doesNotMatch(source, /analyticsPrefetches|datesToWarm/);
+  assert.doesNotMatch(source, /targetView of \["brands", "compare", "sources"\]/);
+  assert.match(source, /silent && analyticsRequest\.current/);
+  assert.match(source, /setInterval\(refreshLiveData, 15000\)/);
+  assert.match(source, /analyticsResponseEtag/);
+  assert.match(source, /cache: "no-cache"/);
+  assert.match(source, /A filter label must never be paired with the previous filter's rows/);
+  assert.doesNotMatch(source, /analyticsPayload\.questions\.includes\(question\).*setQuestion/);
+  assert.doesNotMatch(source, /analyticsPayload\.dates\.includes\(date\).*setDate/);
+  assert.match(source, /selectors must remain controlled by the user's last action/);
+  assert.match(source, /filters\?\.view \|\| ""/);
+  assert.match(source, /全部日期汇总已加载/);
+  assert.match(source, /全部日期完整统计/);
+  assert.match(source, /if \(view === "control"\)/);
+  assert.match(source, /view !== "control" && \(/);
 });

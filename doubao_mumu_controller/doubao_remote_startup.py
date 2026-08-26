@@ -71,6 +71,7 @@ def environment_check() -> dict[str, object]:
     from doubao_mumu_web_pipeline import (
         resolve_adb,
         resolve_chrome,
+        resolve_memuc,
         resolve_mumu_manager,
     )
     from doubao_mumu_loop import (
@@ -82,6 +83,7 @@ def environment_check() -> dict[str, object]:
     )
 
     mumu_manager = resolve_mumu_manager()
+    memuc = resolve_memuc()
     chrome = resolve_chrome()
     try:
         adb = resolve_adb()
@@ -95,12 +97,12 @@ def environment_check() -> dict[str, object]:
         (path for path in APPIUM_MAIN_CANDIDATES if path.is_file()),
         None,
     )
-    if mumu_manager is None:
-        raise RuntimeError("找不到逍遥模拟器管理程序 memuc.exe，请确认逍遥已完整安装。")
+    if mumu_manager is None and memuc is None:
+        raise RuntimeError("找不到逍遥 memuc.exe 或 MuMuManager.exe，请先安装模拟器。")
     if chrome is None:
         raise RuntimeError("找不到 Google Chrome。")
     if adb is None:
-        raise RuntimeError("找不到 ADB；请确认安卓模拟器安装完整。")
+        raise RuntimeError("找不到 ADB；请确认逍遥或 MuMu 安装完整。")
     if appium_node is None or appium_main is None:
         global_appium = resolve_global_appium()
         if global_appium is None:
@@ -114,6 +116,7 @@ def environment_check() -> dict[str, object]:
     return {
         "python": sys.version.split()[0],
         "mumu_manager": str(mumu_manager),
+        "memuc": str(memuc or ""),
         "chrome": str(chrome),
         "adb": str(adb),
         "portable_appium": bool(appium_node and appium_main),

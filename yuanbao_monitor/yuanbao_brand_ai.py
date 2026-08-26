@@ -121,7 +121,8 @@ def _call_deepseek(items: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[st
         "temperature": 0,
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
-        "max_tokens": 2600,
+        # 这里仅做候选商品实体抽取，不需要长回答；可在 env 中按需调高。
+        "max_tokens": max(400, int(os.getenv("YUANBAO_AI_MAX_OUTPUT_TOKENS", "1600") or 1600)),
         "stream": False,
     }
     request = urllib.request.Request(

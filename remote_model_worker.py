@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 from monitor_core.plugins import ROOT, discover_plugins
+from monitor_core.collector_guard import collector_guard_port
 from monitor_core.lan_result_sync import start as start_result_sync
 
 
@@ -59,7 +60,10 @@ def preflight(model: str) -> dict[str, Any]:
     questions = plugin.load_questions()
     if not questions:
         raise ValueError(f"question list is empty for {model}")
-    for module in ("requests", "selenium", "uiautomator2", "websocket"):
+    modules = ["requests", "selenium", "websocket"]
+    if model in {"deepseek", "yuanbao"}:
+        modules.append("uiautomator2")
+    for module in modules:
         __import__(module)
     return {"ok": True, "model": model, "questions": len(questions), "sync_config": str(config)}
 
@@ -69,7 +73,13 @@ def main() -> int:
     parser.add_argument("--model", choices=REMOTE_MODELS, required=True)
     parser.add_argument("--pairing", type=Path, help="Copy of runtime/lan_result_pairing.json from the main machine")
     parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--tasks", type=int, default=1, help="Independent Wenxin tasks (1-4)")
     parser.add_argument("--question-mode", choices=("interleaved", "sequential"), default="interleaved")
+    parser.add_argument(
+        "--restart-completed",
+        action="store_true",
+        help="Start a new uniquely numbered batch when the saved plan is already complete",
+    )
     parser.add_argument("--configure-only", action="store_true")
     parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
@@ -83,7 +93,7 @@ def main() -> int:
         return 0
     guard = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        guard.bind(("127.0.0.1", 18800))
+        guard.bind(("127.0.0.1", collector_guard_port(args.model)))
     except OSError as exc:
         guard.close()
         raise SystemExit("This computer already has a remote model collector running.") from exc
@@ -96,7 +106,12 @@ def main() -> int:
         plugin = discover_plugins().get(args.model)
         if plugin is None:
             raise SystemExit(f"unknown model: {args.model}")
-        options: dict[str, Any] = {"rounds": max(1, args.rounds), "question_mode": args.question_mode}
+        options: dict[str, Any] = {
+            "rounds": max(1, args.rounds),
+            "tasks": max(1, min(args.tasks, 4)),
+            "question_mode": args.question_mode,
+            "restart_completed": args.restart_completed,
+        }
         plugin.prepare(options, print)
         command, cwd = plugin.command(options)
         return subprocess.run(command, cwd=cwd, check=False).returncode

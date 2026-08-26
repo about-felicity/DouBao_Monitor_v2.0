@@ -193,9 +193,8 @@ class DoubaoMuMuControlPanel:
         self.root.after(200, self.drain_events)
         self.root.after(1000, self.refresh_process_status)
         self.root.after(1000, self.poll_job_log)
-        # Open one isolated web session for every running emulator first.
-        # A background validation runs after the browsers are ready; users can
-        # still click the button after changing a login.
+        # Open one isolated web session for every running emulator, then detect
+        # both login states once.  The user manually triggers subsequent checks.
         self.root.after(700, self.prepare_browser_sessions)
         self.root.after(1200, self.refresh_schedule_status)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1266,7 +1265,7 @@ class DoubaoMuMuControlPanel:
                 f"实例 {item['index']} {item['serial']}" for item in devices
             )
         )
-        self.mobile_account_var.set("等待点击“重新检测账号”")
+        self.mobile_account_var.set("正在自动检测登录状态")
         self.web_account_var.set("；".join(opened))
         cdp_ports = result.get("cdp_ports") or {}
         self.show_account_mappings(
@@ -1274,7 +1273,7 @@ class DoubaoMuMuControlPanel:
                 {
                     "index": str(item["index"]),
                     "device": item,
-                    "mobile": "等待点击“重新检测账号”",
+                    "mobile": "正在自动检测登录状态",
                     "web": (
                         f"Chrome 已打开 / CDP "
                         f"{cdp_ports.get(str(item['index']), '未就绪')}"
@@ -1284,16 +1283,19 @@ class DoubaoMuMuControlPanel:
                 for item in devices
             ]
         )
-        self.status_var.set("等待网页登录和手动检测")
+        self.status_var.set("正在检测两端登录状态")
         self.set_readiness(
             False,
             (
-                f"已为 {len(devices)} 个逍遥实例打开 {len(devices)} 个独立 Chrome。"
-                "请分别登录对应账号，完成后点击“重新检测账号”。"
+                f"已为 {len(devices)} 个逍遥实例打开 {len(devices)} 个独立 Chrome，"
+                "正在检测登录状态……"
             ),
             state_key="waiting_manual_account_check",
         )
-        self.root.after(250, lambda: self.begin_probe(manual=False))
+        # Exactly one automatic check follows browser startup.  If either side
+        # is logged out the result tells the user to log in and click recheck;
+        # no background polling can accidentally start a task.
+        self.root.after(300, lambda: self.begin_probe(manual=False))
 
     def drain_events(self) -> None:
         try:
@@ -1784,10 +1786,10 @@ class DoubaoMuMuControlPanel:
                 "manual": manual,
                 "state": "mumu_not_ready",
                 "device": "未检测到已启动的逍遥模拟器",
-                "mobile": "逍遥端未就绪",
-                "web": "等待逍遥端",
+                "mobile": "模拟器端未就绪",
+                "web": "等待模拟器端",
                 "message": (
-                    "逍遥端未就绪：请启动逍遥模拟器，打开豆包 App。"
+                    "模拟器端未就绪：请启动逍遥模拟器，打开豆包 App。"
                 ),
                 "error": str(exc),
             }
@@ -1939,7 +1941,7 @@ class DoubaoMuMuControlPanel:
                     web_text = f"未登录 / CDP {port}"
                     message = (
                         f"实例 {index} 的网页端未登录：请在对应调试 Chrome "
-                        f"登录逍遥豆包 UID {pipeline.mask_uid(account['uid'])}。"
+                        f"登录模拟器 UID {pipeline.mask_uid(account['uid'])}。"
                     )
                 elif (
                     str(identity.get("uid") or "") == account["uid"]
@@ -1957,7 +1959,7 @@ class DoubaoMuMuControlPanel:
                         f" / CDP {port}"
                     )
                     message = (
-                        f"实例 {index} 网页账号不一致：请切换为逍遥豆包 UID "
+                        f"实例 {index} 网页账号不一致：请切换为模拟器 UID "
                         f"{pipeline.mask_uid(account['uid'])}。"
                     )
                 instance_results.append(
@@ -2099,6 +2101,13 @@ class DoubaoMuMuControlPanel:
                     "检测详情："
                     + str(result.get("error") or "未知错误")
                 )
+        if not result.get("manual") and not result.get("ready"):
+            messagebox.showwarning(
+                "请先完成登录",
+                str(result.get("message") or "模拟器端或网页端尚未登录。")
+                + "\n\n请在对应逍遥模拟器的豆包 App 和对应调试 Chrome 中完成登录，"
+                "然后由你点击“重新检测账号”。",
+            )
         if (
             bool(result.get("ready"))
             and self.auto_start_on_ready
@@ -2116,7 +2125,7 @@ class DoubaoMuMuControlPanel:
             messagebox.showwarning(
                 "尚未准备完成",
                 self.readiness_var.get()
-                + "\n\n逍遥端和网页端都登录且数字 UID 完全一致后，"
+                + "\n\n模拟器端和网页端都登录且数字 UID 完全一致后，"
                 "按钮才会变为绿色。",
             )
             return

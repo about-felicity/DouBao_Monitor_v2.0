@@ -60,4 +60,3 @@ def validate_prompt_list(values: list[str]) -> list[str]:
     if unknown:
         raise ValueError("只允许配置既定的 13 个推荐问题：" + "、".join(unknown))
     return list(dict.fromkeys(prompts))
-

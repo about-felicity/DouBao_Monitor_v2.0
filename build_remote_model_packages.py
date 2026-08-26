@@ -65,8 +65,9 @@ def load_pairing(path: Path) -> dict:
     return value
 
 
-def clean_generated_packages(output_root: Path) -> None:
-    pattern = re.compile(r"(?:deepseek|yuanbao|wenxin|afu)_remote_\d{8}_\d{6}(?:\.zip)?")
+def clean_generated_packages(output_root: Path, models: tuple[str, ...] | None = None) -> None:
+    names = models or ("deepseek", "yuanbao", "wenxin", "afu")
+    pattern = re.compile(rf"(?:{'|'.join(re.escape(name) for name in names)})_remote_\d{{8}}_\d{{6}}(?:\.zip)?")
     if not output_root.exists():
         return
     for path in output_root.iterdir():
@@ -94,6 +95,11 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
         encoding="utf-8",
     )
     launcher = package_root / f"一键启动{model_name}远端采集.bat"
+    dependency_probe = (
+        "import requests,selenium,websocket"
+        if model == "wenxin"
+        else "import requests,selenium,uiautomator2,websocket"
+    )
     launcher_content = (
         "@echo off\r\n"
         "setlocal\r\n"
@@ -101,7 +107,7 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
         "set \"PYTHONUTF8=1\"\r\n"
         "set \"PY_CMD=python\"\r\n"
         "where py >nul 2>nul && set \"PY_CMD=py -3\"\r\n"
-        "%PY_CMD% -c \"import requests,selenium,uiautomator2,websocket\" >nul 2>nul\r\n"
+        f"%PY_CMD% -c \"{dependency_probe}\" >nul 2>nul\r\n"
         "if errorlevel 1 %PY_CMD% -m pip install -r remote_worker_requirements.txt --disable-pip-version-check\r\n"
         "if errorlevel 1 (echo Dependency installation failed & pause & exit /b 1)\r\n"
         f"%PY_CMD% remote_model_worker.py --model {model} --preflight\r\n"
@@ -111,13 +117,22 @@ def build_package(model: str, pairing: dict, output_root: Path, stamp: str) -> t
     )
     launcher.write_bytes(launcher_content.encode("ascii"))
     (package_root / f"start_{model}_remote.cmd").write_bytes(launcher_content.encode("ascii"))
+    if model == "wenxin":
+        environment_instructions = (
+            f"远端电脑只需安装 Chrome 和 Python，无需安装或启动模拟器，双击：{launcher.name}\n"
+            "采集器会直接搜索百度问题，抓取搜索结果中的 AI 回答正文及引用信源。\n"
+        )
+    else:
+        environment_instructions = (
+            f"远端电脑安装 Chrome、MuMu 和 Python 后，双击：{launcher.name}\n"
+            "首次打开会自动启动登录检测：分别登录模拟器 App 与专用 Chrome 后，点击“打开并重新检测”。\n"
+            "登录检测通过前无法启动采集；启动时还会再次校验，防止账号退出或不一致。\n"
+        )
     (package_root / "使用说明.txt").write_text(
         f"本部署包只运行 {model_name}。\n"
         f"主机回传地址已写入：{pairing['receiver_url']}\n"
         "主机 IP 变化时会通过局域网 UDP 8792 自动发现新地址，并继续补传离线队列。\n"
-        f"远端电脑安装 Chrome、MuMu 和 Python 后，双击：{launcher.name}\n"
-        "首次打开会自动启动登录检测：分别登录模拟器 App 与专用 Chrome 后，点击“打开并重新检测”。\n"
-        "登录检测通过前无法启动采集；启动时还会再次校验，防止账号退出或不一致。\n",
+        + environment_instructions,
         encoding="utf-8-sig",
     )
     archive = output_root / f"{package_root.name}.zip"
@@ -135,10 +150,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "remote_model_deploy_three_models")
     args = parser.parse_args()
     pairing = load_pairing(args.pairing)
-    clean_generated_packages(args.output)
+    selected = MODELS if args.model == "all" else (args.model,)
+    clean_generated_packages(args.output, selected)
     args.output.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    selected = MODELS if args.model == "all" else (args.model,)
     for model in selected:
         folder, archive = build_package(model, pairing, args.output, stamp)
         print(f"{model}: {folder}")

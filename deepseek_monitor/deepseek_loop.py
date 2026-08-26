@@ -1,4 +1,4 @@
-"""DeepSeek 网页监控循环，默认每次实际提问随机间隔 1–10 分钟。"""
+"""DeepSeek monitoring loop with a persisted 92–118 second send cadence."""
 
 from __future__ import annotations
 
@@ -24,6 +24,15 @@ from monitor_core.lan_result_sync import enqueue as enqueue_remote_result
 
 BASE_DIR = Path(__file__).resolve().parent
 STOP = False
+MIN_SEND_INTERVAL_SECONDS = 92.0
+MAX_SEND_INTERVAL_SECONDS = 118.0
+
+
+def safe_interval_bounds(minimum: float, maximum: float) -> tuple[float, float]:
+    """Clamp requested timing inside the account-safe 90–120 second window."""
+    lower = min(MAX_SEND_INTERVAL_SECONDS, max(MIN_SEND_INTERVAL_SECONDS, float(minimum)))
+    upper = min(MAX_SEND_INTERVAL_SECONDS, max(lower, float(maximum)))
+    return lower, upper
 
 
 def now() -> str:
@@ -89,8 +98,8 @@ def main() -> int:
     parser.add_argument("--rounds-per-question", type=int, help="每个问题执行的轮数")
     parser.add_argument("--question-mode", choices=("interleaved", "sequential"), default="interleaved")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--min-interval", type=float, default=120, help="实际发送之间的最短秒数，最低 120")
-    parser.add_argument("--max-interval", type=float, default=300, help="实际发送之间的最长秒数")
+    parser.add_argument("--min-interval", type=float, default=MIN_SEND_INTERVAL_SECONDS, help="计划发送间隔下限；强制限制在 92–118 秒")
+    parser.add_argument("--max-interval", type=float, default=MAX_SEND_INTERVAL_SECONDS, help="计划发送间隔上限；强制限制在 92–118 秒")
     parser.add_argument("--retry-wait", type=float, default=60)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--stable-seconds", type=int, default=8)
@@ -105,8 +114,7 @@ def main() -> int:
         raise SystemExit("--rounds-per-question 必须大于 0")
     if args.rounds < 1:
         raise SystemExit("--rounds 必须大于 0")
-    args.min_interval = max(120.0, args.min_interval)
-    args.max_interval = max(args.min_interval, args.max_interval)
+    args.min_interval, args.max_interval = safe_interval_bounds(args.min_interval, args.max_interval)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler(args.log, encoding="utf-8")])
     logger = logging.getLogger("deepseek_loop")
@@ -155,10 +163,16 @@ def main() -> int:
                 baseline = web.latest_chat(timeout=min(30, args.timeout))
                 previous_chat_url = latest_chat_url(baseline)
                 # App 发送和等待回答必须是一个原子区间，其他模型只能排队。
+                delay = random.uniform(args.min_interval, args.max_interval)
+                # Reserve the safety window before clicking Send. If the UI
+                # click succeeds but the automation connection drops before it
+                # returns, the retry still cannot submit another question early.
+                attempted_at = time.time()
+                state.update({"last_send_attempt_at": attempted_at, "next_send_at": attempted_at + delay, "next_index": index})
+                save_state(state_path, state)
                 app.send(question)
                 sent = True
                 sent_at = time.time()
-                delay = random.uniform(args.min_interval, args.max_interval)
                 state.update({"last_sent_at": sent_at, "next_send_at": sent_at + delay, "next_index": index})
                 save_state(state_path, state)
                 logger.info("第 %d 轮已发送；下次随机间隔 %.1f 分钟", index + 1, delay / 60)

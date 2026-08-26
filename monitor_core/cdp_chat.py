@@ -52,10 +52,11 @@ class CDPPage:
     def __init__(self, port: int):
         self.port = port
         self.ws: websocket.WebSocket | None = None
+        self.target_id = ""
         self.sequence = 0
         self.connect()
 
-    def connect(self) -> None:
+    def connect(self, target_id: str = "") -> None:
         if self.ws is not None:
             try:
                 self.ws.close()
@@ -65,14 +66,60 @@ class CDPPage:
         tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=10))
         pages = [item for item in tabs if item.get("type") == "page"]
         page = next(
+            (item for item in pages if target_id and str(item.get("id") or "") == target_id),
+            None,
+        ) or next(
             (item for item in pages if str(item.get("url") or "").startswith(("http://", "https://"))),
             pages[0] if pages else None,
         )
         if not page:
             raise RuntimeError("Chrome 中没有可采集页面")
+        self.target_id = str(page.get("id") or "")
         self.ws = websocket.create_connection(
             page["webSocketDebuggerUrl"], timeout=3, origin="http://127.0.0.1"
         )
+
+    def replace_tab(self, url: str, timeout: float = 20) -> dict[str, str]:
+        """Create one replacement tab, bind to it, then close the exact old tab."""
+        old_target = str(getattr(self, "target_id", "") or "")
+        created = self.call("Target.createTarget", {"url": str(url or "about:blank")}, timeout=timeout)
+        new_target = str(created.get("targetId") or "")
+        if not new_target:
+            raise RuntimeError("Chrome 未返回新标签页标识")
+        deadline = time.monotonic() + max(3, timeout)
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                self.connect(new_target)
+                if self.target_id == new_target:
+                    break
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.2)
+        else:
+            raise RuntimeError(f"无法连接新建的 Chrome 标签页：{last_error}") from last_error
+
+        closed = not old_target or old_target == new_target
+        if not closed:
+            close_url = f"http://127.0.0.1:{self.port}/json/close/{old_target}"
+            for _ in range(3):
+                try:
+                    with urllib.request.urlopen(close_url, timeout=5) as response:
+                        response.read()
+                    closed = True
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            if not closed:
+                try:
+                    closed = bool(
+                        self.call("Target.closeTarget", {"targetId": old_target}, timeout=5).get("success")
+                    )
+                except Exception:
+                    closed = False
+        if not closed:
+            raise RuntimeError(f"新标签页已打开，但旧标签页 {old_target} 关闭失败")
+        return {"old_target": old_target, "new_target": new_target, "url": str(url or "about:blank")}
 
     def send(self, method: str, params: dict[str, Any] | None = None) -> int:
         if self.ws is None:

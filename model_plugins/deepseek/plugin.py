@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import json
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,10 +17,26 @@ class Plugin(ModelPlugin):
     runner = ROOT / "deepseek_monitor" / "deepseek_loop.py"
     results = ROOT / "deepseek_monitor" / "deepseek_results.jsonl"
     collector_results = ROOT / "runtime" / "remote_workers" / "deepseek_collector_results.jsonl"
+    collector_state = ROOT / "runtime" / "remote_workers" / "deepseek_state.json"
     dashboard = ROOT / "deepseek_monitor" / "dashboard.json"
     builder = ROOT / "deepseek_monitor" / "build_dashboard_data.py"
     execution = "remote"
     supports_control = False
+
+    def has_device_binding(self) -> bool:
+        return (ROOT / "runtime" / "deepseek_device.json").is_file()
+
+    def device_serial(self) -> str:
+        """Use a host-local binding when several MuMu instances are present."""
+        config = ROOT / "runtime" / "deepseek_device.json"
+        try:
+            value = json.loads(config.read_text(encoding="utf-8-sig"))
+            serial = str(value.get("serial") or "").strip()
+            if serial:
+                return serial
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        return "127.0.0.1:16384"
 
     def ready(self) -> bool:
         return self.questions.exists() and self.runner.exists()
@@ -27,7 +44,8 @@ class Plugin(ModelPlugin):
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
         mode = normalize_question_mode(options.get("question_mode"))
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "120", "--max-interval", "300", "--results", str(self.collector_results)], self.runner.parent
+        serial = str(getattr(self, "_resolved_serial", "") or self.device_serial())
+        return [sys.executable, str(self.runner), "--questions-file", str(self.questions), "--rounds-per-question", str(rounds), "--question-mode", mode, "--resume", "--min-interval", "92", "--max-interval", "118", "--serial", serial, "--state", str(self.collector_state), "--results", str(self.collector_results)], self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
         from deepseek_monitor.controller import ensure_deepseek_chrome
@@ -49,13 +67,31 @@ class Plugin(ModelPlugin):
         self.questions.write_text("\n".join(questions) + "\n", encoding="utf-8")
 
     def account_check(self) -> dict[str, Any]:
-        from deepseek_monitor.controller import DeepSeekAppController, DeepSeekWebCollector, ensure_deepseek_chrome
+        from deepseek_monitor.controller import DeepSeekAppController, DeepSeekWebCollector, discover_deepseek_device, ensure_deepseek_device, ensure_deepseek_chrome
         from monitor_core.device_lock import device_session
         ensure_deepseek_chrome(9333)
-        app = DeepSeekAppController("127.0.0.1:16384")
         web = DeepSeekWebCollector(9333)
-        with device_session("127.0.0.1:16384", "DeepSeek 账号校验", timeout=300):
-            mobile = app.account_identity()
+        last_error: Exception | None = None
+        mobile: dict[str, Any] = {}
+        for attempt in range(1, 4):
+            try:
+                preferred = self.device_serial()
+                self._resolved_serial = (
+                    ensure_deepseek_device(preferred, timeout=60)
+                    if self.has_device_binding()
+                    else discover_deepseek_device(preferred)
+                )
+                ensure_deepseek_device(self._resolved_serial, timeout=45)
+                app = DeepSeekAppController(self._resolved_serial, connect_timeout=25)
+                with device_session(self._resolved_serial, "DeepSeek 账号校验", timeout=300):
+                    mobile = app.account_identity()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(4 * attempt)
+        else:
+            raise RuntimeError(f"DeepSeek MuMu 连续 3 次连接失败：{last_error}") from last_error
         browser = web.account_identity()
         matched = bool(mobile.get("name") and browser.get("name") and mobile["name"].casefold() == browser["name"].casefold())
         return {"ok": matched, "status": "matched" if matched else "mismatch", "message": "模拟器与网页账号一致" if matched else "模拟器与网页账号不一致",

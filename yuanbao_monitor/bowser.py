@@ -115,7 +115,7 @@ def yuanbao_web_identity(debug_port: int = 9222) -> dict[str, str]:
     except Exception as exc:
         raise RuntimeError(f"无法读取元宝网页账号：{exc}") from exc
     name = str(value.get("name") or "").strip()
-    if not name:
+    if not name or name in {"未登录", "登录", "立即登录"}:
         raise RuntimeError("元宝网页尚未登录或没有显示账号昵称")
     return {"name": name, "masked": name[:2] + "***"}
 

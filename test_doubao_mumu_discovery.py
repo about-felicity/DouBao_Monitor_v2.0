@@ -57,6 +57,27 @@ class MuMuAdbDiscoveryTests(unittest.TestCase):
             {},
         )
 
+    def test_parses_running_memu_instances(self) -> None:
+        output = """0,逍遥模拟器,787404,1,6428
+1,逍遥模拟器 - 1,1966982,1,18516
+2,逍遥模拟器 - 2,0,0,0
+"""
+        devices = pipeline.parse_memu_listvms(output, None)
+        self.assertEqual(
+            [(item["index"], item["name"], item["emulator"]) for item in devices],
+            [
+                ("0", "逍遥模拟器", "memu"),
+                ("1", "逍遥模拟器 - 1", "memu"),
+            ],
+        )
+
+    def test_filters_requested_memu_instance(self) -> None:
+        output = """0,MEmu,100,1,200
+1,MEmu_1,101,1,201
+"""
+        devices = pipeline.parse_memu_listvms(output, "1")
+        self.assertEqual([item["index"] for item in devices], ["1"])
+
     def test_maps_standard_mumu_ports_to_instance_indexes(self) -> None:
         output = """List of devices attached
 127.0.0.1:16384 device product:a model:a

@@ -28,6 +28,15 @@ def invalid_answer_reason(value: str, *, minimum_length: int = 12) -> str:
         return "模型返回系统或服务异常"
     if any(normalize_text(marker) in compact for marker in REFUSAL_MARKERS):
         return "模型拒绝或无法完成产品推荐"
+    # Yuanbao can leave only its recommendation chips / download footer in the
+    # captured message container while the real answer failed to hydrate.  The
+    # old minimum-length check accepted that shell as a successful answer.
+    footer_markers = ("下载元宝电脑版", "前往下载中心", "推荐问题")
+    if any(normalize_text(marker) in compact for marker in footer_markers) and (
+        len(compact) < 300
+        or not re.search(r"(?:核心|成分|功效|适合|推荐|首选).{2,}", text)
+    ):
+        return "只抓到页面推荐词或下载页尾，未抓到模型正文"
     if len(compact) < minimum_length:
         return f"模型回答过短（{len(compact)} 字）"
     return ""
@@ -40,6 +49,40 @@ def expected_topic(question: str) -> str:
     return text.strip("，。！？?：:")
 
 def topic_matches(topic: str, body: str) -> bool:
+    # 同一品类在网页回答里经常使用商品通用名，而不是逐字复述问题。
+    # 例如“眉毛增长液”通常写作“眉毛精华液/育眉液”；这应视为同主题。
+    semantic_aliases = {
+        "护发精油": ("护发油", "润发油", "发油", "护发精华油"),
+        "沐浴精油": ("沐浴油", "精油沐浴露", "油基沐浴露"),
+        "眉毛增长液": ("眉毛生长液", "眉毛精华液", "眉毛护理液", "眉毛植萃精华液", "育眉液", "养眉液", "密眉精华"),
+        "眉毛生长液": ("眉毛增长液", "眉毛精华液", "眉毛护理液", "育眉液", "养眉液", "密眉精华"),
+        "睫毛增长液": ("睫毛生长液", "睫毛精华液", "睫毛护理液", "育睫液", "养睫液"),
+        "睫毛生长液": ("睫毛增长液", "睫毛精华液", "睫毛护理液", "育睫液", "养睫液"),
+        "祛痘精华液": ("祛痘精华", "抗痘精华", "净痘精华", "痘痘精华"),
+        "祛痘精华": ("祛痘精华液", "抗痘精华", "净痘精华", "痘痘精华"),
+    }
+    if any(normalize_text(alias) in body for alias in semantic_aliases.get(topic, ())):
+        return True
+
+    # 祛痘产品常按主要酸类或具体痘型命名，例如“三酸精华”，回答中未必
+    # 逐字写出“祛痘精华液”。同时要求产品形态和祛痘证据，避免仅凭“精华”
+    # 或仅凭“痘”放行美白精华、洁面等跨品类回答。
+    semantic_evidence_groups = {
+        "祛痘精华液": (
+            ("祛痘", "抗痘", "净痘", "痘痘", "痘肌", "痤疮", "闭口", "粉刺", "红肿痘", "爆痘"),
+            ("精华", "水杨酸", "壬二酸", "果酸", "杏仁酸", "三酸"),
+        ),
+        "祛痘精华": (
+            ("祛痘", "抗痘", "净痘", "痘痘", "痘肌", "痤疮", "闭口", "粉刺", "红肿痘", "爆痘"),
+            ("精华", "水杨酸", "壬二酸", "果酸", "杏仁酸", "三酸"),
+        ),
+    }
+    evidence_groups = semantic_evidence_groups.get(topic, ())
+    if evidence_groups and all(
+        any(normalize_text(marker) in body for marker in group)
+        for group in evidence_groups
+    ):
+        return True
     variants = {topic}
     if "增长" in topic:
         variants.add(topic.replace("增长", "生长"))
@@ -67,5 +110,5 @@ def answer_quality_reason(question: str, answer: str, *, minimum_length: int = 1
 
         if not topic_matches(topic, body):
 
-            return f"回答主题与问题不一致（未出现“{expected_topic(question)}”）"
+            return f"回答主题与问题不一致（未能确认“{expected_topic(question)}”相关内容）"
     return ""

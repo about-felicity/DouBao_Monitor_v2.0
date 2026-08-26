@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from monitor_core.recommendation_questions import canonical_recommendation_question
+
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGINS_ROOT = ROOT / "model_plugins"
@@ -19,6 +21,7 @@ class ModelPlugin:
     tone = ""
     supports_control = True
     execution = "local"
+    ingest_only = False
 
     @property
     def stats_endpoint(self) -> str:
@@ -28,7 +31,8 @@ class ModelPlugin:
         return {"id": self.id, "name": self.name, "short_name": self.short_name,
                 "tone": self.tone, "stats_endpoint": self.stats_endpoint,
                 "supports_control": self.supports_control,
-                "execution": self.execution}
+                "execution": self.execution,
+                "ingest_only": self.ingest_only}
 
     def ready(self) -> bool:
         raise NotImplementedError
@@ -79,31 +83,93 @@ class ModelPlugin:
         root = ROOT / "runtime" / "lan_result_receiver" / self.id
         folders = {"queued": root / "inbox", "processed": root / "done", "error": root / "errors"}
         counts = {"queued": 0, "processed": 0, "errors": 0}
-        events: list[dict[str, Any]] = []
+        events_by_request: dict[str, dict[str, Any]] = {}
+        queued_ids = {path.stem for path in folders["queued"].glob("*.json")} if folders["queued"].exists() else set()
+        processed_ids = {path.stem for path in folders["processed"].glob("*.json")} if folders["processed"].exists() else set()
+        priority = {"queued": 1, "error": 2, "processed": 3}
         for status, folder in folders.items():
             paths = list(folder.glob("*.json")) if folder.exists() else []
+            if status == "error":
+                paths = [
+                    path for path in paths
+                    if path.stem not in processed_ids and not _is_pending_retry(path, queued_ids)
+                ]
             counts["errors" if status == "error" else status] = len(paths)
             for path in sorted(paths, key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]:
                 try:
                     value = json.loads(path.read_text(encoding="utf-8-sig"))
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
-                analysis = value.get("analysis") if isinstance(value.get("analysis"), dict) else {}
+                record = value.get("record") if isinstance(value.get("record"), dict) else {}
+                analysis = value.get("analysis") if isinstance(value.get("analysis"), dict) else _queued_analysis(record)
+                request_id = str(value.get("request_id") or path.stem)
                 event = {
-                    "request_id": str(value.get("request_id") or path.stem),
+                    "request_id": request_id,
                     "status": status,
-                    "source_device": str(value.get("source_device") or "远端设备"),
-                    "question": str(value.get("question") or ""),
+                    "source_device": str(value.get("source_device") or record.get("remote_source_device") or "远端设备"),
+                    "question": str(value.get("question") or record.get("question") or record.get("prompt") or ""),
                     "received_at": _activity_time(value.get("received_at"), path),
                     "processed_at": _activity_time(value.get("processed_at") or value.get("received_at"), path),
-                    "account_uid_masked": str(value.get("account_uid_masked") or ""),
+                    "account_uid_masked": str(value.get("account_uid_masked") or record.get("account_uid_masked") or ""),
                     "rows_written": int(value.get("rows_written") or analysis.get("source_count") or 0),
                     "message": str(value.get("last_error") or value.get("message") or ""),
                 }
                 event.update(_generic_analysis_event(status, analysis))
-                events.append(event)
+                previous = events_by_request.get(request_id)
+                if previous is None or priority[status] > priority[previous["status"]]:
+                    events_by_request[request_id] = event
+        events = list(events_by_request.values())
         events.sort(key=lambda item: item["processed_at"] or item["received_at"], reverse=True)
         return {"ok": True, "model": self.id, "queue": counts, "events": events[:limit]}
+
+
+def _is_pending_retry(path: Path, queued_ids: set[str]) -> bool:
+    if path.stem not in queued_ids:
+        return False
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return "product analysis is pending" in str(value.get("last_error") or "").casefold()
+
+
+def _queued_analysis(record: dict[str, Any]) -> dict[str, Any]:
+    sources = record.get("sources") if isinstance(record.get("sources"), list) else []
+    compact_sources = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        compact_sources.append({
+            "title": str(source.get("title") or "").strip(),
+            "href": str(source.get("href") or source.get("url") or "").strip(),
+        })
+    question = str(record.get("question") or record.get("prompt") or "").strip()
+    answer = str(record.get("web_body") or record.get("reply") or record.get("answer") or "").strip()
+    expected = max(len(compact_sources), int(record.get("expected_source_count") or 0))
+    capture_complete = bool(record.get("source_capture_complete", len(compact_sources) >= expected))
+    if str(record.get("collector_model") or record.get("model") or "").casefold() == "wenxin" and not compact_sources:
+        capture_complete = False
+    products = record.get("products") if isinstance(record.get("products"), list) else []
+    recommendation = bool(canonical_recommendation_question(question))
+    return {
+        "question_present": bool(question),
+        "answer_present": bool(answer),
+        "answer_length": len(answer),
+        "task_id": int(record.get("task_id") or 1),
+        "capture_mode": str(record.get("capture_mode") or ""),
+        "capture_label": str(record.get("capture_label") or ""),
+        "body_capture_complete": bool(record.get("body_capture_complete", bool(answer))),
+        "source_count": len(compact_sources),
+        "expected_source_count": expected,
+        "source_capture_complete": capture_complete,
+        "missing_source_links": sum(not item["href"] for item in compact_sources),
+        "missing_source_titles": sum(not item["title"] for item in compact_sources),
+        "recommendation_question": recommendation,
+        "product_count": len(products),
+        "product_review_status": str(record.get("product_review_status") or ("pending" if recommendation else "not_required")),
+        "product_parse_complete": (not recommendation) or str(record.get("product_review_status") or "") == "ai_verified",
+        "sources": compact_sources,
+    }
 
 
 def _activity_time(value: Any, path: Path) -> str:
