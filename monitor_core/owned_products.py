@@ -7,7 +7,32 @@ from typing import Any
 # Increment this whenever matching semantics or the product vocabulary changes.
 # The content worker includes it in its fingerprint and re-evaluates archived
 # article bodies without spending LLM tokens.
-OWN_PRODUCT_SCHEMA_VERSION = 4
+OWN_PRODUCT_SCHEMA_VERSION = 6
+
+# Audited source cards whose visible DOM title was cut before the owned-brand
+# suffix. The video id is stable across www/redirect URL variants.
+OWNED_SOURCE_URL_OVERRIDES: dict[str, dict[str, tuple[str, ...]]] = {
+    "7670110338930494772": {
+        "owned_brands": ("梵玢 FBCY",),
+        "own_products": ("梵玢染发剂（含黑茶色）",),
+    },
+    "7684167777762004270": {
+        "owned_brands": ("科熙本",),
+        "own_products": ("科熙本控油蓬松造型喷雾",),
+    },
+    "redsh.com/pinpai/20260905/051530.shtml": {
+        "owned_brands": ("梵玢 FBCY",),
+        "own_products": ("梵玢睫毛精华液",),
+    },
+}
+
+
+def owned_source_url_override(url: str) -> dict[str, tuple[str, ...]]:
+    text = str(url or "")
+    for token, labels in OWNED_SOURCE_URL_OVERRIDES.items():
+        if token in text:
+            return labels
+    return {"owned_brands": (), "own_products": ()}
 
 OWN_PRODUCT_RULES: tuple[dict[str, Any], ...] = (
     {"name": "梵玢焕活精华液", "brand": "梵玢", "terms": ("焕活精华", "焕活精华液")},
@@ -24,7 +49,7 @@ OWN_PRODUCT_RULES: tuple[dict[str, Any], ...] = (
     {"name": "科熙本控油蓬松造型喷雾", "brand": "科熙本", "terms": ("控油蓬松造型喷雾", "蓬松造型喷雾", "造型喷雾")},
     {"name": "梵玢洗发水", "brand": "梵玢", "terms": ("洗发水", "洗发露")},
     {"name": "道和小绿瓶", "brand": "道和", "terms": ("小绿瓶",)},
-    {"name": "姿生怡手部保湿修护霜", "brand": "姿生怡", "terms": ("手部保湿修护霜", "护手霜", "手霜")},
+    {"name": "姿生怡手部保湿霜", "brand": "姿生怡", "terms": ("手部保湿霜", "手部保湿修护霜", "护手霜", "手霜")},
     {"name": "梵玢睫毛精华液", "brand": "梵玢", "terms": ("睫毛精华液", "睫毛精华", "睫毛增长液")},
     {"name": "姿生怡眼霜", "brand": "姿生怡", "terms": ("眼霜",)},
     {"name": "焕颜计小白罐", "brand": "焕颜计", "terms": ("小白罐",)},
@@ -52,6 +77,7 @@ OWN_PRODUCT_QUESTION_GROUPS: tuple[dict[str, Any], ...] = (
     {"question_terms": ("护发精油",), "products": ("梵玢护发精油",)},
     {"question_terms": ("护发素",), "products": ("科熙本鱼子酱修护柔顺护发素",)},
     {"question_terms": ("控油蓬松洗发水",), "products": ("科熙本控油蓬松洗发水",)},
+    {"question_terms": ("二硫化硒洗发水",), "products": ("科熙本二硫化硒洗发水",)},
     {"question_terms": ("沐浴精油", "沐浴油"), "products": ("梵玢沐浴油",)},
     {"question_terms": ("眉毛增长液", "眉毛精华液"), "products": ("梵玢眉毛精华液",)},
     {"question_terms": ("祛痘精华液", "祛痘精华"), "products": ("梵玢祛痘精华",)},
@@ -62,6 +88,13 @@ OWN_PRODUCT_QUESTION_GROUPS: tuple[dict[str, Any], ...] = (
     {"question_terms": ("防脱洗发水",), "products": ("梵玢洗发水", "道和小绿瓶")},
     {"question_terms": ("防脱精华液",), "products": ("梵玢焕活精华液", "道和小红瓶")},
     {"question_terms": ("面膜",), "products": ("姿生怡鱼子酱面膜",)},
+    {"question_terms": ("眼霜",), "products": ("姿生怡眼霜",)},
+    {"question_terms": ("卸妆油",), "products": ("姿生怡卸妆油",)},
+    {"question_terms": ("爽肤水", "精粹水"), "products": ("姿生怡阿尔卑斯冰川焕肤精粹水",)},
+    {"question_terms": ("洗面奶", "洁面乳"), "products": ("姿生怡洗面奶",)},
+    {"question_terms": ("身体乳",), "products": ("姿生怡身体乳",)},
+    {"question_terms": ("护手霜", "手部保湿霜"), "products": ("姿生怡手部保湿霜",)},
+    {"question_terms": ("防晒霜", "防晒乳"), "products": ("茗媛萃防晒霜",)},
 )
 
 

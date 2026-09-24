@@ -29,14 +29,9 @@ def _counted(values) -> list[dict]:
     return [{"name": name, "count": count} for name, count in Counter(values).most_common()]
 
 
-def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
-    records = []
-    if results.exists():
-        for line in results.read_text(encoding="utf-8").splitlines():
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+def build_records_dashboard(model_id: str, records) -> dict:
+    """Build the legacy per-model payload from already normalized records."""
+    records = list(records or [])
     runs, seen, quarantine = [], set(), []
     for record in records:
         declared_model = str(record.get("collector_model") or record.get("model_id") or "").strip()
@@ -49,13 +44,13 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
         question = canonical_recommendation_question(record.get("question") or record.get("prompt"))
         if not question:
             continue
-        answer = str(record.get("reply") or record.get("web_body") or "")
+        answer = str(record.get("reply") or record.get("web_body") or record.get("answer") or "")
         quality_reason = answer_quality_reason(question, answer)
         if quality_reason:
             quarantine.append({"round": record.get("round"), "question": question, "reason": quality_reason})
             continue
         stable = "\0".join(str(record.get(key) or "") for key in ("round", "prompt", "started_at", "finished_at"))
-        run_id = hashlib.sha256(stable.encode()).hexdigest()[:20]
+        run_id = str(record.get("run_id") or hashlib.sha256(stable.encode()).hexdigest()[:20])
         if run_id in seen:
             continue
         seen.add(run_id)
@@ -73,9 +68,9 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
                             "domain": domain,
                             "media": str(raw.get("media") or "").strip() or media_name(domain),
                             "type": kind})
-        runs.append({"run_id": run_id, "sequence": len(runs) + 1, "round": int(record.get("round") or 0),
+        runs.append({"run_id": run_id, "sequence": int(record.get("sequence") or len(runs) + 1), "round": int(record.get("round") or record.get("sequence") or 0),
                      "serial": str(record.get("serial") or model_id), "question": question,
-                     "reply": answer, "web_body": str(record.get("web_body") or answer),
+                     "reply": answer, "web_body": str(record.get("web_body") or record.get("answer") or answer),
                      "started_at": str(record.get("started_at") or ""),
                      "finished_at": str(record.get("finished_at") or ""),
                      "day": _day(record.get("finished_at") or record.get("started_at") or ""),
@@ -114,6 +109,18 @@ def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
                "top_media": _counted(item["media"] for item in all_sources),
                "source_types": _counted(item["type"] for item in all_sources), "brands": [], "products": [],
                "quality_quarantine": {"count": len(quarantine), "records": quarantine}}
+    return payload
+
+
+def build_jsonl_dashboard(model_id: str, results: Path, output: Path) -> dict:
+    records = []
+    if results.exists():
+        for line in results.read_text(encoding="utf-8").splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    payload = build_records_dashboard(model_id, records)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload

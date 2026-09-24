@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -16,10 +18,12 @@ from monitor_core.owned_products import (
     OWN_PRODUCT_SCHEMA_VERSION,
     brands_for_products,
     own_product_mentions,
+    owned_source_url_override,
     owned_product_recommendations,
     owned_product_brand,
     owned_products_for_question,
 )
+from monitor_core.performance import MODEL_PERFORMANCE_START_DATES, daily_employee_performance
 
 try:
     import jieba
@@ -39,7 +43,7 @@ PARTICLES = "的了是一在于和及与或到用为把被从对跟等很更最�
 ENGLISH_STOP = {"the", "and", "for", "with", "from", "best", "top", "review", "reviews"}
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT_INDEX_PATH = ROOT / "doubao_source_content_index.json"
-BRAND_MATCH_SCHEMA_VERSION = 4
+BRAND_MATCH_SCHEMA_VERSION = 6
 
 # Short Chinese brand names can occur across an ordinary word boundary. For
 # example, 道和 in 渠道和使用 is not the brand 道和. Ambiguous names require
@@ -112,6 +116,9 @@ INVALID_BRAND_NAMES.update({
     "自然滋润", "贵妇", "闪亮",
     "本草", "毛囊清洁", "眼睫毛", "眼睫毛滋养液", "胶原蛋白面膜",
     "美容院定制款", "在研",
+    "大众", "B5", "产品", "干皮首选", "干敏皮首选", "粗硬沙发首选",
+    "日常防晒可直接洗净", "选先生驾到或施华蔻", "无眉",
+    "经典入门款", "外出大风", "尿素果酸", "白松露",
     "郝邵文", "海马体", "毛曼陀罗", "主持人严选", "泽经百货", "闻柳甄选",
     "瑾墨成百货商行", "踏恒百货",
 })
@@ -168,6 +175,19 @@ BRAND_CANONICAL_GROUPS.update({
     "澳白汀 OHBT": {"澳白汀", "OHBT", "澳白汀（OHBT", "澳白汀 OHBT"},
     "Aromatherapy Associates": {"AA", "Aromatherapy Associates", "AROMATHERAPY ASSOCIATES"},
     "康王": {"康王", "康王拜耳"},
+    "潘婷": {"潘婷", "潘婷三分钟奇迹"},
+    "小甘菊": {"小甘菊", "德国小甘菊"},
+    "奥斯曼": {"奥斯曼", "奥斯曼乌斯曼草"},
+    "焕颜计": {"焕颜计", "焕颜计小白罐"},
+    "麦致": {"麦致", "麦致植萃"},
+    "蓝梦茵": {"蓝梦茵", "蓝梦茵草本植护"},
+    "科熙本": {"科熙本"},
+    "极方": {"极方", "极方防", "极方防脱", "极方防脱控油"},
+    "可复美": {"可复美", "可复美胶原舒舒贴"},
+    "自然堂": {"自然堂", "自然堂防脱大绿瓶"},
+    "蔓迪": {"蔓迪", "蔓迪米诺地尔泡沫剂"},
+    "悦密佳": {"悦密佳", "悦密佳乌斯玛草生眉液"},
+    "迷失公园": {"迷失公园", "迷失公园控油"},
 })
 BRAND_CANONICAL_BY_KEY = {
     _compact(alias): canonical
@@ -190,12 +210,47 @@ PRODUCT_CANONICAL_BY_KEY = {
 
 def canonical_brand_name(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip(" -_/·（）()")
-    if not valid_brand(text):
+    if not text:
         return ""
-    return BRAND_CANONICAL_BY_KEY.get(_compact(text), text)
+    key = _compact(text)
+    exact = BRAND_CANONICAL_BY_KEY.get(key)
+    if exact:
+        return exact
+    # Recommendation prose sometimes leaks into the extracted brand field,
+    # e.g. ``选花王`` / ``选REVITALASH``.  It is an instruction word, not part
+    # of the brand.  Normalize it before consulting historical seed brands.
+    cleaned = re.sub(r"^(?:优先)?选(?:择)?", "", text, count=1).strip(" -_/·（）()")
+    if cleaned and cleaned != text:
+        text = cleaned
+        key = _compact(text)
+        exact = BRAND_CANONICAL_BY_KEY.get(key)
+        if exact:
+            return exact
+
+    # Citation markers copied from the answer can be glued to a Chinese brand
+    # name (``达霏欣5``).  Preserve numeric/ASCII brands such as 3CE and SK-II,
+    # and only trim terminal digits from names that already contain CJK text.
+    if re.search(r"[\u3400-\u9fff]", text):
+        cleaned = re.sub(r"(?<=[\u3400-\u9fff])\d{1,2}$", "", text).strip()
+        if cleaned:
+            text = cleaned
+            key = _compact(text)
+            exact = BRAND_CANONICAL_BY_KEY.get(key)
+            if exact:
+                return exact
+    # Some upstream product rows accidentally put a known master brand plus
+    # series adjectives in the brand field (for example “欧舒丹甜扁桃紧致”).
+    # Prefer a reviewed multi-character brand prefix; exact aliases above still
+    # win, so legitimate longer canonical brands are not shortened.
+    for alias_key, canonical in sorted(
+        BRAND_CANONICAL_BY_KEY.items(), key=lambda item: len(item[0]), reverse=True,
+    ):
+        if len(alias_key) >= 2 and key.startswith(alias_key) and len(key) - len(alias_key) <= 12:
+            return canonical
+    return text if valid_brand(text) else ""
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=1)
 def _content_index(stamp: int) -> dict[str, Any]:
     del stamp
     try:
@@ -217,7 +272,7 @@ def content_index() -> dict[str, Any]:
 
 def brand_vocabulary() -> list[dict[str, Any]]:
     try:
-        import doubao_brand_settings
+        from legacy.doubao.core import doubao_brand_settings
         return list(doubao_brand_settings.vocabulary())
     except (ImportError, OSError, ValueError):
         return []
@@ -233,7 +288,7 @@ def canonical_question(value: str) -> str:
     if recommendation:
         return recommendation
     try:
-        from doubao_question_aliases import canonical_question_name
+        from legacy.doubao.core.doubao_question_aliases import canonical_question_name
         return canonical_question_name(value) or str(value or "未知问题")
     except ImportError:
         return str(value or "未知问题")
@@ -245,6 +300,13 @@ RELATED_CONTENT_HEADERS = (
     "延伸阅读", "相关视频推荐",
 )
 
+_RELATED_CONTENT_HEADING_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:"
+    + "|".join(re.escape(item) for item in sorted(RELATED_CONTENT_HEADERS, key=len, reverse=True))
+    + r")[\s:：—-]*$",
+    re.I,
+)
+
 
 def recommendation_body(value: str) -> str:
     """Return only the assistant's recommendation prose, excluding source cards."""
@@ -254,6 +316,7 @@ def recommendation_body(value: str) -> str:
     lines = text.splitlines()
     cleaned: list[str] = []
     skipping_leading_reference_titles = True
+    found_trailing_section = False
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -261,11 +324,17 @@ def recommendation_body(value: str) -> str:
         if skipping_leading_reference_titles and re.search(r"(?:#\S+\s*)+$", stripped):
             continue
         skipping_leading_reference_titles = False
-        if any(stripped.startswith(marker) for marker in RELATED_CONTENT_HEADERS):
+        # Doubao appends video/article cards to the same DOM text as the answer.
+        # Only an actual standalone section heading ends the recommendation;
+        # prose such as “相关推荐很多” must remain part of the answer.
+        if _RELATED_CONTENT_HEADING_RE.fullmatch(stripped):
+            found_trailing_section = True
             break
         cleaned.append(line)
     result = "\n".join(cleaned).strip()
-    return result or text
+    # If the captured fragment starts at the related-content drawer, returning
+    # the original text would turn source titles into recommendation evidence.
+    return result if found_trailing_section else (result or text)
 
 
 def valid_brand(value: str) -> bool:
@@ -280,6 +349,21 @@ def valid_brand(value: str) -> bool:
     if re.search(r"[>→]|\s\|\s", text):
         return False
     if any(token in compact for token in ("拼多多", "淘宝", "天猫", "京东")):
+        return False
+    # Recommendation labels, audience descriptions and comparison prose are
+    # not brands even when a legacy parser stored them in the brand column.
+    # These phrases are especially dangerous because the historical seed
+    # matcher can otherwise repeat the mistake on every later answer.
+    if re.search(
+        r"(?:首选|优选|推荐|适合人群|适合肤质|人群选择|选购|怎么选|"
+        r"可直接|不要|不能|必须|谨慎用|注意事项|"
+        r"(?:入门|进阶|强效|温和|平价|高端|经典)(?:款|级))",
+        text,
+    ):
+        return False
+    if re.search(r"(?:^|\s)(?:产品|品牌|方案|方向)(?:$|\s)", text):
+        return False
+    if "或" in text or "/" in text:
         return False
     if re.search(r"(?:优选|百货(?:店|商行)?|旗舰店|专卖店|妆品(?:小店)?|彩妆小店|甄选|严选)$", text):
         return False
@@ -342,12 +426,45 @@ def normalize_source(raw: dict[str, Any]) -> dict[str, Any]:
     domain = urlparse(url).netloc.lower().removeprefix("www.")
     title = str(raw.get("title") or "").strip()
     kind = str(raw.get("type") or raw.get("source_type") or "").strip() or source_type(domain, title)
+    title_labels = owned_source_title_metadata(title, url)
+    owned_brands = sorted(set(raw.get("owned_brands") or []) | set(title_labels["owned_brands"]))
+    own_products = sorted(set(raw.get("own_products") or []) | set(title_labels["own_products"]))
+    own_brand = bool(raw.get("own_brand") or owned_brands or own_products)
+    match_scope = str(raw.get("brand_match_scope") or "") or ("标题" if own_brand else "")
     return {"title": title, "url": url, "canonical_url": stable, "domain": domain,
             "media": str(raw.get("media") or "").strip() or media_name(domain), "type": kind,
             "brand_mentions": list(raw.get("brand_mentions") or []),
-            "owned_brands": list(raw.get("owned_brands") or []),
-            "own_products": list(raw.get("own_products") or []),
-            "own_brand": bool(raw.get("own_brand")), "brand_match_scope": str(raw.get("brand_match_scope") or "")}
+            "owned_brands": owned_brands, "own_products": own_products,
+            "own_brand": own_brand, "brand_match_scope": match_scope}
+
+
+def owned_source_title_metadata(title: str, url: str = "") -> dict[str, Any]:
+    """Deterministically label owned brands/products found in a source title."""
+    text = str(title or "").strip()
+    products = sorted(set(own_product_mentions(text)))
+    owned_brands: set[str] = set()
+    override = owned_source_url_override(url)
+    products = sorted(set(products) | set(override.get("own_products") or ()))
+    owned_brands.update(override.get("owned_brands") or ())
+    for item in owned_brand_vocabulary():
+        name = canonical_brand_name(item.get("name") or "")
+        aliases = set(item.get("aliases") or []) | {item.get("name") or "", name}
+        if name and any(brand_alias_occurs(text, alias) for alias in aliases if alias):
+            owned_brands.add(name)
+    # Product matching is intentionally stricter (brand + descriptor), but it
+    # also provides a fallback if brand settings were temporarily unavailable.
+    for product_brand in brands_for_products(products):
+        matched_name = ""
+        for item in owned_brand_vocabulary():
+            aliases = set(item.get("aliases") or []) | {item.get("name") or ""}
+            if _compact(product_brand) in {_compact(alias) for alias in aliases if alias}:
+                matched_name = canonical_brand_name(item.get("name") or "")
+                break
+        owned_brands.add(matched_name or canonical_brand_name(product_brand))
+    owned_brands.discard("")
+    return {"owned_brands": sorted(owned_brands), "own_products": products,
+            "own_brand": bool(owned_brands or products),
+            "brand_match_scope": "标题" if owned_brands or products else ""}
 
 
 def source_title_key(source: dict[str, Any]) -> str:
@@ -953,11 +1070,21 @@ def _product_fields(raw: dict[str, Any]) -> tuple[str, str, int]:
     return _normalized_product_fields(brand, product, rank_value)
 
 
-def _catalogs(runs_by_model: dict[str, list[dict[str, Any]]]) -> tuple[dict[str, set[str]], dict[str, tuple[str, str]]]:
+def _catalogs(
+    runs_by_model: dict[str, list[dict[str, Any]]],
+    *, seed_brands: Iterable[str] = (),
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, str]]]:
     brand_aliases: dict[str, set[str]] = defaultdict(set)
     product_catalog: dict[str, tuple[str, str]] = {}
     canonical_by_key: dict[str, str] = {}
-    raw_brands: list[str] = []
+    # A date/question-scoped dashboard request may contain only freshly ingested
+    # rows whose paid product review is still pending. Seed the matcher with
+    # historically verified structured brands for the same question so explicit
+    # mentions remain visible while those new rows wait for review.
+    raw_brands: list[str] = [
+        str(name).strip() for name in seed_brands
+        if valid_brand(canonical_brand_name(str(name or "").strip()))
+    ]
 
     for item in brand_vocabulary():
         canonical = canonical_brand_name(item.get("name") or "")
@@ -1024,6 +1151,8 @@ def _catalogs(runs_by_model: dict[str, list[dict[str, Any]]]) -> tuple[dict[str,
         brand_aliases[canonical].add(name)
         brand_aliases[canonical].update(BRAND_CANONICAL_GROUPS.get(canonical, set()))
         return canonical
+    for name in raw_brands:
+        add_brand(name)
     for runs in runs_by_model.values():
         for run in runs:
             for raw in run.get("products") or []:
@@ -1139,9 +1268,18 @@ def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: 
                         for key, value in cached_source.items()
                     })
                     continue
+                title_metadata = owned_source_title_metadata(
+                    source.get("title") or "", source.get("url") or source.get("canonical_url") or ""
+                )
                 title_matches = set(_mentions(source.get("title") or "", matcher))
+                # Some Doubao video cards clamp the visible title before the
+                # owned-brand hashtag.  The ingestion repair persists the
+                # audited URL label, so source enrichment must apply the same
+                # deterministic rule instead of wiping it back to false.
+                title_matches.update(title_metadata.get("owned_brands") or [])
                 body_matches: set[str] = set()
                 title_products = set(own_product_mentions(source.get("title") or ""))
+                title_products.update(title_metadata.get("own_products") or [])
                 body_products: set[str] = set()
                 entry = index.get(source.get("url")) or index.get(source.get("canonical_url")) or {}
                 is_article = source.get("type") != "视频"
@@ -1207,14 +1345,14 @@ def _enrich_runs(runs_by_model: dict[str, list[dict[str, Any]]], brand_aliases: 
 
 def prepare_analytics(
     runs_by_model: dict[str, list[dict[str, Any]]],
-    *, enrich_sources: bool = True,
+    *, enrich_sources: bool = True, seed_brands: Iterable[str] = (),
 ) -> tuple[
     dict[str, set[str]],
     dict[str, tuple[str, str]],
     tuple[re.Pattern[str] | None, dict[str, set[str]]],
 ]:
     """Enrich one versioned run snapshot for reuse across dashboard filters."""
-    brand_aliases, product_catalog = _catalogs(runs_by_model)
+    brand_aliases, product_catalog = _catalogs(runs_by_model, seed_brands=seed_brands)
     matcher = _brand_matcher(brand_aliases)
     _enrich_runs(
         runs_by_model, brand_aliases, product_catalog, matcher,
@@ -1285,6 +1423,73 @@ def _daily_mentions(runs: list[dict[str, Any]], field: str) -> list[dict[str, An
     return result
 
 
+def _dedupe_exact_answer_runs(runs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse deterministic answer copies while retaining the best reviewed row."""
+    ordered = sorted(
+        runs,
+        key=lambda run: bool(run.get("brand_analysis_ready", True)),
+        reverse=True,
+    )
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for run in ordered:
+        answer = unicodedata.normalize("NFKC", str(run.get("answer") or ""))
+        compact = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\s]+", "", answer)
+        key = hashlib.sha256(compact.encode("utf-8")).hexdigest() if compact else str(run.get("run_id") or id(run))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(run)
+    return unique
+
+
+def _owned_product_model_status(
+    eligible: list[dict[str, Any]],
+    owned_product: str,
+    product_question: str,
+) -> dict[str, Any]:
+    reviewed = [run for run in eligible if bool(run.get("brand_analysis_ready", True))]
+    body_match_run_ids: set[str] = set()
+    structured_match_run_ids: set[str] = set()
+    candidates = owned_products_for_question(product_question)
+    for run in eligible:
+        body_mentions = set(owned_product_recommendations(
+            recommendation_body(run.get("answer") or ""), candidates,
+        ))
+        if owned_product in body_mentions:
+            body_match_run_ids.add(str(run.get("run_id") or id(run)))
+    for run in reviewed:
+        mentioned: set[str] = set()
+        for raw_product in run.get("products") or []:
+            brand, product_name, _rank = _product_fields(raw_product)
+            mentioned.update(own_product_mentions(f"{brand} {product_name}"))
+        if owned_product in mentioned:
+            structured_match_run_ids.add(str(run.get("run_id") or id(run)))
+    listed_run_ids = body_match_run_ids | structured_match_run_ids
+    listed_runs = len(listed_run_ids)
+    eligible_count = len(eligible)
+    reviewed_count = len(reviewed)
+    pending_count = eligible_count - reviewed_count
+    if listed_runs:
+        state = "listed"
+    elif not eligible_count:
+        state = "not_collected"
+    elif pending_count:
+        state = "pending"
+    else:
+        state = "not_listed"
+    return {
+        "state": state,
+        "eligible_runs": eligible_count,
+        "reviewed_runs": reviewed_count,
+        "pending_runs": pending_count,
+        "recommendation_runs": listed_runs,
+        "body_match_runs": len(body_match_run_ids),
+        "structured_match_runs": len(structured_match_run_ids),
+        "recommendation_rate": round(listed_runs * 100 / eligible_count, 2) if eligible_count else 0,
+    }
+
+
 def daily_owned_product_recommendations(
     runs_by_model: dict[str, list[dict[str, Any]]],
     model_ids: Iterable[str],
@@ -1307,14 +1512,25 @@ def daily_owned_product_recommendations(
     scoped_by_model: dict[str, list[dict[str, Any]]] = {}
     all_days: set[str] = set()
     for model_id in selected_ids:
-        scoped = [
-            run for run in runs_by_model.get(model_id, [])
-            if str(run.get("status") or "success").casefold() == "success"
-            and run.get("body_capture_complete") is not False
-            if (not question or str(run.get("question") or "") == question)
-            and (not date or str(run.get("day") or "") == date)
-            and owned_products_for_question(str(run.get("question") or ""))
-        ]
+        scoped = []
+        for run in runs_by_model.get(model_id, []):
+            run_question = str(run.get("question") or "")
+            status = str(run.get("status") or "success").casefold()
+            successful = status == "success" and run.get("body_capture_complete") is not False
+            observed_baidu_absence = (
+                model_id == "wenxin"
+                and str(run.get("capture_mode") or "") == "baidu_search_ai"
+                and status in {"not_available", "capture_failed"}
+            )
+            if not (successful or observed_baidu_absence):
+                continue
+            if question and run_question != question:
+                continue
+            if date and str(run.get("day") or "") != date:
+                continue
+            if not owned_products_for_question(run_question):
+                continue
+            scoped.append(run)
         scoped_by_model[model_id] = scoped
         all_days.update(str(run.get("day") or "") for run in scoped if run.get("day"))
     visible_days = sorted(all_days, reverse=True)[:max(1, day_limit)]
@@ -1330,62 +1546,95 @@ def daily_owned_product_recommendations(
             for owned_product in owned_products_for_question(product_question):
                 model_statuses: dict[str, dict[str, Any]] = {}
                 for model_id in selected_ids:
-                    eligible = [
+                    records = [
                         run for run in scoped_by_model.get(model_id, [])
                         if str(run.get("day") or "") == day
                         and str(run.get("question") or "") == product_question
                     ]
-                    reviewed = [
-                        run for run in eligible
-                        if bool(run.get("brand_analysis_ready", True))
+                    eligible = [
+                        run for run in records
+                        if str(run.get("status") or "success").casefold() == "success"
+                        and run.get("body_capture_complete") is not False
                     ]
-                    body_match_run_ids: set[str] = set()
-                    structured_match_run_ids: set[str] = set()
-                    # The answer body is primary evidence for this board.  It
-                    # must not disappear merely because asynchronous product AI
-                    # review is backlogged.  own_product_mentions is conservative:
-                    # both the owned brand and a configured product descriptor
-                    # must occur together.  The question mapping above prevents
-                    # a product from being credited under the wrong category.
-                    for run in eligible:
-                        body_mentions = set(owned_product_recommendations(
-                            recommendation_body(run.get("answer") or ""),
-                            owned_products_for_question(product_question),
-                        ))
-                        if owned_product in body_mentions:
-                            body_match_run_ids.add(str(run.get("run_id") or id(run)))
-                    for run in reviewed:
-                        mentioned: set[str] = set()
-                        for raw_product in run.get("products") or []:
-                            brand, product_name, _rank = _product_fields(raw_product)
-                            mentioned.update(own_product_mentions(f"{brand} {product_name}"))
-                        if owned_product in mentioned:
-                            structured_match_run_ids.add(str(run.get("run_id") or id(run)))
-                    listed_run_ids = body_match_run_ids | structured_match_run_ids
-                    listed_runs = len(listed_run_ids)
-                    eligible_count = len(eligible)
-                    reviewed_count = len(reviewed)
-                    pending_count = eligible_count - reviewed_count
-                    if listed_runs:
-                        state = "listed"
-                    elif not eligible_count:
-                        state = "not_collected"
-                    elif pending_count:
-                        state = "pending"
-                    else:
-                        state = "not_listed"
-                    model_statuses[model_id] = {
-                        "state": state,
-                        "eligible_runs": eligible_count,
-                        "reviewed_runs": reviewed_count,
-                        "pending_runs": pending_count,
-                        "recommendation_runs": listed_runs,
-                        "body_match_runs": len(body_match_run_ids),
-                        "structured_match_runs": len(structured_match_run_ids),
-                        "recommendation_rate": round(
-                            listed_runs * 100 / eligible_count, 2
-                        ) if eligible_count else 0,
+                    if model_id != "wenxin":
+                        model_statuses[model_id] = _owned_product_model_status(
+                            eligible, owned_product, product_question,
+                        )
+                        continue
+
+                    baidu_records = [
+                        run for run in records
+                        if str(run.get("capture_mode") or "") == "baidu_search_ai"
+                    ]
+                    wenxin_records = [
+                        run for run in records
+                        if str(run.get("capture_mode") or "") != "baidu_search_ai"
+                    ]
+                    raw_baidu = [
+                        run for run in baidu_records
+                        if str(run.get("status") or "success").casefold() == "success"
+                        and run.get("body_capture_complete") is not False
+                    ]
+                    effective_baidu = _dedupe_exact_answer_runs(raw_baidu)
+                    effective_wenxin = [
+                        run for run in wenxin_records
+                        if str(run.get("status") or "success").casefold() == "success"
+                        and run.get("body_capture_complete") is not False
+                    ]
+                    baidu_status = _owned_product_model_status(
+                        effective_baidu, owned_product, product_question,
+                    )
+                    baidu_attempted = len(baidu_records)
+                    baidu_unavailable = sum(
+                        str(run.get("status") or "").casefold() == "not_available"
+                        for run in baidu_records
+                    )
+                    baidu_failed = sum(
+                        str(run.get("status") or "").casefold() == "capture_failed"
+                        for run in baidu_records
+                    )
+                    baidu_target = max(
+                        [int(run.get("daily_surface_target") or 0) for run in baidu_records] or [5]
+                    ) or 5
+                    baidu_status.update({
+                        "surface_label": "百度卡片",
+                        "attempted_runs": baidu_attempted,
+                        "raw_eligible_runs": len(raw_baidu),
+                        "duplicate_runs_merged": max(0, len(raw_baidu) - len(effective_baidu)),
+                        "unavailable_runs": baidu_unavailable,
+                        "failed_runs": baidu_failed,
+                        "target_runs": baidu_target,
+                        "availability_note": (
+                            "百度搜索未出现 AI 卡片"
+                            if not raw_baidu and baidu_attempted >= baidu_target and baidu_unavailable >= baidu_target
+                            else f"百度卡片抓取失败 {baidu_failed}/{baidu_target} 次"
+                            if not raw_baidu and baidu_attempted >= baidu_target and baidu_failed
+                            else f"百度卡片检测中（{baidu_attempted}/{baidu_target}）"
+                            if not raw_baidu and baidu_attempted
+                            else "今日尚未检测百度卡片"
+                            if not raw_baidu else ""
+                        ),
+                    })
+                    wenxin_status = _owned_product_model_status(
+                        effective_wenxin, owned_product, product_question,
+                    )
+                    wenxin_status.update({
+                        "surface_label": "文心卡片",
+                        "attempted_runs": len(wenxin_records),
+                        "raw_eligible_runs": len(effective_wenxin),
+                        "duplicate_runs_merged": 0,
+                        "unavailable_runs": 0,
+                        "target_runs": 0,
+                        "availability_note": "" if effective_wenxin else "文心卡片暂无有效数据",
+                    })
+                    combined = _owned_product_model_status(
+                        [*effective_wenxin, *effective_baidu], owned_product, product_question,
+                    )
+                    combined["surfaces"] = {
+                        "wenxin_card": wenxin_status,
+                        "baidu_card": baidu_status,
                     }
+                    model_statuses[model_id] = combined
                 rows.append({
                     "date": day,
                     "question": product_question,
@@ -1397,6 +1646,182 @@ def daily_owned_product_recommendations(
                     ),
                 })
     return rows
+
+
+def owned_product_recommendation_summary(
+    daily_rows: Iterable[dict[str, Any]],
+    model_ids: Iterable[str],
+    *,
+    month: str = "",
+) -> list[dict[str, Any]]:
+    """Average daily owned-product mention rates over observed days only.
+
+    Every product + model + day probability receives equal weight, regardless
+    of how many questions/runs produced that probability.  A missing model-day
+    is omitted while other models from the same calendar day remain eligible.
+    """
+    selected_ids = list(model_ids)
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in daily_rows:
+        if month and not str(row.get("date") or "").startswith(f"{month}-"):
+            continue
+        key = (
+            str(row.get("question") or ""),
+            str(row.get("product") or ""),
+            str(row.get("brand") or ""),
+        )
+        bucket = buckets.setdefault(key, {
+            "question": key[0], "product": key[1], "brand": key[2],
+            "observations": [],
+            "models": {model_id: [] for model_id in selected_ids},
+            "model_surfaces": {model_id: defaultdict(list) for model_id in selected_ids},
+        })
+        day = str(row.get("date") or "")
+        for model_id in selected_ids:
+            status = dict((row.get("models") or {}).get(model_id) or {})
+            for surface_id, surface_status in dict(status.get("surfaces") or {}).items():
+                surface = dict(surface_status or {})
+                surface_eligible = int(surface.get("eligible_runs") or 0)
+                surface_recommendations = int(surface.get("recommendation_runs") or 0)
+                bucket["model_surfaces"][model_id][surface_id].append({
+                    "date": day,
+                    "eligible_runs": surface_eligible,
+                    "recommendation_runs": surface_recommendations,
+                    "rate": surface_recommendations * 100 / surface_eligible if surface_eligible else 0,
+                    "attempted_runs": int(surface.get("attempted_runs") or 0),
+                    "raw_eligible_runs": int(surface.get("raw_eligible_runs") or surface_eligible),
+                    "duplicate_runs_merged": int(surface.get("duplicate_runs_merged") or 0),
+                    "unavailable_runs": int(surface.get("unavailable_runs") or 0),
+                    "target_runs": int(surface.get("target_runs") or 0),
+                    "availability_note": str(surface.get("availability_note") or ""),
+                    "surface_label": str(surface.get("surface_label") or surface_id),
+                })
+            eligible = int(status.get("eligible_runs") or 0)
+            recommendations = int(status.get("recommendation_runs") or 0)
+            if eligible <= 0:
+                continue
+            observation = {
+                "date": day,
+                "eligible_runs": eligible,
+                "recommendation_runs": recommendations,
+                "rate": recommendations * 100 / eligible,
+            }
+            bucket["models"][model_id].append(observation)
+            bucket["observations"].append(observation)
+
+    output: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        observations = bucket["observations"]
+        if not observations:
+            continue
+        latest_date = max((item["date"] for item in observations if item["date"]), default="")
+        model_summaries = {}
+        for model_id in selected_ids:
+            model_days = bucket["models"][model_id]
+            eligible = sum(item["eligible_runs"] for item in model_days)
+            recommendations = sum(item["recommendation_runs"] for item in model_days)
+            previous_days = [item for item in model_days if item["date"] < latest_date]
+            has_latest_day = any(item["date"] == latest_date for item in model_days)
+            average_rate = (
+                sum(item["rate"] for item in model_days) / len(model_days)
+                if model_days else 0
+            )
+            previous_average = (
+                sum(item["rate"] for item in previous_days) / len(previous_days)
+                if previous_days else None
+            )
+            model_summaries[model_id] = {
+                "observed_days": len(model_days),
+                "average_daily_mention_rate": round(average_rate, 2),
+                "previous_average_daily_mention_rate": (
+                    round(previous_average, 2) if previous_average is not None else None
+                ),
+                "day_over_day_change": (
+                    round(average_rate - previous_average, 2)
+                    if has_latest_day and previous_average is not None else None
+                ),
+                "total_recommendation_runs": recommendations,
+                "total_eligible_runs": eligible,
+                "pooled_mention_rate": round(recommendations * 100 / eligible, 2) if eligible else 0,
+            }
+            surface_summaries = {}
+            for surface_id, surface_days in bucket["model_surfaces"][model_id].items():
+                effective_days = [item for item in surface_days if item["eligible_runs"] > 0]
+                effective_dates = sorted({item["date"] for item in effective_days if item["date"]})
+                surface_latest = max((item["date"] for item in effective_days), default="")
+                surface_previous = [item for item in effective_days if item["date"] < surface_latest]
+                surface_average = (
+                    sum(item["rate"] for item in effective_days) / len(effective_days)
+                    if effective_days else 0
+                )
+                surface_previous_average = (
+                    sum(item["rate"] for item in surface_previous) / len(surface_previous)
+                    if surface_previous else None
+                )
+                latest_status = max(surface_days, key=lambda item: item["date"], default={})
+                surface_eligible = sum(item["eligible_runs"] for item in effective_days)
+                surface_recommendations = sum(item["recommendation_runs"] for item in effective_days)
+                surface_summaries[surface_id] = {
+                    "surface_label": str(latest_status.get("surface_label") or surface_id),
+                    "observed_days": len(effective_days),
+                    "first_date": effective_dates[0] if effective_dates else "",
+                    "last_date": effective_dates[-1] if effective_dates else "",
+                    "last_attempt_date": max((item["date"] for item in surface_days), default=""),
+                    "average_daily_mention_rate": round(surface_average, 2),
+                    "previous_average_daily_mention_rate": (
+                        round(surface_previous_average, 2) if surface_previous_average is not None else None
+                    ),
+                    "day_over_day_change": (
+                        round(surface_average - surface_previous_average, 2)
+                        if surface_previous_average is not None else None
+                    ),
+                    "total_recommendation_runs": surface_recommendations,
+                    "total_eligible_runs": surface_eligible,
+                    "pooled_mention_rate": round(
+                        surface_recommendations * 100 / surface_eligible, 2
+                    ) if surface_eligible else 0,
+                    "attempted_days": sum(item["attempted_runs"] > 0 for item in surface_days),
+                    "attempted_runs": sum(item["attempted_runs"] for item in surface_days),
+                    "raw_eligible_runs": sum(item["raw_eligible_runs"] for item in surface_days),
+                    "duplicate_runs_merged": sum(item["duplicate_runs_merged"] for item in surface_days),
+                    "unavailable_runs": sum(item["unavailable_runs"] for item in surface_days),
+                    "target_runs": int(latest_status.get("target_runs") or 0),
+                    "availability_note": str(latest_status.get("availability_note") or ""),
+                }
+            if surface_summaries:
+                model_summaries[model_id]["surfaces"] = surface_summaries
+        dates = [item["date"] for item in observations if item["date"]]
+        observed_dates = set(dates)
+        eligible = sum(item["eligible_runs"] for item in observations)
+        recommendations = sum(item["recommendation_runs"] for item in observations)
+        previous_observations = [item for item in observations if item["date"] < latest_date]
+        average_rate = sum(item["rate"] for item in observations) / len(observations)
+        previous_average = (
+            sum(item["rate"] for item in previous_observations) / len(previous_observations)
+            if previous_observations else None
+        )
+        output.append({
+            "question": bucket["question"],
+            "product": bucket["product"],
+            "brand": bucket["brand"],
+            "observed_days": len(observed_dates),
+            "observed_model_days": len(observations),
+            "first_date": min(dates) if dates else "",
+            "last_date": max(dates) if dates else "",
+            "average_daily_mention_rate": round(average_rate, 2),
+            "previous_average_daily_mention_rate": (
+                round(previous_average, 2) if previous_average is not None else None
+            ),
+            "day_over_day_change": (
+                round(average_rate - previous_average, 2)
+                if previous_average is not None else None
+            ),
+            "total_recommendation_runs": recommendations,
+            "total_eligible_runs": eligible,
+            "pooled_mention_rate": round(recommendations * 100 / eligible, 2) if eligible else 0,
+            "models": model_summaries,
+        })
+    return output
 
 
 def _daily_source_analysis(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1616,6 +2041,7 @@ def build_analytics(
             str(run.get("model_id") or "").casefold() == "wenxin"
             and not (run.get("sources") or [])
             and run.get("source_capture_complete") is True
+            and run.get("source_list_present") is not False
         )
         return (
             str(run.get("status") or "success").casefold() == "success"
@@ -1722,6 +2148,38 @@ def build_analytics(
         if full or view == "overview"
         else []
     )
+    summary_month = date[:7] if date else datetime.now(BEIJING).strftime("%Y-%m")
+    monthly_daily_rows = (
+        daily_owned_product_recommendations(
+            runs_by_model, selected_models, question=question, day_limit=3660,
+        )
+        if full or view == "overview"
+        else []
+    )
+    owned_product_summary = (
+        owned_product_recommendation_summary(
+            monthly_daily_rows, selected_models, month=summary_month,
+        )
+        if monthly_daily_rows else []
+    )
+    performance_model_rows = {}
+    wenxin_start = MODEL_PERFORMANCE_START_DATES.get("wenxin", "")
+    if monthly_daily_rows and wenxin_start:
+        cutoff_rows = [
+            row for row in monthly_daily_rows
+            if str(row.get("date") or "") >= wenxin_start
+        ]
+        performance_model_rows["wenxin"] = owned_product_recommendation_summary(
+            cutoff_rows, ["wenxin"], month=summary_month,
+        )
+    employee_performance = (
+        daily_employee_performance(
+            owned_product_summary,
+            date=summary_month, model_rows=performance_model_rows,
+        )
+        if full or view == "overview"
+        else {"date": "", "cap": 200, "people": []}
+    )
     eligible_competitor_brands = (
         structured_product_brand_catalog(runs_by_model, question=question, date=date)
         if need_inline_source_intersections
@@ -1779,6 +2237,8 @@ def build_analytics(
             "common_owned_sources": common_links,
             "two_model_owned_sources": two_model_links,
             "owned_product_daily": owned_product_daily,
+            "owned_product_summary": owned_product_summary,
+            "employee_performance": employee_performance,
             "competitor_brands": competitor_brands,
             "common_competitor_sources": common_competitor_links,
             "two_model_competitor_sources": two_model_competitor_links,

@@ -27,7 +27,7 @@ except ImportError:  # Database support remains an optional, safe fallback.
     ConnectionPool = None
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _POOL: ConnectionPool | None = None
 _POOL_LOCK = threading.Lock()
 _SCHEMA_READY = False
@@ -52,6 +52,22 @@ def enabled() -> bool:
     return bool(psycopg is not None and database_url())
 
 
+def database_session_options() -> str:
+    """Bound database queries using settings available to the application role."""
+    timeout_ms = max(
+        5_000,
+        min(600_000, int(os.getenv("MONITOR_DATABASE_STATEMENT_TIMEOUT_MS", "120000") or 120000)),
+    )
+    parallel_workers = max(
+        0,
+        min(2, int(os.getenv("MONITOR_DATABASE_MAX_PARALLEL_WORKERS", "1") or 1)),
+    )
+    return (
+        f"-c statement_timeout={timeout_ms} "
+        f"-c max_parallel_workers_per_gather={parallel_workers}"
+    )
+
+
 def pool() -> ConnectionPool:
     global _POOL
     if not enabled():
@@ -68,7 +84,8 @@ def pool() -> ConnectionPool:
                 timeout=max(1, float(os.getenv("MONITOR_DATABASE_POOL_TIMEOUT", "10") or 10)),
                 max_idle=300, max_lifetime=3600,
                 kwargs={"autocommit": False, "row_factory": dict_row,
-                        "application_name": "monitor-dashboard"},
+                        "application_name": "monitor-dashboard",
+                        "options": database_session_options()},
                 open=True,
             )
     return _POOL
@@ -201,6 +218,18 @@ CREATE TABLE IF NOT EXISTS monitor_ingest_events (
     stored_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (model_id, request_id)
 );
+CREATE TABLE IF NOT EXISTS product_analysis_incidents (
+    id bigserial PRIMARY KEY,
+    provider text NOT NULL,
+    incident_type text NOT NULL DEFAULT 'provider_unavailable',
+    status text NOT NULL DEFAULT 'open',
+    started_at timestamptz NOT NULL DEFAULT now(),
+    last_failure_at timestamptz NOT NULL DEFAULT now(),
+    recovered_at timestamptz,
+    review_completed_at timestamptz,
+    error text NOT NULL DEFAULT '',
+    affected_runs bigint NOT NULL DEFAULT 0
+);
 ALTER TABLE monitor_ingest_events ADD COLUMN IF NOT EXISTS run_id text NOT NULL DEFAULT '';
 ALTER TABLE monitor_runs ADD COLUMN IF NOT EXISTS product_ai_retry_count integer NOT NULL DEFAULT 0;
 ALTER TABLE monitor_runs ADD COLUMN IF NOT EXISTS product_ai_next_retry_at timestamptz;
@@ -229,6 +258,8 @@ CREATE INDEX IF NOT EXISTS idx_cache_scope ON analytics_cache(scope_key, scope_v
 CREATE INDEX IF NOT EXISTS idx_ingest_received ON monitor_ingest_events(model_id, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ingest_record_gin ON monitor_ingest_events USING gin(record jsonb_path_ops);
 CREATE INDEX IF NOT EXISTS idx_ingest_run ON monitor_ingest_events(model_id, run_id) WHERE run_id <> '';
+CREATE INDEX IF NOT EXISTS idx_product_incidents_provider_status
+ON product_analysis_incidents(provider, status, started_at DESC);
 
 CREATE OR REPLACE FUNCTION monitor_source_stats_apply() RETURNS trigger AS $$
 DECLARE
@@ -393,7 +424,24 @@ def capture_quarantine_reason(model_id: str, run: dict[str, Any]) -> str:
         return "empty_answer"
     if run.get("body_capture_complete") is False:
         return f"{normalized_model or 'unknown'}_body_capture_incomplete"
+    if normalized_model == "quark":
+        from monitor_core.quality import answer_quality_reason
+        if reason := answer_quality_reason(
+            str(run.get("question") or ""), str(run.get("answer") or "")
+        ):
+            return f"quark_invalid_answer: {reason}"
     if normalized_model != "wenxin":
+        return ""
+    # A complete Baidu AI search-card answer remains a valid probability
+    # observation even when Baidu changes the source drawer markup.  Keep the
+    # answer queryable and expose source_capture_complete=false separately;
+    # otherwise a cosmetic provenance-parser change erases the whole card from
+    # the daily board.  The dedicated Wenxin page stays strict because its
+    # explicit reference list is part of that collector's completion contract.
+    if (
+        str(run.get("capture_mode") or "") == "baidu_search_ai"
+        and run.get("card_available") is not False
+    ):
         return ""
     usable_sources = [
         source for source in (run.get("sources") or [])
@@ -434,6 +482,7 @@ def _write_children(cur, model_id: str, run_id: str, sources, brands, products) 
         _product_fields,
         canonical_brand_name,
         canonical_url as normalize_canonical_url,
+        owned_source_title_metadata,
     )
 
     def normalized_brand_list(values) -> list[str]:
@@ -447,6 +496,17 @@ def _write_children(cur, model_id: str, run_id: str, sources, brands, products) 
     seen_source_urls: set[str] = set()
     for raw_item in sources or []:
         item = dict(raw_item)
+        title_labels = owned_source_title_metadata(
+            str(item.get("title") or ""), str(item.get("url") or item.get("href") or ""))
+        item["owned_brands"] = sorted(
+            set(item.get("owned_brands") or []) | set(title_labels["owned_brands"])
+        )
+        item["own_products"] = sorted(
+            set(item.get("own_products") or []) | set(title_labels["own_products"])
+        )
+        if title_labels["own_brand"]:
+            item["own_brand"] = True
+            item["brand_match_scope"] = str(item.get("brand_match_scope") or "") or "标题"
         for field in (
             "brand_mentions", "title_brand_mentions", "body_brand_mentions",
             "owned_brands",
@@ -580,7 +640,9 @@ def sync_incremental(runs_by_model: dict[str, list[dict[str, Any]]]) -> dict[str
 
 
 def load_runs_by_model(*, day: str = "", day_from: str = "", day_to: str = "",
-                       question: str = "", model: str = "") -> dict[str, list[dict[str, Any]]]:
+                       question: str = "", model: str = "",
+                       exclude_questions: Iterable[str] = (),
+                       include_analysis: bool = True) -> dict[str, list[dict[str, Any]]]:
     """Load normalized runs, optionally using a narrow indexed dashboard scope."""
     ensure_schema()
     output: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -603,6 +665,10 @@ def load_runs_by_model(*, day: str = "", day_from: str = "", day_to: str = "",
     if model:
         clauses.append("r.model_id=%s")
         params.append(model)
+    excluded = [str(item).strip() for item in exclude_questions if str(item).strip()]
+    if excluded:
+        clauses.append("NOT (r.question=ANY(%s::text[]))")
+        params.append(excluded)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with connection() as conn:
         for row in conn.execute(
@@ -621,23 +687,26 @@ def load_runs_by_model(*, day: str = "", day_from: str = "", day_to: str = "",
         ):
             run = keyed.get((row["model_id"], row["run_id"]))
             if run is not None: run["sources"].append(dict(row["payload"] or {}))
-        for row in conn.execute(
-            "SELECT c.model_id,c.run_id,c.brand FROM monitor_brands c" + child_join + where +
-            " ORDER BY c.model_id,c.run_id,c.brand", params,
-        ):
-            run = keyed.get((row["model_id"], row["run_id"]))
-            if run is not None: run["brands"].append(row["brand"])
-        for row in conn.execute(
-            "SELECT c.model_id,c.run_id,c.payload FROM monitor_products c" + child_join + where +
-            " ORDER BY c.model_id,c.run_id,c.product_index", params,
-        ):
-            run = keyed.get((row["model_id"], row["run_id"]))
-            if run is not None: run["products"].append(dict(row["payload"] or {}))
+        if include_analysis:
+            for row in conn.execute(
+                "SELECT c.model_id,c.run_id,c.brand FROM monitor_brands c" + child_join + where +
+                " ORDER BY c.model_id,c.run_id,c.brand", params,
+            ):
+                run = keyed.get((row["model_id"], row["run_id"]))
+                if run is not None: run["brands"].append(row["brand"])
+            for row in conn.execute(
+                "SELECT c.model_id,c.run_id,c.payload FROM monitor_products c" + child_join + where +
+                " ORDER BY c.model_id,c.run_id,c.product_index", params,
+            ):
+                run = keyed.get((row["model_id"], row["run_id"]))
+                if run is not None: run["products"].append(dict(row["payload"] or {}))
     return dict(output)
 
 
-def load_owned_product_runs(*, day: str = "", latest_days: int = 7,
-                            question: str = "", model: str = "") -> dict[str, list[dict[str, Any]]]:
+def load_owned_product_runs(*, day: str = "", day_from: str = "", day_to: str = "",
+                            latest_days: int = 7,
+                            question: str = "", model: str = "",
+                            exclude_questions: Iterable[str] = ()) -> dict[str, list[dict[str, Any]]]:
     """Load only fields needed by the real-time owned-product board.
 
     The all-date analytics snapshot includes hundreds of thousands of source
@@ -651,17 +720,28 @@ def load_owned_product_runs(*, day: str = "", latest_days: int = 7,
     if day:
         clauses.append("r.day=%s")
         params.append(day)
+    else:
+        if day_from:
+            clauses.append("r.day>=%s")
+            params.append(day_from)
+        if day_to:
+            clauses.append("r.day<=%s")
+            params.append(day_to)
     if question:
         clauses.append("r.question=%s")
         params.append(question)
     if model:
         clauses.append("r.model_id=%s")
         params.append(model)
+    excluded = [str(item).strip() for item in exclude_questions if str(item).strip()]
+    if excluded:
+        clauses.append("NOT (r.question=ANY(%s::text[]))")
+        params.append(excluded)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     output: dict[str, list[dict[str, Any]]] = defaultdict(list)
     keyed: dict[tuple[str, str], dict[str, Any]] = {}
     with connection() as conn:
-        if not day:
+        if not day and not day_from and not day_to:
             day_clauses = [part.replace("r.", "") for part in clauses]
             day_where = (" WHERE " + " AND ".join(day_clauses)) if day_clauses else ""
             selected_days = [
@@ -669,7 +749,7 @@ def load_owned_product_runs(*, day: str = "", latest_days: int = 7,
                     "SELECT DISTINCT day FROM monitor_runs" + day_where
                     + (" AND day IS NOT NULL" if day_where else " WHERE day IS NOT NULL")
                     + " ORDER BY day DESC LIMIT %s",
-                    [*params, max(1, min(int(latest_days), 31))],
+                    [*params, max(1, min(int(latest_days), 3660))],
                 ) if row["day"]
             ]
             if not selected_days:
@@ -703,11 +783,20 @@ def load_owned_product_runs(*, day: str = "", latest_days: int = 7,
     return dict(output)
 
 
-def analytics_filter_options(*, model: str = "", question: str = "") -> dict[str, list[str]]:
+def analytics_filter_options(*, model: str = "", question: str = "",
+                             exclude_questions: Iterable[str] = ()) -> dict[str, list[str]]:
     """Return dashboard selectors without materializing answers or sources."""
     ensure_schema()
-    model_clause = " WHERE model_id=%s" if model else ""
-    model_params = (model,) if model else ()
+    excluded = [str(item).strip() for item in exclude_questions if str(item).strip()]
+    question_clauses: list[str] = []
+    question_params: list[Any] = []
+    if model:
+        question_clauses.append("model_id=%s")
+        question_params.append(model)
+    if excluded:
+        question_clauses.append("NOT (question=ANY(%s::text[]))")
+        question_params.append(excluded)
+    model_clause = (" WHERE " + " AND ".join(question_clauses)) if question_clauses else ""
     date_clauses = []
     date_params: list[Any] = []
     if model:
@@ -716,13 +805,16 @@ def analytics_filter_options(*, model: str = "", question: str = "") -> dict[str
     if question:
         date_clauses.append("question=%s")
         date_params.append(question)
+    elif excluded:
+        date_clauses.append("NOT (question=ANY(%s::text[]))")
+        date_params.append(excluded)
     date_where = (" WHERE " + " AND ".join(date_clauses)) if date_clauses else ""
     with connection() as conn:
         questions = [
             str(row["question"])
             for row in conn.execute(
                 "SELECT DISTINCT question FROM monitor_runs" + model_clause +
-                " ORDER BY question", model_params,
+                " ORDER BY question", question_params,
             )
             if str(row["question"] or "").strip()
         ]
@@ -743,7 +835,26 @@ def analytics_filter_options(*, model: str = "", question: str = "") -> dict[str
     return {"questions": questions, "dates": dates}
 
 
-def analytics_source_scope_summary(*, question: str = "", model: str = "") -> dict[str, dict[str, int]]:
+def analytics_dates(*, question: str = "", model: str = "") -> list[str]:
+    """Return dates for one narrow dashboard scope without scanning question options."""
+    ensure_schema()
+    clauses = ["day IS NOT NULL"]
+    params: list[Any] = []
+    if question:
+        clauses.append("question=%s")
+        params.append(question)
+    if model:
+        clauses.append("model_id=%s")
+        params.append(model)
+    with connection() as conn:
+        return [str(row["day"]) for row in conn.execute(
+            "SELECT DISTINCT day FROM monitor_runs WHERE " + " AND ".join(clauses)
+            + " ORDER BY day DESC", params,
+        )]
+
+
+def analytics_source_scope_summary(*, question: str = "", model: str = "",
+                                   exclude_questions: Iterable[str] = ()) -> dict[str, dict[str, int]]:
     """Aggregate all-history source KPIs without materializing source payloads.
 
     The source-insights page only needs full-history totals for its KPI cards.
@@ -769,11 +880,15 @@ def analytics_source_scope_summary(*, question: str = "", model: str = "") -> di
     if model:
         clauses.append("r.model_id=%s")
         params.append(model)
+    excluded = [str(item).strip() for item in exclude_questions if str(item).strip()]
+    if excluded and not question:
+        clauses.append("NOT (r.question=ANY(%s::text[]))")
+        params.append(excluded)
     where = " AND ".join(clauses)
     # The maintained model totals are exact for the all-question scope. A
     # selected question is much smaller, so its source aggregate remains a
     # fast indexed live query.
-    if not question:
+    if not question and not excluded:
         source_stats_sql = (
             "SELECT model_id,source_refs AS sources,unique_sources "
             "FROM analytics_source_model_stats"
@@ -811,7 +926,7 @@ def analytics_source_scope_summary(*, question: str = "", model: str = "") -> di
         FROM run_stats r
         LEFT JOIN source_stats s USING(model_id)
     """
-    query_params = params if not question else [*params, *params]
+    query_params = [*params, *params] if (question or excluded) else params
     with connection() as conn:
         rows = list(conn.execute(query, query_params))
     numeric_fields = (
@@ -844,10 +959,11 @@ def source_intersection_catalog(*, question: str = "", day: str = "") -> list[di
     where = " AND ".join(clauses)
     with connection() as conn:
         return list(conn.execute(
-            "SELECT DISTINCT ON (s.canonical_url) s.canonical_url,s.url,s.title,"
-            "s.media,s.source_type FROM monitor_sources s JOIN monitor_runs r "
+            "SELECT s.canonical_url,max(s.url) AS url,max(s.title) AS title,"
+            "max(s.media) AS media,max(s.source_type) AS source_type "
+            "FROM monitor_sources s JOIN monitor_runs r "
             "ON r.model_id=s.model_id AND r.run_id=s.run_id WHERE " + where +
-            " ORDER BY s.canonical_url,r.day DESC,r.finished_at DESC,s.source_index DESC",
+            " GROUP BY s.canonical_url",
             params,
         ))
 
@@ -903,6 +1019,38 @@ def source_intersection_citations(
             " GROUP BY r.day,r.question,s.canonical_url,s.model_id",
             params,
         ))
+
+
+def prune_old_data(retention_days: int = 60) -> dict[str, Any]:
+    """Delete database records older than the Beijing-day retention window."""
+    days = max(1, min(3650, int(retention_days or 60)))
+    with connection() as conn:
+        cutoff = conn.execute(
+            "SELECT (now() AT TIME ZONE 'Asia/Shanghai')::date - %s AS cutoff",
+            (days - 1,),
+        ).fetchone()["cutoff"]
+        runs = conn.execute(
+            "DELETE FROM monitor_runs WHERE "
+            "COALESCE(day,(finished_at AT TIME ZONE 'Asia/Shanghai')::date,"
+            "(updated_at AT TIME ZONE 'Asia/Shanghai')::date) < %s",
+            (cutoff,),
+        ).rowcount
+        ingest_events = conn.execute(
+            "DELETE FROM monitor_ingest_events WHERE "
+            "COALESCE(received_at,stored_at) < "
+            "%s::date::timestamp AT TIME ZONE 'Asia/Shanghai'",
+            (cutoff,),
+        ).rowcount
+        analytics_cache = conn.execute("DELETE FROM analytics_cache").rowcount if runs else 0
+        if runs:
+            conn.execute("DELETE FROM analytics_versions")
+    return {
+        "retention_days": days,
+        "cutoff_day": str(cutoff),
+        "runs_deleted": int(runs or 0),
+        "ingest_events_deleted": int(ingest_events or 0),
+        "analytics_cache_deleted": int(analytics_cache or 0),
+    }
 
 
 def repair_structural_integrity() -> dict[str, Any]:
@@ -1069,6 +1217,145 @@ def repair_brand_entities(days: Iterable[str]) -> dict[str, int]:
     return counts
 
 
+def repair_owned_source_title_labels(days: Iterable[str] = ()) -> dict[str, int]:
+    """Backfill deterministic owned labels for source titles already stored."""
+    ensure_schema()
+    from monitor_core.analytics import owned_brand_vocabulary, owned_source_title_metadata
+    from monitor_core.owned_products import OWNED_SOURCE_URL_OVERRIDES
+
+    selected_days = sorted({str(item).strip() for item in days if str(item).strip()})
+    aliases = sorted({
+        str(alias).strip()
+        for item in owned_brand_vocabulary()
+        for alias in (list(item.get("aliases") or []) + [item.get("name") or ""])
+        if str(alias).strip()
+    })
+    if not aliases:
+        return {"candidates": 0, "sources_updated": 0}
+    clauses = ["(s.title ILIKE ANY(%s::text[]) OR s.url LIKE ANY(%s::text[]))"]
+    params: list[Any] = [
+        [f"%{alias}%" for alias in aliases],
+        [f"%{token}%" for token in OWNED_SOURCE_URL_OVERRIDES],
+    ]
+    if selected_days:
+        clauses.append("r.day=ANY(%s::date[])")
+        params.append(selected_days)
+    scopes: set[str] = {"global"}
+    updated = 0
+    with connection() as conn:
+        rows = list(conn.execute(
+            "SELECT s.model_id,s.run_id,s.source_index,s.title,s.payload,r.day "
+            "FROM monitor_sources s JOIN monitor_runs r "
+            "ON r.model_id=s.model_id AND r.run_id=s.run_id WHERE "
+            + " AND ".join(clauses), params,
+        ))
+        with conn.cursor() as cur:
+            for row in rows:
+                labels = owned_source_title_metadata(
+                    str(row["title"] or ""), str((row["payload"] or {}).get("url") or ""))
+                if not labels["own_brand"]:
+                    continue
+                payload = dict(row["payload"] or {})
+                payload["owned_brands"] = sorted(
+                    set(payload.get("owned_brands") or []) | set(labels["owned_brands"])
+                )
+                payload["own_products"] = sorted(
+                    set(payload.get("own_products") or []) | set(labels["own_products"])
+                )
+                payload["title_brand_mentions"] = sorted(
+                    set(payload.get("title_brand_mentions") or []) | set(labels["owned_brands"])
+                )
+                payload["title_product_mentions"] = sorted(
+                    set(payload.get("title_product_mentions") or []) | set(labels["own_products"])
+                )
+                payload["brand_mentions"] = sorted(
+                    set(payload.get("brand_mentions") or []) | set(labels["owned_brands"])
+                )
+                payload["own_brand"] = True
+                payload["brand_match_scope"] = str(payload.get("brand_match_scope") or "") or "标题"
+                cur.execute(
+                    "UPDATE monitor_sources SET own_brand=true,payload=%s "
+                    "WHERE model_id=%s AND run_id=%s AND source_index=%s",
+                    (Jsonb(payload), row["model_id"], row["run_id"], row["source_index"]),
+                )
+                scopes.update(_scope_keys(row["model_id"], row["day"]))
+                updated += 1
+            if updated:
+                cur.execute("DELETE FROM analytics_cache")
+                _bump_versions(cur, scopes)
+        conn.commit()
+    return {"candidates": len(rows), "sources_updated": updated}
+
+
+def apply_browser_source_title(url: str, browser_title: str) -> dict[str, int]:
+    """Apply a full title resolved from a hidden browser to every URL occurrence."""
+    ensure_schema()
+    from monitor_core.analytics import canonical_url, owned_source_title_metadata
+
+    source_url = str(url or "").strip()
+    resolved_title = str(browser_title or "").strip()[:20000]
+    if not source_url or not resolved_title:
+        return {"matched": 0, "updated": 0, "owned": 0}
+    stable_url = canonical_url(source_url)
+    scopes: set[str] = {"global"}
+    updated = 0
+    owned = 0
+    with connection() as conn:
+        rows = list(conn.execute(
+            "SELECT s.model_id,s.run_id,s.source_index,s.title,s.url,s.payload,r.day "
+            "FROM monitor_sources s JOIN monitor_runs r "
+            "ON r.model_id=s.model_id AND r.run_id=s.run_id "
+            "WHERE s.url=%s OR s.canonical_url=%s",
+            (source_url, stable_url),
+        ))
+        with conn.cursor() as cur:
+            for row in rows:
+                old_title = str(row["title"] or "")
+                browser_labels = owned_source_title_metadata(resolved_title, source_url)
+                chosen_title = (
+                    resolved_title
+                    if len(resolved_title) > len(old_title) or browser_labels["own_brand"]
+                    else old_title
+                )
+                labels = owned_source_title_metadata(chosen_title, source_url)
+                payload = dict(row["payload"] or {})
+                payload["title"] = chosen_title
+                payload["browser_resolved_title"] = resolved_title
+                payload["title_resolution_method"] = "douyin_hidden_browser"
+                payload["owned_brands"] = sorted(
+                    set(payload.get("owned_brands") or []) | set(labels["owned_brands"])
+                )
+                payload["own_products"] = sorted(
+                    set(payload.get("own_products") or []) | set(labels["own_products"])
+                )
+                payload["title_brand_mentions"] = sorted(
+                    set(payload.get("title_brand_mentions") or []) | set(labels["owned_brands"])
+                )
+                payload["title_product_mentions"] = sorted(
+                    set(payload.get("title_product_mentions") or []) | set(labels["own_products"])
+                )
+                payload["brand_mentions"] = sorted(
+                    set(payload.get("brand_mentions") or []) | set(labels["owned_brands"])
+                )
+                if labels["own_brand"]:
+                    payload["own_brand"] = True
+                    payload["brand_match_scope"] = "标题"
+                    owned += 1
+                cur.execute(
+                    "UPDATE monitor_sources SET title=%s,own_brand=(own_brand OR %s),payload=%s "
+                    "WHERE model_id=%s AND run_id=%s AND source_index=%s",
+                    (chosen_title, labels["own_brand"], Jsonb(payload), row["model_id"],
+                     row["run_id"], row["source_index"]),
+                )
+                scopes.update(_scope_keys(row["model_id"], row["day"]))
+                updated += 1
+            if updated:
+                cur.execute("DELETE FROM analytics_cache")
+                _bump_versions(cur, scopes)
+        conn.commit()
+    return {"matched": len(rows), "updated": updated, "owned": owned}
+
+
 def repair_source_identities(days: Iterable[str]) -> dict[str, int]:
     """Normalize HTTP/HTTPS/www aliases in derived source rows.
 
@@ -1177,7 +1464,7 @@ def global_version() -> int:
         return int(row["version"] if row else 0)
 
 
-def scope_version(cache_key: tuple[str, str, str, str]) -> tuple[str, int]:
+def scope_version(cache_key: tuple[str, ...]) -> tuple[str, int]:
     """Return the narrow analytics version for one dashboard selection."""
     if not enabled():
         return "global", 0
@@ -1187,8 +1474,8 @@ def scope_version(cache_key: tuple[str, str, str, str]) -> tuple[str, int]:
         return scope, _scope_version(conn, scope)
 
 
-def cache_scope(cache_key: tuple[str, str, str, str]) -> str:
-    _question, day_value, model_id, _view = cache_key
+def cache_scope(cache_key: tuple[str, ...]) -> str:
+    _question, day_value, model_id, _view, *_extra = cache_key
     if day_value and model_id: return f"model_day:{model_id}:{day_value}"
     if day_value: return f"day:{day_value}"
     if model_id: return f"model:{model_id}"
@@ -1200,7 +1487,7 @@ def _scope_version(conn, scope: str) -> int:
     return int(row["version"] if row else 0)
 
 
-def cache_get(cache_key: tuple[str, str, str, str], content_token: str) -> dict[str, Any] | None:
+def cache_get(cache_key: tuple[str, ...], content_token: str) -> dict[str, Any] | None:
     if not enabled(): return None
     ensure_schema()
     encoded = json.dumps(cache_key, ensure_ascii=False, separators=(",", ":"))
@@ -1216,7 +1503,7 @@ def cache_get(cache_key: tuple[str, str, str, str], content_token: str) -> dict[
         return dict(row["payload"]) if row else None
 
 
-def cache_put(cache_key: tuple[str, str, str, str], content_token: str,
+def cache_put(cache_key: tuple[str, ...], content_token: str,
               payload: dict[str, Any], expected_scope_version: int | None = None) -> bool:
     if not enabled(): return False
     ensure_schema()
@@ -1397,15 +1684,25 @@ def pending_product_runs(limit: int = 20, max_retries: int = 3,
             "WITH ranked AS ("
             "SELECT model_id,run_id,question,answer,payload,day,updated_at,finished_at,sequence_no,"
             "product_ai_retry_count,"
+            "CASE WHEN COALESCE(payload->>'requires_provider_recheck','false')='true' THEN 0 ELSE 1 END AS incident_priority,"
             "CASE WHEN day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - 1 THEN 0 ELSE 1 END AS recent_priority,"
-            "row_number() OVER (PARTITION BY model_id,CASE WHEN day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - 1 "
-            "THEN day ELSE DATE '1900-01-01' END ORDER BY updated_at,finished_at NULLS LAST,sequence_no) AS model_rank "
+            "row_number() OVER (PARTITION BY model_id,question,CASE WHEN day >= (now() AT TIME ZONE 'Asia/Shanghai')::date - 1 "
+            "THEN day ELSE DATE '1900-01-01' END ORDER BY updated_at,finished_at NULLS LAST,sequence_no) AS question_rank "
             "FROM monitor_runs WHERE COALESCE(payload->>'product_review_status','')='ai_pending' "
+            "AND status='success' "
             "AND product_ai_retry_count < %s "
             "AND (%s::date[] IS NULL OR day = ANY(%s::date[])) "
             "AND (product_ai_next_retry_at IS NULL OR product_ai_next_retry_at <= now())) "
             "SELECT model_id,run_id,question,answer,payload,product_ai_retry_count FROM ranked "
-            "ORDER BY recent_priority,model_rank,day DESC,model_id,updated_at,finished_at NULLS LAST,sequence_no LIMIT %s",
+            # Round-robin model+question pairs before taking the next row from
+            # any pair. A large early question can no longer hide every newer
+            # question from the worker's bounded scan window.
+            # Never let a large recovered provider-outage backlog hide today's
+            # live monitoring.  Current/yesterday rows are cleared first; the
+            # historical incident repair continues with the remaining slots.
+            "ORDER BY recent_priority,question_rank,day DESC,"
+            "md5(model_id || ':' || question),incident_priority,updated_at,"
+            "finished_at NULLS LAST,sequence_no LIMIT %s",
             (max(1, min(int(max_retries), 20)), days or None, days or None,
              max(1, min(int(limit), 100))),
         ).fetchall()
@@ -1432,6 +1729,120 @@ def verified_product_runs() -> list[dict[str, Any]]:
          "products": list(row["products"] or [])}
         for row in rows
     ]
+
+
+def mark_product_provider_unavailable(provider: str, error: str) -> dict[str, Any]:
+    """Open a durable outage marker and tag pending rows received after it."""
+    ensure_schema()
+    provider = str(provider or "unknown").strip().casefold()
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"product-provider:{provider}",))
+            incident = cur.execute(
+                "SELECT * FROM product_analysis_incidents WHERE provider=%s "
+                "AND status IN ('open','reviewing') ORDER BY started_at DESC LIMIT 1 FOR UPDATE",
+                (provider,),
+            ).fetchone()
+            if incident is None:
+                incident = cur.execute(
+                    "INSERT INTO product_analysis_incidents(provider,error) VALUES(%s,%s) RETURNING *",
+                    (provider, str(error or "")[:2000]),
+                ).fetchone()
+            else:
+                incident = cur.execute(
+                    "UPDATE product_analysis_incidents SET status='open',last_failure_at=now(),"
+                    "recovered_at=NULL,review_completed_at=NULL,error=%s WHERE id=%s RETURNING *",
+                    (str(error or "")[:2000], incident["id"]),
+                ).fetchone()
+            incident_id = int(incident["id"])
+            cur.execute(
+                "UPDATE monitor_runs SET payload=jsonb_set(jsonb_set(payload,"
+                "'{requires_provider_recheck}','true'::jsonb,true),'{product_provider_incident_id}',"
+                "to_jsonb(%s::bigint),true) WHERE COALESCE(payload->>'product_review_status','')='ai_pending' "
+                "AND status='success' "
+                "AND COALESCE(finished_at,updated_at) >= %s",
+                (incident_id, incident["started_at"]),
+            )
+            affected = int(cur.execute(
+                "SELECT count(*) AS count FROM monitor_runs WHERE "
+                "COALESCE((payload->>'product_provider_incident_id')::bigint,0)=%s",
+                (incident_id,),
+            ).fetchone()["count"] or 0)
+            cur.execute(
+                "UPDATE product_analysis_incidents SET affected_runs=%s WHERE id=%s",
+                (affected, incident_id),
+            )
+        conn.commit()
+    return {**dict(incident), "affected_runs": affected}
+
+
+def recover_product_provider(provider: str) -> dict[str, Any] | None:
+    """Mark an outage recovered; tagged pending rows remain in the normal queue."""
+    ensure_schema()
+    provider = str(provider or "unknown").strip().casefold()
+    with connection() as conn:
+        with conn.cursor() as cur:
+            incident = cur.execute(
+                "SELECT * FROM product_analysis_incidents WHERE provider=%s AND status='open' "
+                "ORDER BY started_at DESC LIMIT 1 FOR UPDATE",
+                (provider,),
+            ).fetchone()
+            if incident is None:
+                conn.rollback()
+                return None
+            incident_id = int(incident["id"])
+            cur.execute(
+                "UPDATE monitor_runs SET payload=jsonb_set(jsonb_set(payload,"
+                "'{requires_provider_recheck}','true'::jsonb,true),'{product_provider_incident_id}',"
+                "to_jsonb(%s::bigint),true) WHERE COALESCE(payload->>'product_review_status','')='ai_pending' "
+                "AND status='success' "
+                "AND COALESCE(finished_at,updated_at) >= %s",
+                (incident_id, incident["started_at"]),
+            )
+            affected = int(cur.execute(
+                "SELECT count(*) AS count FROM monitor_runs WHERE "
+                "COALESCE((payload->>'product_provider_incident_id')::bigint,0)=%s",
+                (incident_id,),
+            ).fetchone()["count"] or 0)
+            incident = cur.execute(
+                "UPDATE product_analysis_incidents SET status='reviewing',recovered_at=now(),"
+                "affected_runs=%s WHERE id=%s RETURNING *",
+                (affected, incident_id),
+            ).fetchone()
+        conn.commit()
+    return dict(incident)
+
+
+def complete_product_provider_reviews(provider: str) -> dict[str, Any] | None:
+    """Close a recovered incident once all of its tagged rows are reviewed."""
+    ensure_schema()
+    provider = str(provider or "unknown").strip().casefold()
+    with connection() as conn:
+        with conn.cursor() as cur:
+            incident = cur.execute(
+                "SELECT * FROM product_analysis_incidents WHERE provider=%s AND status='reviewing' "
+                "ORDER BY started_at DESC LIMIT 1 FOR UPDATE",
+                (provider,),
+            ).fetchone()
+            if incident is None:
+                conn.rollback()
+                return None
+            pending = cur.execute(
+                "SELECT count(*) AS count FROM monitor_runs WHERE "
+                "status='success' AND COALESCE(payload->>'product_review_status','')='ai_pending' AND "
+                "COALESCE((payload->>'product_provider_incident_id')::bigint,0)=%s",
+                (incident["id"],),
+            ).fetchone()
+            if int(pending["count"] or 0):
+                conn.rollback()
+                return None
+            incident = cur.execute(
+                "UPDATE product_analysis_incidents SET status='completed',review_completed_at=now() "
+                "WHERE id=%s RETURNING *",
+                (incident["id"],),
+            ).fetchone()
+        conn.commit()
+    return dict(incident)
 
 
 def defer_product_analysis(model_id: str, run_id: str, base_delay_seconds: int = 900) -> int:
@@ -1476,6 +1887,11 @@ def update_product_analysis(model_id: str, run_id: str, products: list[dict[str,
                             "product_analysis_model": analysis_model,
                             "product_extraction_method": method,
                             "products": products})
+            if payload.get("requires_provider_recheck"):
+                payload["requires_provider_recheck"] = False
+                payload["provider_recheck_completed_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                )
             normalized_products = [dict(item) for item in products if isinstance(item, dict)]
             brands = sorted({str(item.get("brand") or item.get("brand_name") or "").strip()
                              for item in normalized_products

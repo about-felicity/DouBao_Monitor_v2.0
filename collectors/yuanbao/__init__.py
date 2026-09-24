@@ -1,0 +1,1 @@
+"""Yuanbao collector package."""

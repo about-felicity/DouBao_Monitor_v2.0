@@ -11,7 +11,7 @@ from monitor_core.recommendation_questions import canonical_recommendation_quest
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PLUGINS_ROOT = ROOT / "model_plugins"
+PLUGINS_ROOT = ROOT / "collectors" / "plugins"
 
 
 class ModelPlugin:

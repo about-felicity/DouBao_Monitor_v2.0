@@ -6,6 +6,13 @@ doubao_mumu_controller/doubao_lan_receiver_config.json
 doubao_mumu_controller/lan_receiver_queue/
 doubao_mumu_controller/lan_upload_outbox/
 doubao_mumu_controller/lan_upload_sent/
+collectors/doubao/mumu/doubao_api_keys.env
+collectors/doubao/mumu/doubao_lan_pairing.json
+collectors/doubao/mumu/doubao_remote_sync_config.json
+collectors/doubao/mumu/doubao_lan_receiver_config.json
+collectors/doubao/mumu/lan_receiver_queue/
+collectors/doubao/mumu/lan_upload_outbox/
+collectors/doubao/mumu/lan_upload_sent/
 **/.env
 **/*cookie*
 **/*session*
@@ -52,6 +59,24 @@ doubao_mumu_controller/portable_runtime/
 /yuanbao_monitor/create_bat.py
 /yuanbao_monitor/find_drawer*.py
 /yuanbao_monitor/fix_bat*.py
+/collectors/yuanbao/yuanbao_results.jsonl
+/collectors/yuanbao/yuanbao_state/
+/collectors/yuanbao/yuanbao_diagnostics/
+/collectors/yuanbao/web_results/
+/collectors/yuanbao/yuanbao_browser_assignments.json
+/collectors/yuanbao/snapshot_*.html
+/collectors/wenxin/wenxin_results.jsonl
+/collectors/wenxin/wenxin_state.json
+/collectors/wenxin/dashboard.json
+/collectors/deepseek/chrome/data/
+/collectors/deepseek/legacy_app/deepseek_results.jsonl
+/collectors/deepseek/legacy_app/deepseek_state.json
+/collectors/deepseek/legacy_app/dashboard.json
+/collectors/quark/data/
+/dashboard/frontend/public/data/dashboard.json
+/dashboard/frontend/.next/
+/dashboard/frontend/dist/
+/dashboard/frontend/.wrangler/
 
 # Generated deploy bundles and dependency trees
 doubao_standalone_deploy/
@@ -75,6 +100,12 @@ doubao_mumu_controller/*_results.json
 doubao_mumu_controller/doubao_panel_readiness.json
 doubao_mumu_controller/doubao_mumu_web_diagnostics/
 doubao_mumu_controller/_test_artifacts/
+collectors/doubao/mumu/*.jsonl
+collectors/doubao/mumu/*_state.json
+collectors/doubao/mumu/*_results.json
+collectors/doubao/mumu/doubao_panel_readiness.json
+collectors/doubao/mumu/doubao_mumu_web_diagnostics/
+collectors/doubao/mumu/_test_artifacts/
 
 # Historical and repair backups
 data_cleanup_backups/
@@ -96,6 +127,12 @@ deepseek*
 !deepseek_monitor/**
 !deepseek_chrome/
 !deepseek_chrome/**
+!collectors/
+!collectors/deepseek/
+!collectors/deepseek/**
+!collectors/plugins/
+!collectors/plugins/deepseek/
+!collectors/plugins/deepseek/**
 !/test_deepseek_pipeline.py
 !/打开DeepSeek远端面板.bat
 !model_plugins/
@@ -114,6 +151,9 @@ deepseek*
 /afu_monitor/afu_results.jsonl
 /afu_monitor/afu_state.json
 /afu_monitor/dashboard.json
+/legacy/afu_monitor/afu_results.jsonl
+/legacy/afu_monitor/afu_state.json
+/legacy/afu_monitor/dashboard.json
 image_pro/
 mumu-python-api/
 outputs/
@@ -148,3 +188,22 @@ doubao_api_check.json
 # Generated packages contain the local callback token
 /remote_model_deploy/
 /remote_model_deploy_three_models/
+
+# Retired local collectors are not part of the three-model mainline
+/collectors/quark/
+/collectors/plugins/afu/
+/collectors/plugins/doubao/
+/collectors/plugins/quark/
+
+# Runtime remnants left by the pre-reorganization collectors
+/collectors/doubao/
+/collectors/deepseek/**/__pycache__/
+/collectors/deepseek/legacy_app/chrome_profile/
+/collectors/deepseek/legacy_app/dashboard.json
+/collectors/deepseek/legacy_app/deepseek_brand_ai_cache.json
+/collectors/deepseek/legacy_app/deepseek_results.jsonl
+/collectors/deepseek/legacy_app/deepseek_state.json
+/collectors/deepseek/legacy_app/*.log
+/deepseek_chrome/
+/wenxin_monitor/
+/yuanbao_monitor/

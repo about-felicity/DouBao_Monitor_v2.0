@@ -1,0 +1,1 @@
+"""Wenxin collector package."""

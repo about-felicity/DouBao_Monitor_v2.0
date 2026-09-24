@@ -159,7 +159,7 @@ def deterministic_review(answer: str, question: str, knowledge: AnalysisKnowledg
 
 def compact_model_text(answer: str, question: str, known: list[dict[str, Any]] | None = None) -> str:
     """Keep recommendation-bearing lines while dropping verbose usage prose."""
-    import save_doubao_refs as saver
+    from legacy.doubao.core import save_doubao_refs as saver
 
     text = clean_text(saver.strip_reference_prefix(answer))
     if len(text) <= 1800:
@@ -296,7 +296,7 @@ def batch_model_review(items: list[dict[str, Any]], knowledge: AnalysisKnowledge
     """Review several ambiguous answers in one compact DeepSeek request."""
     if not items:
         return {}, {"calls": 0}
-    import save_doubao_refs as saver
+    from legacy.doubao.core import save_doubao_refs as saver
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -329,6 +329,7 @@ def batch_model_review(items: list[dict[str, Any]], knowledge: AnalysisKnowledge
             "不推荐、不建议、避雷、排除、慎选或仅作反例的商品绝不能返回。",
             "同一商品正文与卡片重复时只保留一次；按正文首次出现排序。",
             "evidence必须是该条text中的最短原文；品牌不确定就留空。",
+            "product_name必须逐字抄录原文商品名；若原文在“代表产品/参考产品/方向”中只明确列出品牌名，可原样返回该品牌名，绝不能擅自补写品类词或型号。",
             "不要把黄金浓度、黄金组合等描述词当成品牌。",
             "每个输入id都必须返回；确无明确商品才返回空products。",
         ],
@@ -367,6 +368,56 @@ def batch_model_review(items: list[dict[str, Any]], knowledge: AnalysisKnowledge
     }
     results: dict[str, list[dict[str, Any]]] = {}
     rejected: dict[str, str] = {}
+
+    def explicit_grounded_fallback(
+        answer: str,
+        question: str,
+        model_products: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Recover literal product headings when a paid response omits one.
+
+        This remains evidence-only: every accepted item must come from an
+        explicit answer heading (or an unnumbered branded product line), pass
+        the question-category filter and survive the normal grounding validator.
+        Generic advice and comparison prose are deliberately excluded.
+        """
+        candidates: list[dict[str, Any]] = []
+        # Keep individually valid paid-model products even when a different
+        # item caused the batch-level completeness/grounding check to fail.
+        for product in model_products or []:
+            try:
+                saver.validate_grounded_ai_products(answer, [product])
+            except ValueError:
+                continue
+            candidates.append(product)
+        candidates.extend(saver.extract_products(answer) or [])
+        candidates.extend(saver.extract_structured_product_headings(answer, question) or [])
+        safe: list[dict[str, Any]] = []
+        noise_markers = ("效果排序", "标准：", "可以选", "优先选", "不要选")
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            evidence = clean_text(candidate.get("evidence"))
+            brand = clean_text(candidate.get("brand_name") or candidate.get("brand"))
+            name = clean_text(candidate.get("product_name") or candidate.get("name"))
+            numbered = bool(re.match(r"^\s*\d{1,2}\s*[.、）)]", evidence))
+            branded_line = bool(brand and compact(brand) != compact(name))
+            if not numbered and (not branded_line or any(marker in evidence for marker in noise_markers)):
+                continue
+            key = compact(name)
+            if key and not any(equivalent_name(key, compact(
+                item.get("product_name") or item.get("name")
+            )) for item in safe):
+                safe.append(candidate)
+        products = saver.normalize_ai_products({"products": safe})
+        products = saver.filter_products_for_question(question, products)
+        products = saver.ground_product_brands(answer, products)
+        products = merge_explicit_owned_products(answer, question, products)
+        if not products:
+            return None
+        saver.validate_grounded_ai_products(answer, products)
+        return products
+
     for item_id, source in by_id.items():
         raw = raw_by_id.get(item_id)
         if raw is None:
@@ -391,8 +442,14 @@ def batch_model_review(items: list[dict[str, Any]], knowledge: AnalysisKnowledge
                     products.append(candidate)
             products = saver.ground_product_brands(answer, products)
             products = merge_explicit_owned_products(answer, question, products)
-            products = saver.ensure_complete_ai_products(answer, raw, products)
-            saver.validate_grounded_ai_products(answer, products)
+            try:
+                products = saver.ensure_complete_ai_products(answer, raw, products)
+                saver.validate_grounded_ai_products(answer, products)
+            except ValueError:
+                recovered = explicit_grounded_fallback(answer, question, products)
+                if recovered is None:
+                    raise
+                products = recovered
             if not products and not saver.credible_empty_product_result(answer):
                 raise ValueError("implausible empty product result")
             results[item_id] = products

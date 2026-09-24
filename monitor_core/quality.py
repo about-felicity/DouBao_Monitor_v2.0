@@ -28,6 +28,20 @@ def invalid_answer_reason(value: str, *, minimum_length: int = 12) -> str:
         return "模型返回系统或服务异常"
     if any(normalize_text(marker) in compact for marker in REFUSAL_MARKERS):
         return "模型拒绝或无法完成产品推荐"
+    # Quark's page-level fallback can capture the recent-conversation sidebar
+    # plus the prompt/model footer instead of the assistant message. It looks
+    # long and contains many product keywords, so ordinary topic checks accept
+    # it and create cross-question false positives.
+    sidebar_recommendations = len(re.findall(r"(?:^|\n)[^\n]{0,8}推荐[^\n]{0,36}", text))
+    if (
+        "近期对话" in text
+        and (
+            text.lstrip().startswith("近期对话")
+            or (text.count("新对话") >= 2 and "内容由千问AI生成" in text)
+        )
+        and sidebar_recommendations >= 5
+    ):
+        return "只抓到夸克近期对话侧栏和页面页尾，未抓到当前回答正文"
     # Yuanbao can leave only its recommendation chips / download footer in the
     # captured message container while the real answer failed to hydrate.  The
     # old minimum-length check accepted that shell as a successful answer.
