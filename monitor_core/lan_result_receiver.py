@@ -232,6 +232,12 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
             "source_count": len(compact_sources),
             "expected_source_count": expected_source_count,
             "source_capture_complete": successful and capture_complete and len(compact_sources) >= expected_source_count,
+            "source_list_present": record.get("source_list_present"),
+            "capture_warning": str(record.get("capture_warning") or ""),
+            "card_available": record.get("card_available"),
+            "surface_attempt": int(record.get("surface_attempt") or 0),
+            "daily_surface_target": int(record.get("daily_surface_target") or 0),
+            "answer_fingerprint": str(record.get("answer_fingerprint") or ""),
             "missing_source_links": sum(not item["href"] for item in compact_sources),
             "missing_source_titles": sum(not item["title"] for item in compact_sources),
             "recommendation_question": bool(canonical_recommendation_question(question)),
@@ -247,12 +253,17 @@ def result_receipt(model: str, request_id: str, value: dict[str, Any], record: d
 
 def analyze_record_products(record: dict[str, Any]) -> None:
     question = str(record.get("question") or record.get("prompt") or "").strip()
-    if not canonical_recommendation_question(question):
+    canonical_question = canonical_recommendation_question(question)
+    if not canonical_question:
         record["products"] = []
         record["product_review_status"] = "not_required"
         record["product_extraction_method"] = "not_required"
         record["product_analysis_model"] = ""
         return
+    # Collectors may send the literal prompt (推荐一款X), a generated chat title,
+    # or the canonical bucket (X推荐). Persist one stable value so the daily
+    # board never splits the same product category into duplicate rows.
+    record["question"] = canonical_question
     answer = str(record.get("web_body") or record.get("reply") or record.get("answer") or "").strip()
     if not answer:
         record["products"] = []

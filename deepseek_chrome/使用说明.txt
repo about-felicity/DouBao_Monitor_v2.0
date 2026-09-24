@@ -1,0 +1,14 @@
+1. 双击“一键启动DeepSeek监控.cmd”启动本机接收器。
+2. Chrome 打开 chrome://extensions/，开启开发者模式。
+3. 加载已解压的扩展程序：选择 deepseek_chrome\extension。
+4. 打开并登录 https://chat.deepseek.com/，刷新页面。
+5. 点击“DeepSeek 对话监控”，先用 1 个问题、1 轮测试。
+
+默认固定间隔 360 秒（6 分钟）。
+默认 21 个问题、每题每天 2 轮；完整一轮结束后按 24 小时周期自动继续。
+每一轮都会使用新会话，并自动开启“智能搜索”。
+检测到访问频繁或验证提示时会自动暂停，不会持续重试。
+
+结果：data\deepseek_results.jsonl
+逐轮正文与信源：data\results\<run_id>\
+日志：data\deepseek_monitor.log

@@ -31,7 +31,7 @@ class Plugin(ModelPlugin):
         runner_mode = "cross" if mode == "interleaved" else "sequential"
         command = [sys.executable, str(self.runner), "--questions-file", str(self.questions),
                 "--rounds-per-question", str(rounds),
-                "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "0",
+                "--mode", runner_mode, "--resume", "--collect-web", "--max-retries", "3", "--max-web-retries", "3",
                 "--retry-wait", "90", "--wait", "10", "--random-wait", "20",
                 "--results", str(self.collector_results)]
         if options.get("restart_completed"):

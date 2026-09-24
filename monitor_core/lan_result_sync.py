@@ -256,9 +256,114 @@ def flush(model: str, max_items: int = 100) -> dict[str, Any]:
             "pending": len(list(pending.glob("*.json"))), "last_error": error}
 
 
+def _collector_result_paths(model: str) -> tuple[Path, ...]:
+    """Return the local archives a collector may be writing for this model."""
+    worker_root = ROOT / "runtime" / "remote_workers"
+    candidates = (
+        ROOT / "runtime" / "remote_workers" / f"{model}_collector_results.jsonl",
+        ROOT / f"{model}_monitor" / f"{model}_results.jsonl",
+        *sorted(worker_root.glob(f"{model}_collector_results*.jsonl")),
+    )
+    return tuple(dict.fromkeys(candidates))
+
+
+def prune_collector_results(
+    model: str,
+    path: Path,
+    *,
+    retention_days: int | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Remove only records whose successful upload receipt is over the limit.
+
+    The outbox is authoritative for unsent work. A JSONL line without a valid
+    acknowledgement is always retained, regardless of its age. The source file
+    is replaced only when it stayed unchanged for the whole compaction, so an
+    active collector cannot lose a concurrently appended line.
+    """
+    path = Path(path)
+    config = _load_config(model)
+    days = max(1, min(365, int(
+        retention_days if retention_days is not None
+        else config.get("local_retention_days") or 1
+    )))
+    root = ROOT / "runtime" / "remote_workers" / model
+    state_path = root / f"local_retention_{path.name}.json"
+    now = time.time()
+    if not force:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            if now - float(state.get("last_checked_at") or 0) < 3600:
+                return {"checked": False, "removed": 0, "bytes_freed": 0, "retention_days": days}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    if not path.is_file():
+        _atomic_json(state_path, {"last_checked_at": now, "retention_days": days})
+        return {"checked": True, "removed": 0, "bytes_freed": 0, "retention_days": days}
+
+    sent = root / "sent"
+    sent.mkdir(parents=True, exist_ok=True)
+    cutoff = now - days * 86400
+    before = path.stat()
+    handle, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".retention.tmp", dir=path.parent)
+    os.close(handle)
+    temporary = Path(temporary_name)
+    removed = 0
+    dropped_receipts: list[Path] = []
+    device = str(config.get("device_name") or socket.gethostname()).strip()
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as source, temporary.open(
+            "w", encoding="utf-8", newline=""
+        ) as target:
+            for line in source:
+                keep = True
+                try:
+                    record = json.loads(line)
+                    stamped = stamp_record_model(model, record)
+                    receipt_path = sent / f"{_request_id(model, stamped, device)}.json"
+                    if receipt_path.is_file():
+                        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+                        if float(receipt.get("uploaded_at") or 0) <= cutoff:
+                            keep = False
+                            dropped_receipts.append(receipt_path)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    # Malformed or unprovable records are evidence, not trash.
+                    keep = True
+                if keep:
+                    target.write(line if line.endswith("\n") else line + "\n")
+                else:
+                    removed += 1
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return {"checked": False, "removed": 0, "bytes_freed": 0,
+                    "retention_days": days, "reason": "collector_file_changed"}
+        if removed:
+            os.replace(temporary, path)
+            for receipt_path in dropped_receipts:
+                receipt_path.unlink(missing_ok=True)
+        bytes_freed = max(0, before.st_size - path.stat().st_size)
+        _atomic_json(state_path, {
+            "last_checked_at": now,
+            "retention_days": days,
+            "last_removed": removed,
+            "last_bytes_freed": bytes_freed,
+            "path": str(path),
+        })
+        return {"checked": True, "removed": removed, "bytes_freed": bytes_freed,
+                "retention_days": days}
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _watch(model: str) -> None:
     while True:
         flush(model)
+        for result_path in _collector_result_paths(model):
+            try:
+                prune_collector_results(model, result_path)
+            except Exception:
+                # Retention must never interrupt durable upload retries.
+                pass
         time.sleep(5)
 
 

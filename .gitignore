@@ -11,6 +11,7 @@ doubao_mumu_controller/lan_upload_sent/
 **/*session*
 **/*credential*
 **/*token*.json
+/local_server_config.txt
 
 # Browser profiles and runtime state
 runtime/
@@ -93,6 +94,8 @@ deepseek*
 *deepseek*
 !deepseek_monitor/
 !deepseek_monitor/**
+!deepseek_chrome/
+!deepseek_chrome/**
 !/test_deepseek_pipeline.py
 !/打开DeepSeek远端面板.bat
 !model_plugins/

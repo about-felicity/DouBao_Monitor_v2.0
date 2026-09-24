@@ -1,0 +1,167 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>extension self test</title></head>
+<body><pre id="result">RUNNING</pre>
+<script>
+const extensionStorage = {};
+globalThis.chrome = {
+  runtime: { lastError: null, getManifest: () => ({version:'test'}), sendMessage: (_p, cb) => cb({ok:true,job:null}), onMessage: {addListener(){}}, onInstalled: {addListener(){}} },
+  storage: { local: {
+    get: (keys, cb) => cb(Object.fromEntries((Array.isArray(keys) ? keys : Object.keys(extensionStorage)).filter(key => key in extensionStorage).map(key => [key, extensionStorage[key]]))),
+    set: (value, cb) => { Object.assign(extensionStorage, value); if (cb) cb(); },
+    remove: (keys, cb) => { for (const key of (Array.isArray(keys) ? keys : [keys])) delete extensionStorage[key]; if (cb) cb(); }
+  } },
+  tabs: { query: (_q, cb) => cb([]), sendMessage: (_id, _p, cb) => cb({ok:true}), create: async () => ({id:1}), update: async (_id, value) => value },
+  scripting: { executeScript: async () => [] },
+  action: { setBadgeBackgroundColor: async()=>{}, setBadgeText: async()=>{} },
+  alarms: { created: [], create(name, options){ this.created.push({name, options}); }, clear: async()=>true, onAlarm: {addListener(){}} }
+};
+</script>
+<script src="../extension/core.js"></script>
+<script src="../extension/injected.js"></script>
+<script src="../extension/content.js"></script>
+<script src="../extension/background.js"></script>
+<script>
+window.addEventListener('load', async () => {
+  const checks = [];
+  const check = (name, value) => { if (!value) throw new Error(name); checks.push(name); };
+  try {
+    const C = DeepSeekMonitorCore;
+    const schedule = C.buildSchedule(['问题A','问题B'], 2, 'interleaved');
+    check('schedule length', schedule.length === 4);
+    check('schedule order', schedule.map(x => x.prompt).join(',') === '问题A,问题B,问题A,问题B');
+    check('conversation route recognition', C.conversationIdFromUrl('https://chat.deepseek.com/a/chat/s/abc-123?x=1') === 'abc-123');
+    check('fresh chat has no conversation id', C.conversationIdFromUrl('https://chat.deepseek.com/') === '');
+    const sources = C.dedupeSources([
+      {url:'https://example.com/a#x',title:'短',via:'dom'},
+      {url:'https://example.com/a',title:'更完整的标题',via:'network'},
+      {url:'https://chat.deepseek.com/internal',title:'内部'}
+    ]);
+    check('source dedupe', sources.length === 1 && sources[0].title === '更完整的标题');
+    const titled = C.dedupeSources([
+      {url:'https://m.39.net/a.html',title:'m.39.net',via:'network'},
+      {url:'https://m.39.net/a.html',title:'这是文章的真实标题',via:'dom'}
+    ]);
+    check('real source title preferred', titled[0].title === '这是文章的真实标题');
+    check('domain is not title', C.dedupeSources([{url:'https://toutiao.com/a',title:'toutiao.com'}])[0].title === '标题未获取');
+    const networkSourcesPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('network title parser timeout')), 2000);
+      window.addEventListener('deepseek-monitor:sources', (event) => {
+        const item = (event.detail?.items || []).find(value => value.url === 'https://video.example.com/watch/1');
+        if (item) { clearTimeout(timer); resolve(item); }
+      });
+    });
+    await fetch('data:application/json,' + encodeURIComponent(JSON.stringify({referenceListArr:[{videoTitle:'真实视频标题',articleUrl:'https://video.example.com/watch/1'}]})));
+    const networkSource = await networkSourcesPromise;
+    check('network article/video title extraction', networkSource.title === '真实视频标题');
+    check('redirect unwrap', C.unwrapUrl('https://deepseek.cn/go?url=https%3A%2F%2Fexample.org%2Fx').startsWith('https://example.org/x'));
+    const picked = C.chooseAnswerCandidate([
+      {text:'推荐一款染发剂',afterPrompt:false,isMessageLike:true},
+      {text:'这是模型回答正文，包含足够多的测试字符用于完成候选选择。',afterPrompt:true,hasCopyAction:true,isMessageLike:true}
+    ], '推荐一款染发剂');
+    check('answer candidate', picked && picked.text.startsWith('这是模型回答正文'));
+    const cleaned = C.cleanAnswerText('正文内容足够长，表示回答已经完成。\n02:05\n视频卡片\n作者\n9篇来源', '');
+    check('answer tail clean', cleaned === '正文内容足够长，表示回答已经完成。');
+    check('DeepSeek citation placeholder clean', C.cleanAnswerText('第一段正文-\n1\n\n第二段正文-\n12\n', '') === '第一段正文\n\n第二段正文');
+    check('DeepSeek smart-search shell clean', C.cleanAnswerText(
+      'Found 12 web pages\n\n回答正文第一段。\n\n价格 298元/100ml-\n知乎\n\n。\n\n回答正文第二段。\n\n12 web pages',
+      ''
+    ) === '回答正文第一段。\n\n价格 298元/100ml。\n\n回答正文第二段。');
+    check('middle source wording preserved', C.cleanAnswerText(
+      '回答开头。\n\n我实际阅读了 12 web pages 后再进行比较。\n\n回答结尾。', ''
+    ).includes('12 web pages'));
+    check('system timeout detection', C.detectTransientFailure('抱歉，系统超时，请稍后重试。') === '系统超时');
+    check('busy detection', C.detectTransientFailure('当前服务繁忙，请稍后再试') === '服务繁忙');
+    check('answer dynamic tail stability', C.answerTextEquivalent(
+      '这是已经完成的回答正文，前面内容保持不变。'.repeat(8) + '来源卡片A',
+      '这是已经完成的回答正文，前面内容保持不变。'.repeat(8) + '来源卡片B'
+    ));
+    check('answer growth is not stable', !C.answerTextEquivalent(
+      '这是仍在生成的回答正文。'.repeat(8),
+      '这是仍在生成的回答正文。'.repeat(8) + '后续新增了很多正文内容，说明模型仍然正在生成回答。'.repeat(5)
+    ));
+    const selected = C.selectCitationSources([
+      {url:'https://s2.zimgs.cn/ims?a=1',title:'图片'},
+      {url:'https://example.com/a',title:'来源一'},
+      {url:'https://example.org/b',title:'来源二'},
+      {url:'https://extra.example.net/c',title:'额外卡片'}
+    ], 2);
+    check('citation source boundary', selected.length === 2 && selected[0].url.includes('example.com'));
+    check('english web pages source count', C.sourceSummaryCount('11 web pages') === 11);
+    check('english singular web page source count', C.sourceSummaryCount('1 web page') === 1);
+    check('chinese web pages source count', C.sourceSummaryCount('11 个网页') === 11);
+    const answerSentence = '看重肤感与效率：可以优先考虑质地轻薄的水感卸妆油，减少摩擦。';
+    check('answer sentence is rejected as source title', C.sourceTitleIsAnswerText(answerSentence + '-', answerSentence));
+    check('answer-derived title is sanitized', C.sanitizeSourceTitles([{url: 'https://example.com/a', title: answerSentence + '-'}], answerSentence)[0].title === '标题未获取');
+    const [popupJs, popupHtml, contentJs] = await Promise.all([
+      fetch('../extension/popup.js').then(response => response.text()),
+      fetch('../extension/popup.html').then(response => response.text()),
+      fetch('../extension/content.js').then(response => response.text())
+    ]);
+    new Function(popupJs);
+    check('popup syntax', popupJs.includes('GET_ALL_RESULTS') && popupJs.includes('GET_EVENT_LOGS'));
+    check('human readable logs', popupJs.includes('模型回答已完成并保持稳定') && popupJs.includes('查看技术详情'));
+    check('remote sync logs', popupJs.includes('远端回传已经启用') && popupJs.includes('结果仍保存在本机') && popupJs.includes('回传主机连接正常'));
+    const backgroundJs = await fetch('../extension/background.js').then(response => response.text());
+    check('all questions default', (backgroundJs.match(/推荐一款/g) || []).length >= 21 && backgroundJs.includes('rounds: 2'));
+    check('persistent six minute send slot', backgroundJs.includes('next.intervalMinSeconds = 360') && backgroundJs.includes('nextAllowedSendAt') && contentJs.includes('CLAIM_SEND_SLOT'));
+    check('daily scheduling', backgroundJs.includes('deepseek-daily-run') && backgroundJs.includes('nextDailyTime') && popupHtml.includes('dailyEnabled'));
+    check('risk control pause', contentJs.includes('risk_control_paused') && contentJs.includes('error.pauseJob = true'));
+    check('smart search required', contentJs.includes('ensureSmartSearch') && contentJs.includes('智能搜索') && contentJs.includes('web search'));
+    check('upgrade stops stale jobs', backgroundJs.includes('oldVersion < 9') && backgroundJs.includes('安全停止旧任务'));
+    check('DeepSeek source card title', contentJs.includes('search-view-card__title'));
+    check('startup migration', backgroundJs.includes('const initialization = initializeStorage()') && backgroundJs.includes('await initialization'));
+    check('lightweight context polling', backgroundJs.includes('RECENT_RESULT_LIMIT') && !backgroundJs.includes('storageGet(["settings", "job", "results"'));
+    check('bounded extension storage', backgroundJs.includes('recentResults: results.slice(-RECENT_RESULT_LIMIT)') && backgroundJs.includes('recentEventLogs: logs.slice(-RECENT_EVENT_LIMIT)'));
+    check('network timeout', backgroundJs.includes('fetchWithTimeout') && backgroundJs.includes('AbortController'));
+    await initialization;
+    extensionStorage.recentResults = Array.from({length: 200}, (_, index) => ({result_id: `old-${index}`}));
+    extensionStorage.recentResultIds = extensionStorage.recentResults.map(item => item.result_id);
+    extensionStorage.resultCount = 2637;
+    extensionStorage.pendingSync = [];
+    extensionStorage.job = {cursor: 0, schedule: [{globalIndex: 0}], inFlight: {globalIndex: 0}, state: 'running'};
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true})});
+    await storeResult({result_id: 'new-result', round: 1});
+    globalThis.fetch = originalFetch;
+    check('bounded result write behavior', extensionStorage.recentResults.length === 200 && extensionStorage.resultCount === 2638 && extensionStorage.job.cursor === 1);
+    check('final result schedules next daily run', chrome.alarms.created.some(item => item.name === 'deepseek-daily-run') && Number(extensionStorage.nextDailyRunAt) > Date.now());
+    check('manual question recovery', popupJs.includes('loadAllQuestions') && popupJs.includes('已载入全部21题'));
+    check('automatic round retry', popupJs.includes('本轮将自动重试') && popupHtml.includes('maxRetries'));
+    check('answer timeout fallback', popupJs.includes('等待超时，已保留正文') && popupJs.includes('不再重复提问'));
+    check('submitted answer waits full timeout', contentJs.includes('已等待完整的回答超时时间') && !contentJs.includes('DeepSeek45秒内没有生成任何可识别的回答'));
+    check('submitted conversation preserved', contentJs.includes('preserveSubmission') && contentJs.includes('submitted_conversation_restore'));
+    check('failed round continues', popupJs.includes('本轮失败，继续后续任务') && popupJs.includes('不再停止整个任务'));
+    check('strict composer geometry', contentJs.includes('inMainArea') && contentJs.includes('horizontallyNear') && contentJs.includes('verticallyNear'));
+    check('unconfirmed send auto retry', contentJs.includes('DM_SUBMIT_UNCONFIRMED') && contentJs.includes('error.reloadPage = true') && popupJs.includes('发送未确认，准备自动恢复'));
+    check('route alone does not confirm send', !contentJs.includes('method: "new_conversation_url"') && contentJs.includes('conversationCreated && generationBusy()'));
+    check('fresh conversation hard barrier', contentJs.includes('new_chat_verified') && contentJs.includes('DM_NEW_CHAT_NOT_FRESH') && contentJs.includes('old_messages_visible'));
+    check('silent submission waits for next slot without synthetic cooldown', contentJs.includes('DM_SILENT_SUBMISSION') && contentJs.includes('下一个6分钟发送窗口') && !contentJs.includes('error.cooldownSeconds ='));
+    check('six minute fixed interval', backgroundJs.includes('intervalMinSeconds: 360') && backgroundJs.includes('intervalMaxSeconds: 360') && popupHtml.includes('固定间隔 6 分钟'));
+    check('safe unpacked extension activation', popupJs.includes('EXPECTED_EXTENSION_VERSION = "0.2.22"') && popupJs.includes('activationRequested') && popupJs.includes('history.replaceState') && popupJs.includes('chrome.runtime.reload()'));
+    check('background tab alarm wake', backgroundJs.includes('deepseek-runner-wake') && backgroundJs.includes('deepseek-runner-watchdog') && backgroundJs.includes('SCHEDULE_RUNNER_WAKE') && contentJs.includes('wait_mode: "extension_alarm"'));
+    check('upgrade returns existing DeepSeek tab to foreground', backgroundJs.includes('autoDiscardable: false') && backgroundJs.includes('chrome.windows.update') && backgroundJs.includes('chrome.tabs.reload(target.id)'));
+    check('upgrade releases stale tab ownership', backgroundJs.includes('previousOwnerTabId') && backgroundJs.includes('ownerTabId: null'));
+    check('fresh chat is created only when send slot is ready', contentJs.indexOf('await waitForSendSlot()') < contentJs.indexOf('const composer = await createNewChat();'));
+    check('confirmed submissions are never re-asked', contentJs.includes('DM_SUBMISSION_LOST') && contentJs.includes('DM_GENERATION_NOT_STARTED') && contentJs.includes('promptStableSince') && contentJs.includes('error.preserveSubmission = true') && contentJs.includes('const preserveSubmission = Boolean(inFlight.phase === "submitted")'));
+    check('hydration recovery waits full timeout after first reload', contentJs.includes('recoveryAttempt === 0') && contentJs.includes('firstPassHydrationMs') && contentJs.includes('waitForAnswer(item.prompt, settings, submittedAt || Date.now(), retryCount)'));
+    check('confirmed empty conversation is safely resent', contentJs.includes('DM_EMPTY_CONVERSATION') && contentJs.includes('emptyRecoveryMs') && contentJs.includes('error?.preserveSubmission !== false'));
+    check('affected active rounds are automatically requeued', backgroundJs.includes('recoveryOfRound') && backgroundJs.includes('DM_SUBMISSION_LOST') && backgroundJs.includes('recoveryRoundsAdded'));
+    check('ambiguous created conversation becomes capture-only', contentJs.includes('new_conversation_ambiguous') && contentJs.includes('confirmed: true'));
+    check('network sources reset after send-slot wait', contentJs.indexOf('await waitForSendSlot()') < contentJs.indexOf('window.dispatchEvent(new CustomEvent("deepseek-monitor:reset"))'));
+    check('source drawer scrolls into view before click', contentJs.includes('scrollSourceControlIntoView') && contentJs.indexOf('await scrollSourceControlIntoView(control);') < contentJs.indexOf('control.click();'));
+    check('source drawer has right-side fallback detection', contentJs.includes("box.left < innerWidth * 0.58") && contentJs.includes('source_drawer_open'));
+    check('source drawer prefers compact exact control', contentJs.includes('a.label.length - b.label.length') && contentJs.includes('targetLabel.length <= 100'));
+    check('incomplete sources retried', contentJs.includes('source_capture_retry') && contentJs.includes('sourcePass <= 3'));
+    check('source summary opens sidebar', contentJs.includes('sourceSummaryControls') && contentJs.includes('Search results'));
+    check('source sidebar scrolls', contentJs.includes('collectSearchResultsPanel') && contentJs.includes('scrollTop'));
+    check('source failure preserves answer', contentJs.includes('source_capture_degraded'));
+    const popupDocument = new DOMParser().parseFromString(popupHtml, 'text/html');
+    const referencedIds = [...popupJs.matchAll(/\$\("([^"]+)"\)/g)].map(match => match[1]);
+    check('popup element ids', referencedIds.every(id => popupDocument.getElementById(id)));
+    check('no web dashboard', !popupHtml.includes('dashboard'));
+    document.querySelector('#result').textContent = 'ALL_PASS ' + checks.join(' | ');
+  } catch (error) {
+    document.querySelector('#result').textContent = 'FAILED ' + error.stack;
+  }
+});
+</script></body></html>

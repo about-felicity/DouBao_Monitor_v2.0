@@ -7,6 +7,7 @@ JSONL 结果和失败诊断。控制面板也通过这个入口启动任务。
 from __future__ import annotations
 
 import argparse
+import math
 import csv
 import hashlib
 import json
@@ -252,6 +253,22 @@ def safe_serial(serial: str) -> str:
     return serial.replace(":", "_").replace(".", "_")
 
 
+def acceptable_partial_web_result(question: str, result: dict[str, Any], minimum_ratio: float = 0.9) -> bool:
+    """Allow a nearly complete citation set after bounded web retries."""
+    error = str(result.get("error") or "")
+    if not error.startswith("incomplete_sources:"):
+        return False
+    body = str(result.get("body") or "")
+    if answer_quality_reason(question, body):
+        return False
+    sources = list(result.get("sources") or [])
+    expected = max(0, int(result.get("expected_source_count") or 0))
+    if not sources or expected <= 0:
+        return False
+    required = max(1, math.ceil(expected * max(0.5, min(1.0, float(minimum_ratio)))))
+    return len(sources) >= required
+
+
 def load_browser_assignments() -> dict[str, dict[str, Any]]:
     try:
         value = json.loads(BROWSER_MAP_PATH.read_text(encoding="utf-8-sig"))
@@ -329,6 +346,7 @@ def worker(
         from selenium.common.exceptions import WebDriverException
 
         web_attempt = 0
+        last_result: dict[str, Any] = {}
         while not STOP_EVENT.is_set() and not cancel_event.is_set():
             web_attempt += 1
             try:
@@ -353,6 +371,7 @@ def worker(
                     extra={"serial": serial, "round": round_index + 1},
                     previous_conversation=previous_reference,
                 )
+                last_result = result
                 quality_reason = ""
                 if not result.get("error"):
                     quality_reason = answer_quality_reason(
@@ -361,6 +380,27 @@ def worker(
                     )
                 if not result.get("error") and not quality_reason:
                     return result
+                # A source drawer can occasionally omit one or two links even
+                # though the answer body and almost every advertised source
+                # have already been captured.  Retrying that page used to keep
+                # the device worker parked on its web checkpoint for minutes,
+                # which made a healthy multi-device run look like only one
+                # emulator was being controlled.  Accept high-coverage partial
+                # captures immediately; the record still carries an explicit
+                # warning so downstream consumers know it was not 100%.
+                if acceptable_partial_web_result(target_question, result):
+                    original_error = str(result.get("error") or "")
+                    accepted = dict(result)
+                    accepted["error"] = ""
+                    accepted["source_capture_complete"] = False
+                    accepted["capture_warning"] = f"partial_sources:{original_error}"
+                    logger.warning(
+                        "[%s] 网页已取得 %d/%d 条信源（>=90%%），立即保存并释放该实例继续下一题",
+                        serial,
+                        len(accepted.get("sources") or []),
+                        int(accepted.get("expected_source_count") or 0),
+                    )
+                    return accepted
                 failure_text = "\n".join((
                     str(result.get("error") or ""),
                     str(result.get("body") or ""),
@@ -382,8 +422,24 @@ def worker(
                 ):
                     logger.info("[%s] driver 会话失效，下次将重建 collector", serial)
                     collector = None
-                if args.max_retries and web_attempt >= args.max_retries:
-                    raise RuntimeError(f"网页抓取达到最大重试次数：{web_exc}") from web_exc
+                if args.max_web_retries and web_attempt >= args.max_web_retries:
+                    if acceptable_partial_web_result(target_question, last_result):
+                        original_error = str(last_result.get("error") or "")
+                        accepted = dict(last_result)
+                        accepted["error"] = ""
+                        accepted["source_capture_complete"] = False
+                        accepted["capture_warning"] = f"bounded_partial_sources:{original_error}"
+                        logger.warning(
+                            "[%s] 网页信源补抓达到 %d 次，已取得 %d/%d 条（>=90%%），保存部分完整结果并继续下一题",
+                            serial,
+                            web_attempt,
+                            len(accepted.get("sources") or []),
+                            int(accepted.get("expected_source_count") or 0),
+                        )
+                        return accepted
+                    raise YuanbaoReaskRequired(
+                        f"网页信源补抓达到 {web_attempt} 次且不足90%，返回模拟器重新提问本轮：{web_exc}"
+                    ) from web_exc
                 logger.info("[%s] %.0f 秒后只重试网页抓取", serial, args.retry_wait)
                 if cancel_event.wait(args.retry_wait) or STOP_EVENT.is_set():
                     break
@@ -629,6 +685,7 @@ def worker(
                     "sources": web_result.get("sources", []),
                     "expected_source_count": web_result.get("expected_source_count", len(web_result.get("sources", []))),
                     "source_capture_complete": bool(web_result.get("source_capture_complete")),
+                    "capture_warning": str(web_result.get("capture_warning") or ""),
                     "web_error": web_result.get("error"),
                 }
                 append_jsonl(Path(args.results), record)
@@ -670,8 +727,30 @@ def worker(
                     controller.save_diagnostics(diagnostic_dir, prefix, str(exc))
                 controller = None
                 if args.max_retries and attempt >= args.max_retries:
-                    logger.error("[%s] 已达到最大重试次数，停止当前设备且不跳过本轮", serial)
-                    return
+                    failure = {
+                        "status": "failed", "skip_reason": str(exc),
+                        "serial": serial, "round": index + 1,
+                        "schedule_index": position, "question": question,
+                        "reply": "", "reply_length": 0, "attempt": attempt,
+                        "started_at": started, "finished_at": now(),
+                        "xml": str(diagnostic_dir / f"reply_{index + 1:06d}.xml"),
+                        "web_body": "", "sources": [], "expected_source_count": 0,
+                        "source_capture_complete": False,
+                        "capture_warning": "round_retry_exhausted",
+                        "web_error": str(exc),
+                    }
+                    append_jsonl(Path(args.results), failure)
+                    index += 1
+                    save_state(state_path, {
+                        "serial": serial, "next_index": index,
+                        "plan_signature": plan_signature,
+                        "schedule_origin": schedule_origin,
+                        "target_end_index": end_index,
+                        "updated_at": now(),
+                    })
+                    pending_path.unlink(missing_ok=True)
+                    logger.error("[%s] 本轮已重试 %d 次仍失败，已记录失败并继续下一题", serial, attempt)
+                    break
                 STOP_EVENT.wait(min(2.0, args.retry_wait) if immediate_reask else args.retry_wait)
 
         if not STOP_EVENT.is_set():
@@ -698,6 +777,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-wait", type=float, default=0, help="额外随机等待上限")
     parser.add_argument("--retry-wait", type=float, default=5)
     parser.add_argument("--max-retries", type=int, default=0, help="0 表示无限重试")
+    parser.add_argument("--max-web-retries", type=int, default=3, help="单轮网页信源补抓上限；达到后保存高覆盖部分结果或重新提问")
     parser.add_argument("--connect-timeout", type=int, default=15)
     parser.add_argument("--collect-web", action="store_true", help="同步抓取元宝网页正文和信源")
     parser.add_argument("--chrome-port", type=int, default=9222)

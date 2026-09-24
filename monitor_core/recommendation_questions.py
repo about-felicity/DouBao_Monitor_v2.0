@@ -7,6 +7,7 @@ PRODUCTS: tuple[str, ...] = (
     "护发精油",
     "护发素",
     "控油蓬松洗发水",
+    "二硫化硒洗发水",
     "沐浴精油",
     "眉毛增长液",
     "祛痘精华液",
@@ -17,6 +18,13 @@ PRODUCTS: tuple[str, ...] = (
     "防脱洗发水",
     "防脱精华液",
     "面膜",
+    "眼霜",
+    "卸妆油",
+    "爽肤水",
+    "洗面奶",
+    "身体乳",
+    "护手霜",
+    "防晒霜",
 )
 
 PROMPTS: tuple[str, ...] = tuple(f"推荐一款{product}" for product in PRODUCTS)
@@ -36,7 +44,7 @@ def _compact(value: str) -> str:
 
 
 def canonical_recommendation_question(value: str) -> str:
-    """Map prompts and generated chat titles to one of the 13 allowed buckets."""
+    """Map prompts and generated chat titles to an allowed product bucket."""
     text = _compact(value)
     for alias, product in _ALIASES.items():
         text = text.replace(_compact(alias), _compact(product))
@@ -50,7 +58,7 @@ def canonical_recommendation_question(value: str) -> str:
 def prompt_for_question(value: str) -> str:
     canonical = canonical_recommendation_question(value)
     if canonical not in CANONICAL_QUESTIONS:
-        raise ValueError(f"问题不在允许的 13 个推荐问题中：{value}")
+        raise ValueError(f"问题不在允许的 {len(PRODUCTS)} 个推荐问题中：{value}")
     return "推荐一款" + canonical.removesuffix("推荐")
 
 
@@ -58,5 +66,5 @@ def validate_prompt_list(values: list[str]) -> list[str]:
     prompts = [prompt_for_question(value) for value in values if str(value or "").strip()]
     unknown = [value for value in values if str(value or "").strip() and not canonical_recommendation_question(value)]
     if unknown:
-        raise ValueError("只允许配置既定的 13 个推荐问题：" + "、".join(unknown))
+        raise ValueError(f"只允许配置既定的 {len(PRODUCTS)} 个推荐问题：" + "、".join(unknown))
     return list(dict.fromkeys(prompts))

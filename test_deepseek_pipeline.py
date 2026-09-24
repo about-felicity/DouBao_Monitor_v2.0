@@ -21,10 +21,12 @@ class DeepSeekSchedulingTests(unittest.TestCase):
             self.assertLess(upper, 120)
             self.assertLessEqual(lower, upper)
 
-    def test_remote_plugin_uses_the_safe_interval_window(self):
-        command, _cwd = DeepSeekPlugin().command({"rounds": 1, "question_mode": "interleaved"})
-        self.assertEqual(command[command.index("--min-interval") + 1], "92")
-        self.assertEqual(command[command.index("--max-interval") + 1], "118")
+    def test_remote_plugin_is_ingest_only_for_the_chrome_extension(self):
+        plugin = DeepSeekPlugin()
+        self.assertTrue(plugin.ingest_only)
+        self.assertFalse(plugin.supports_control)
+        with self.assertRaisesRegex(RuntimeError, "Chrome 扩展"):
+            plugin.command({"rounds": 1, "question_mode": "interleaved"})
 
 
 class _FakeDevice:

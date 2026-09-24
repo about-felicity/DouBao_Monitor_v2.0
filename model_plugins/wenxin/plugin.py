@@ -29,16 +29,25 @@ class Plugin(ModelPlugin):
 
     def command(self, options: dict[str, Any]) -> tuple[list[str], Path]:
         rounds = max(1, min(int(options.get("rounds") or 10), 10000))
-        tasks = max(1, min(int(options.get("tasks") or 1), 4))
+        # Multiple automated Baidu searches from one LAN address quickly trigger
+        # the security-verification page.  A single paced browser has higher
+        # sustained throughput because it keeps producing usable observations
+        # instead of rotating profiles and deferring every question.
+        tasks = 1
         mode = normalize_question_mode(options.get("question_mode"))
-        return [sys.executable, str(self.runner), "--questions-file", str(self.questions),
+        command = [sys.executable, str(self.runner), "--questions-file", str(self.questions),
                 "--rounds-per-question", str(rounds), "--question-mode", mode,
-                "--tasks", str(tasks), "--wait", "8", "--random-wait", "20",
-                "--retry-wait", "8", "--timeout", "45",
-                "--results", str(self.collector_results)], self.runner.parent
+                "--tasks", str(tasks), "--wait", "25", "--random-wait", "35",
+                "--retry-wait", "20", "--max-retries", "2", "--timeout", "60",
+                "--baidu-capture-retries", "5",
+                "--baidu-card-daily-rounds", "5",
+                "--results", str(self.collector_results)]
+        if options.get("restart_completed"):
+            command.append("--restart-completed")
+        return command, self.runner.parent
 
     def prepare(self, options: dict[str, Any], progress: Callable[[str], None] | None = None) -> None:
-        tasks = max(1, min(int(options.get("tasks") or 1), 4))
+        tasks = 1
         from wenxin_monitor.controller import WenxinWebCollector
         for task_id in range(1, tasks + 1):
             if progress:
@@ -47,6 +56,13 @@ class Plugin(ModelPlugin):
             web = WenxinWebCollector(9443 + task_id, profile=profile)
             try:
                 web.ensure_ready()
+            except Exception as exc:
+                # The production loop already has per-question retry/defer
+                # handling.  A transient Baidu reset during this optional
+                # preflight must not terminate the whole remote worker (and
+                # its result-sync process) before that recovery can run.
+                if progress:
+                    progress(f"任务 {task_id} 启动检查暂时失败，将由采集循环继续重试：{exc}")
             finally:
                 web.close()
 
@@ -80,6 +96,14 @@ class Plugin(ModelPlugin):
                 "location": "local"}
 
     def stats(self) -> dict[str, Any]:
+        # Production ingestion is PostgreSQL-only.  Reading the retired JSONL
+        # here made the Wenxin-specific stats endpoint report 0 sources while
+        # the unified dashboard and remote activity already had full citations.
+        from monitor_core import database
+        if database.enabled():
+            from monitor_core.jsonl_dashboard import build_records_dashboard
+            runs = database.load_runs_by_model(model=self.id).get(self.id, [])
+            return build_records_dashboard(self.id, runs)
         if self.results.exists() and (not self.dashboard.exists() or self.results.stat().st_mtime > self.dashboard.stat().st_mtime):
             subprocess.run([sys.executable, str(self.builder)], cwd=self.runner.parent, capture_output=True,
                            timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

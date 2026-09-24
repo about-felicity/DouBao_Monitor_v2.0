@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 import re
@@ -11,14 +13,76 @@ import re
 from monitor_core.jsonl_dashboard import build_jsonl_dashboard
 from wenxin_monitor.controller import (
     BAIDU_AI_SNAPSHOT_JS,
+    BAIDU_CARD_DIRECT_SOURCES_JS,
+    BAIDU_OPEN_SOURCE_DRAWER_JS,
     BAIDU_VISIBLE_SOURCES_JS,
     WenxinWebCollector,
+    clean_baidu_ai_body,
 )
 from wenxin_monitor.wenxin_loop import (
+    baidu_card_attempt_count,
+    deferred_due_index,
+    prune_rotated_profiles,
     repeated_search_card,
     replace_repeated_search_card,
+    resume_schedule_window,
     reserve_unique_observation,
+    record_baidu_card_attempt,
+    seed_baidu_card_attempts,
+    security_backoff_seconds,
+    should_retry_baidu_sources,
 )
+
+
+class RotatedProfileRetentionTests(unittest.TestCase):
+    def test_source_less_baidu_variant_retries_until_fifth_attempt(self):
+        self.assertTrue(should_retry_baidu_sources(False, 1, 5))
+        self.assertTrue(should_retry_baidu_sources(False, 4, 5))
+        self.assertFalse(should_retry_baidu_sources(False, 5, 5))
+        self.assertFalse(should_retry_baidu_sources(True, 1, 5))
+
+    def test_resume_continuous_batch_with_deferred_item(self):
+        self.assertEqual(resume_schedule_window(1069, 1050, True, {}), (1050, 2100))
+
+    def test_persisted_batch_window_is_restored(self):
+        state = {"schedule_origin": 1050, "target_end_index": 2100}
+        self.assertEqual(resume_schedule_window(1069, 1050, True, state), (1050, 2100))
+
+    def test_deferred_item_waits_while_normal_queue_advances(self):
+        pending = [{"slot": 1059, "prompt": "推荐一款染发剂", "retry_after_index": 1090}]
+        self.assertIsNone(deferred_due_index(pending, 1069))
+        self.assertEqual(deferred_due_index(pending, 1090), 0)
+
+    def test_security_backoff_is_bounded_and_increases(self):
+        self.assertEqual(security_backoff_seconds(1, 20), 180)
+        self.assertEqual(security_backoff_seconds(2, 20), 360)
+        self.assertEqual(security_backoff_seconds(9, 20), 900)
+
+    def test_prune_rotated_profiles_keeps_recent_and_protected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "wenxin_scrapling_task_1"
+            base.mkdir()
+            rotations = []
+            for index in range(4):
+                profile = root / f"{base.name}_rotated_{index}"
+                profile.mkdir()
+                (profile / "state.bin").write_bytes(b"x")
+                timestamp = time.time() + index
+                profile.touch()
+                os.utime(profile, (timestamp, timestamp))
+                rotations.append(profile)
+
+            removed = prune_rotated_profiles(
+                base,
+                keep=2,
+                protected=(rotations[0],),
+            )
+
+            self.assertEqual({path.name for path in removed}, {rotations[1].name})
+            self.assertTrue(rotations[0].exists())
+            self.assertTrue(rotations[2].exists())
+            self.assertTrue(rotations[3].exists())
 
 
 class _Response:
@@ -95,10 +159,95 @@ class _Page:
                     }
                 ] if self.citation_index < self.captured_citations else []),
             }
+        if expression == BAIDU_CARD_DIRECT_SOURCES_JS:
+            return {"sources": []}
+        if expression == BAIDU_OPEN_SOURCE_DRAWER_JS:
+            return {"clicked": False, "text": ""}
         raise AssertionError(f"unexpected expression: {expression[:80]}")
 
 
+class _DirectSourcePage(_Page):
+    def evaluate(self, expression, timeout=15):
+        if expression == BAIDU_AI_SNAPSHOT_JS:
+            value = super().evaluate(expression, timeout)
+            value["citationCount"] = 0
+            return value
+        if expression == BAIDU_CARD_DIRECT_SOURCES_JS:
+            return {"sources": [{
+                "url": "https://example.com/direct-source",
+                "title": "百度卡片直接信源",
+                "media": "示例站点",
+            }]}
+        return super().evaluate(expression, timeout)
+
+
 class WenxinBaiduSearchTests(unittest.TestCase):
+    def test_snapshot_supports_current_baidu_card_and_search_box_markup(self):
+        self.assertIn('.cosc-card-content', BAIDU_AI_SNAPSHOT_JS)
+        self.assertIn('#chat-textarea', BAIDU_AI_SNAPSHOT_JS)
+        self.assertIn("parameters.get('wd')", BAIDU_AI_SNAPSHOT_JS)
+        self.assertIn('[class*="nbk-index_"]', BAIDU_AI_SNAPSHOT_JS)
+
+    def test_baidu_card_footer_is_not_saved_as_answer_text(self):
+        body = clean_baidu_ai_body(
+            "推荐科熙本控油蓬松造型喷雾。\n"
+            "适合细软塌发质。\n展开剩余 65% 内容\nAI总结43篇结果生成"
+        )
+        self.assertIn("科熙本控油蓬松造型喷雾", body)
+        self.assertNotIn("展开剩余", body)
+        self.assertNotIn("AI总结", body)
+
+    def test_seed_does_not_restore_legacy_source_markup_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            results = root / "results.jsonl"
+            history = root / "cards.sqlite3"
+            rows = [
+                {
+                    "finished_at": "2026-09-15T01:00:00+08:00",
+                    "capture_mode": "baidu_search_ai",
+                    "status": "capture_failed",
+                    "question": "推荐一款染发剂",
+                    "capture_warning": "百度 AI 卡片信源不完整：推荐一款染发剂（0/2 个引用）",
+                },
+                {
+                    "finished_at": "2026-09-15T01:10:00+08:00",
+                    "capture_mode": "baidu_search_ai",
+                    "status": "success",
+                    "question": "推荐一款护发素",
+                    "reply": "完整正文",
+                },
+            ]
+            results.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            seed_baidu_card_attempts(
+                results, history_path=history, natural_day="2026-09-15", maximum=5,
+            )
+            self.assertEqual(baidu_card_attempt_count(
+                "推荐一款染发剂", history_path=history, natural_day="2026-09-15",
+            ), 0)
+            self.assertEqual(baidu_card_attempt_count(
+                "推荐一款护发素", history_path=history, natural_day="2026-09-15",
+            ), 1)
+
+    def test_baidu_card_daily_attempt_quota_counts_identical_answers_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "cards.sqlite3"
+            for attempt in range(1, 6):
+                self.assertEqual(record_baidu_card_attempt(
+                    "推荐一款染发剂", "success", "完全相同的百度卡片回答",
+                    history_path=history, natural_day="2026-09-14", maximum=5,
+                ), attempt)
+            self.assertEqual(baidu_card_attempt_count(
+                "染发剂推荐", history_path=history, natural_day="2026-09-14",
+            ), 5)
+            self.assertEqual(record_baidu_card_attempt(
+                "推荐一款染发剂", "success", "第六次不应写入",
+                history_path=history, natural_day="2026-09-14", maximum=5,
+            ), 5)
+
     def test_repeated_card_is_scoped_by_question_body_and_natural_day(self):
         with tempfile.TemporaryDirectory() as directory:
             history = Path(directory) / "cards.sqlite3"
@@ -203,18 +352,25 @@ class WenxinBaiduSearchTests(unittest.TestCase):
         self.assertEqual(result["sources"][0]["media"], "桂林生活网")
         self.assertTrue(result["source_capture_complete"])
 
-    def test_visible_citation_without_source_uses_wenxin_fallback(self):
+    def test_visible_citation_without_source_preserves_complete_baidu_body(self):
         collector = WenxinWebCollector(page=_Page(captured_citations=1), session=_Session("https://example.com/a"))
-        fallback = {
-            "capture_mode": "baidu_wenxin_search", "body": "完整兜底回答",
-            "sources": [{"url": "https://example.com/source", "title": "资料"}],
-            "source_capture_complete": True,
-        }
-        with mock.patch("wenxin_monitor.controller.time.sleep", return_value=None), \
-             mock.patch.object(collector, "collect_wenxin_search", return_value=fallback) as collect_fallback:
+        with mock.patch("wenxin_monitor.controller.time.sleep", return_value=None):
             result = collector.collect_search("推荐一款染发剂", timeout=10)
-        self.assertEqual(result["capture_mode"], "baidu_wenxin_search")
-        collect_fallback.assert_called_once()
+        self.assertEqual(result["capture_mode"], "baidu_search_ai")
+        self.assertTrue(result["body_capture_complete"])
+        self.assertFalse(result["source_capture_complete"])
+        self.assertIn("正文已完整归档", result["capture_warning"])
+
+    def test_direct_source_without_legacy_citation_marker_is_complete(self):
+        collector = WenxinWebCollector(
+            page=_DirectSourcePage(), session=_Session("https://example.com/direct-source")
+        )
+        with mock.patch("wenxin_monitor.controller.time.sleep", return_value=None):
+            result = collector.collect_search("推荐一款染发剂", timeout=10)
+        self.assertEqual(result["citation_count"], 0)
+        self.assertEqual(len(result["sources"]), 1)
+        self.assertTrue(result["source_capture_complete"])
+        self.assertIn("参考", BAIDU_OPEN_SOURCE_DRAWER_JS)
 
     def test_search_rejects_a_navigation_without_a_new_loader(self):
         page = _Page()
@@ -236,6 +392,32 @@ class WenxinBaiduSearchTests(unittest.TestCase):
         collector = WenxinWebCollector(page=_Page(), session=session)
         self.assertEqual(collector._resolve_source_url("https://example.com/article"), "https://example.com/article")
         self.assertEqual(session.calls, [])
+
+    def test_source_normalization_merges_baidu_wrapper_and_final_url(self):
+        collector = WenxinWebCollector(page=_Page(), session=_Session("https://example.com/article"))
+        with mock.patch.object(
+            collector,
+            "_resolve_source_url",
+            side_effect=lambda value: value,
+        ):
+            sources = collector._normalize_sources([
+                {
+                    "url": "http://www.baidu.com/link?url=source-token",
+                    "title": "同一篇评测文章",
+                    "media": "评测网",
+                },
+                {
+                    "url": "https://example.com/article",
+                    "title": "同一篇评测文章",
+                    "media": "评测网",
+                },
+            ])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["url"], "https://example.com/article")
+        self.assertEqual(
+            sources[0]["baidu_redirect_url"],
+            "http://www.baidu.com/link?url=source-token",
+        )
 
     def test_completed_round_replaces_old_tab_with_clean_baidu_tab(self):
         page = _Page()

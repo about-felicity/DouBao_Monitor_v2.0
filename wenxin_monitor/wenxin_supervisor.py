@@ -35,11 +35,17 @@ def main() -> int:
     parser.add_argument("--random-wait", type=float, default=90)
     parser.add_argument("--retry-wait", type=float, default=15)
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--baidu-capture-retries", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--baidu-card-daily-rounds", type=int, default=5)
+    parser.add_argument("--restart-completed", action="store_true",
+                        help="每批完成后延迟启动下一批，持续采集")
     args = parser.parse_args()
 
     task_count = max(1, min(args.tasks, 4))
     children: list[tuple[int, subprocess.Popen]] = []
+    commands: dict[int, list[str]] = {}
+    pending_restart: dict[int, float] = {}
     for task_id in range(1, task_count + 1):
         paths = task_paths(task_id)
         if task_id == 1:
@@ -59,17 +65,29 @@ def main() -> int:
             "--random-wait", str(args.random_wait),
             "--retry-wait", str(args.retry_wait),
             "--max-retries", str(max(0, args.max_retries)),
+            "--baidu-capture-retries", str(max(1, min(args.baidu_capture_retries, 10))),
             "--timeout", str(args.timeout),
+            "--baidu-card-daily-rounds", str(max(1, args.baidu_card_daily_rounds)),
             "--results", str(paths["results"]),
             "--state", str(paths["state"]),
             "--log", str(paths["log"]),
         ]
+        if args.restart_completed:
+            command.append("--restart-completed")
+        commands[task_id] = command
         print(f"[任务 {task_id}] 已启动独立 Scrapling 隐身浏览器", flush=True)
         children.append((task_id, subprocess.Popen(command, cwd=BASE_DIR)))
 
     return_code = 0
     try:
-        while children:
+        while children or pending_restart:
+            current_time = time.monotonic()
+            for task_id, restart_at in list(pending_restart.items()):
+                if current_time < restart_at:
+                    continue
+                print(f"[任务 {task_id}] 正在启动下一批", flush=True)
+                children.append((task_id, subprocess.Popen(commands[task_id], cwd=BASE_DIR)))
+                del pending_restart[task_id]
             active: list[tuple[int, subprocess.Popen]] = []
             for task_id, child in children:
                 code = child.poll()
@@ -80,8 +98,11 @@ def main() -> int:
                     return_code = code
                 else:
                     print(f"[任务 {task_id}] 已完成全部问题和轮数", flush=True)
+                    if args.restart_completed:
+                        pending_restart[task_id] = time.monotonic() + 60
+                        print(f"[任务 {task_id}] 60 秒后自动开启下一批", flush=True)
             children = active
-            if children:
+            if children or pending_restart:
                 time.sleep(1)
     except KeyboardInterrupt:
         return_code = 130

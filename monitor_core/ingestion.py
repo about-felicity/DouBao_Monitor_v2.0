@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import re
 from typing import Any
 
 from monitor_core.analytics import beijing_day, normalize_source
@@ -11,6 +12,59 @@ from monitor_core.recommendation_questions import canonical_recommendation_quest
 
 
 BEIJING = timezone(timedelta(hours=8))
+
+
+_DEEPSEEK_SOURCE_SHELL_LINE = re.compile(
+    r"^(?:found\s+)?\d{1,3}\s*(?:(?:个)?网页|篇来源|web\s*pages?|sources?)$",
+    re.IGNORECASE,
+)
+
+
+def clean_deepseek_answer(value: Any) -> str:
+    """Remove DeepSeek smart-search UI chrome from captured answer text.
+
+    The browser collector is the primary repair point.  This ingress guard is
+    deliberately duplicated on the server so an older remote extension cannot
+    poison analytics while it is waiting to be upgraded.
+    """
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = text.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and _DEEPSEEK_SOURCE_SHELL_LINE.fullmatch(lines[0].strip()):
+        lines.pop(0)
+    while lines and _DEEPSEEK_SOURCE_SHELL_LINE.fullmatch(lines[-1].strip()):
+        lines.pop()
+
+    cleaned: list[str] = []
+    for line in lines:
+        current = line.strip()
+        previous = cleaned[-1] if cleaned else ""
+        citation_label = (
+            previous.endswith("-")
+            and 0 < len(current) <= 40
+            and not re.search(r"[，。！？；：,.!?;:]", current)
+        )
+        if citation_label:
+            cleaned[-1] = previous[:-1].rstrip()
+            continue
+        if cleaned and re.fullmatch(r"[，。！？；：,.!?;:]+", current):
+            while cleaned and not cleaned[-1].strip():
+                cleaned.pop()
+            if cleaned:
+                cleaned[-1] = cleaned[-1].rstrip() + current
+            continue
+        cleaned.append(line.rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
+
+
+def deepseek_source_title_is_answer_text(title: Any, answer: Any) -> bool:
+    """Detect a citation link whose parent answer sentence was captured as its title."""
+    source_title = re.sub(r"\s+", "", str(title or "").strip().rstrip("-–—"))
+    answer_text = re.sub(r"\s+", "", str(answer or ""))
+    return len(source_title) >= 18 and source_title in answer_text
 
 
 def _question(value: Any) -> str:
@@ -22,6 +76,8 @@ def normalize_remote_record(model_id: str, record: dict[str, Any]) -> dict[str, 
     """Convert a Wenxin/Yuanbao/DeepSeek/Afu callback to one query-ready run."""
     finished = str(record.get("finished_at") or record.get("started_at") or "")
     answer = str(record.get("web_body") or record.get("reply") or "")
+    if model_id == "deepseek":
+        answer = clean_deepseek_answer(answer)
     if model_id == "yuanbao":
         stable = "\0".join((
             str(record.get("serial") or ""), str(record.get("round") or ""),
@@ -41,7 +97,13 @@ def normalize_remote_record(model_id: str, record: dict[str, Any]) -> dict[str, 
     for raw in (record.get("sources") or []):
         if not isinstance(raw, dict):
             continue
-        source = normalize_source(raw)
+        source_raw = raw
+        if model_id == "deepseek" and deepseek_source_title_is_answer_text(raw.get("title"), answer):
+            source_raw = dict(raw)
+            source_raw["title"] = ""
+            for label_key in ("owned_brands", "own_products", "own_brand", "brand_match_scope", "brand_mentions"):
+                source_raw.pop(label_key, None)
+        source = normalize_source(source_raw)
         key = str(source.get("canonical_url") or source.get("url") or "").strip()
         if key and key in seen_urls:
             continue
@@ -70,6 +132,12 @@ def normalize_remote_record(model_id: str, record: dict[str, Any]) -> dict[str, 
         # and canonical URLs. Analytics intentionally counts unique links.
         "expected_source_count": len(normalized_sources),
         "source_capture_complete": bool(record.get("source_capture_complete", True)),
+        "source_list_present": record.get("source_list_present"),
+        "capture_warning": str(record.get("capture_warning") or ""),
+        "card_available": record.get("card_available"),
+        "surface_attempt": int(record.get("surface_attempt") or 0),
+        "daily_surface_target": int(record.get("daily_surface_target") or 0),
+        "answer_fingerprint": str(record.get("answer_fingerprint") or ""),
         "products": [dict(item) for item in (record.get("products") or []) if isinstance(item, dict)],
         "brands": [str(item).strip() for item in (record.get("brands") or []) if str(item).strip()],
         "product_review_status": str(record.get("product_review_status") or ""),

@@ -92,6 +92,27 @@ class _SourceCountDriver:
 
 
 class YuanbaoSourceCountTests(unittest.TestCase):
+    def test_nearly_complete_sources_are_accepted_immediately(self):
+        result = {
+            "error": "incomplete_sources:42/43",
+            "body": "这是一段完整的眼霜推荐回答，包含具体眼霜产品、使用建议和适用人群。" * 8,
+            "sources": [{"url": f"https://example.com/{index}"} for index in range(42)],
+            "expected_source_count": 43,
+        }
+        self.assertTrue(yuanbao_loop.acceptable_partial_web_result("推荐一款眼霜", result))
+
+    def test_empty_or_low_coverage_sources_are_not_accepted(self):
+        body = "这是一段完整的眼霜推荐回答，包含具体眼霜产品、使用建议和适用人群。" * 8
+        self.assertFalse(yuanbao_loop.acceptable_partial_web_result("推荐一款眼霜", {
+            "error": "incomplete_sources:0/43", "body": body,
+            "sources": [], "expected_source_count": 43,
+        }))
+        self.assertFalse(yuanbao_loop.acceptable_partial_web_result("推荐一款眼霜", {
+            "error": "incomplete_sources:20/43", "body": body,
+            "sources": [{"url": f"https://example.com/{index}"} for index in range(20)],
+            "expected_source_count": 43,
+        }))
+
     def test_expected_source_count_uses_valid_javascript_newline_escape(self):
         collector = YuanbaoSourceCollector.__new__(YuanbaoSourceCollector)
         collector.driver = _SourceCountDriver()

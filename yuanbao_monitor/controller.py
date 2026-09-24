@@ -319,13 +319,31 @@ class YuanbaoController:
     def account_identity(self) -> dict[str, str]:
         """Read the visible Yuanbao nickname from the App's profile page."""
         self.d.app_start(self.PKG, stop=False)
-        time.sleep(1)
-        profile = self.d(text="我们")
-        if profile.exists(timeout=5):
-            profile.click()
-        elif "我们" in self.d.dump_hierarchy(compressed=False):
-            self.d.click(434, 920)
-        else:
+        # A cold emulator often needs several seconds before the Compose
+        # navigation bar is exposed to uiautomator.  The previous one-second
+        # wait intermittently treated a logged-in account as logged out.
+        profile_opened = False
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            for selector in ({"text": "我们"}, {"description": "我们"}):
+                profile = self.d(**selector)
+                if profile.exists(timeout=1):
+                    profile.click()
+                    profile_opened = True
+                    break
+            if profile_opened:
+                break
+            try:
+                hierarchy = self.d.dump_hierarchy(compressed=False)
+            except Exception:
+                hierarchy = ""
+            if "我们" in hierarchy:
+                width, height = self.d.window_size()
+                self.d.click(int(width * 0.85), int(height * 0.96))
+                profile_opened = True
+                break
+            time.sleep(0.5)
+        if not profile_opened:
             raise RuntimeError("元宝 App 没有找到“我们”账号页入口")
         ignored = {
             "立即更新", "立即登录", "登录", "未登录", "元宝", "我们",

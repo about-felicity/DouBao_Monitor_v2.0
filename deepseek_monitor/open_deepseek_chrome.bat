@@ -8,4 +8,4 @@ if not exist "%CHROME%" (
   pause
   exit /b 1
 )
-start "DeepSeek Monitor" "%CHROME%" --remote-debugging-port=9333 --remote-allow-origins=* --no-first-run --no-default-browser-check --user-data-dir="%~dp0chrome_profile" "https://chat.deepseek.com/"
+start "DeepSeek Monitor" "%CHROME%" --remote-debugging-port=9333 --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --user-data-dir="%~dp0chrome_profile" "https://chat.deepseek.com/"

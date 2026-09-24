@@ -106,6 +106,8 @@ class ScraplingStealthPage:
             '#content_left [m-name*="new_baikan_index"]',
             '#content_left [tpl="wenda_generate"]',
             '#content_left .ai-entry',
+            '#content_left .cosc-card',
+            '#content_left [class*="nbk-index_"]',
         ), "baidu-wenxin-ai-card", 42)
         if not cards:
             return {"ok": False, "body": "", "citationCount": 0, "citationXpaths": []}
@@ -114,6 +116,9 @@ class ScraplingStealthPage:
             '.cosd-markdown-content',
             '[class*="accordion-panels-title"]',
             '[class*="markdown-content"]',
+            '.cosc-card-content',
+            '[class*="cosc-card-content"]',
+            '[class*="content-container_"]',
         ), "baidu-wenxin-answer-body", 38)
         # Adaptive relocation can return structurally similar nodes elsewhere;
         # retain only nodes that are still descendants of the learned AI card.
@@ -135,7 +140,7 @@ class ScraplingStealthPage:
             path = str(item._root.getroottree().getpath(item._root))
             if path and path not in xpaths:
                 xpaths.append(path)
-        body = "\n\n".join(chunks).strip()
+        body = clean_baidu_ai_body("\n\n".join(chunks))
         result = {"ok": bool(body), "body": body, "citationCount": len(xpaths),
                   "citationXpaths": xpaths, "adaptive": True}
         if result["ok"]:
@@ -525,15 +530,35 @@ class LegacyWenxinWebCollector:
                 "expected_source_count": expected_source_count, "source_capture_complete": True}
 
 
+def clean_baidu_ai_body(value: Any) -> str:
+    """Remove Baidu card controls/footer without treating them as answer text."""
+    text = re.sub(
+        r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", str(value or "")
+    ).replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.split(
+        r"(?:^|\n)\s*(?:AI总结\s*\d+\s*篇结果生成|以上内容均由AI生成|长按识别)",
+        text,
+        maxsplit=1,
+    )[0].strip()
+    return re.sub(
+        r"(?:\n\s*)?展开剩余\s*\d+\s*%\s*内容\s*$", "", text
+    ).strip()
+
+
 BAIDU_AI_SNAPSHOT_JS = r"""
 (()=>{
   const card = document.querySelector(
     '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
-    '#content_left [tpl="wenda_generate"], #content_left .ai-entry'
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
   );
+  const parameters = new URLSearchParams(location.search);
   const query = String(
     document.querySelector('#kw')?.value ||
-    document.querySelector('input[name="wd"]')?.value || ''
+    document.querySelector('input[name="wd"]')?.value ||
+    document.querySelector('#chat-textarea')?.value ||
+    document.querySelector('#chat-textarea')?.textContent ||
+    parameters.get('wd') || parameters.get('word') || ''
   ).trim();
   if (!card) {
     return {
@@ -547,7 +572,8 @@ BAIDU_AI_SNAPSHOT_JS = r"""
   const chunks = [];
   const seen = new Set();
   for (const element of card.querySelectorAll(
-    '[class*="accordion-panels-title"], .ai-entry .cosd-markdown-content'
+    '[class*="accordion-panels-title"], .ai-entry .cosd-markdown-content, ' +
+    '.cosd-markdown-content, [class*="markdown-content"]'
   )) {
     const text = String(element.innerText || '')
       .replace(/[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
@@ -556,9 +582,25 @@ BAIDU_AI_SNAPSHOT_JS = r"""
     seen.add(text);
     chunks.push(text);
   }
+  if (!chunks.length) {
+    const content = card.querySelector(
+      '.cosc-card-content, [class*="cosc-card-content"], [class*="content-container_"]'
+    ) || card;
+    const copy = content.cloneNode(true);
+    for (const unwanted of copy.querySelectorAll(
+      'script, style, input, textarea, button, [contenteditable="true"], ' +
+      '[class*="footer"], [class*="qrcode"], [class*="input-container"]'
+    )) unwanted.remove();
+    const text = String(copy.innerText || copy.textContent || '')
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
+      .replace(/(?:^|\n)\s*(?:AI总结\s*\d+\s*篇结果生成|以上内容均由AI生成|长按识别)[\s\S]*$/m, '')
+      .replace(/(?:\n\s*)?展开剩余\s*\d+\s*%\s*内容\s*$/, '')
+      .trim();
+    if (text) chunks.push(text);
+  }
   const body = chunks.join('\n\n').trim();
   const folded = Array.from(card.querySelectorAll('button, [role="button"], div, span'))
-    .some(element => /^展开剩余\d+%内容$/.test(String(element.innerText || '').trim()));
+    .some(element => /^展开剩余\s*\d+\s*%\s*内容$/.test(String(element.innerText || '').trim()));
   const citationSelectors = [
     '.cosd-citation',
     '[data-citation]',
@@ -590,7 +632,8 @@ BAIDU_AI_SOURCES_JS = r"""
 (async()=>{
   const card = document.querySelector(
     '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
-    '#content_left [tpl="wenda_generate"], #content_left .ai-entry'
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
   );
   if (!card) return {ok:false, error:'ai_card_missing', sources:[]};
   const citations = Array.from(card.querySelectorAll('.cosd-citation'));
@@ -639,6 +682,40 @@ BAIDU_AI_SOURCES_JS = r"""
 """
 
 
+BAIDU_CARD_DIRECT_SOURCES_JS = r"""
+(()=>{
+  const card = document.querySelector(
+    '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
+  );
+  if (!card) return {sources:[]};
+  const sources = [];
+  for (const anchor of card.querySelectorAll('a[href]')) {
+    const href = String(anchor.href || anchor.getAttribute('href') || '').trim();
+    const title = String(
+      anchor.querySelector('[class*="title"]')?.innerText ||
+      anchor.getAttribute('aria-label') || anchor.title || anchor.innerText || ''
+    ).replace(/\s+/g, ' ').trim();
+    if (!/^https?:/i.test(href) || !title) continue;
+    // Search/navigation controls are not provenance links.
+    if (/\/s\?(?:.*&)?wd=/i.test(href) || /javascript:/i.test(href)) continue;
+    const item = anchor.closest(
+      '[class*="citation"], [class*="reference"], [class*="source"], li'
+    ) || anchor.parentElement;
+    sources.push({
+      url:href,
+      title,
+      media:String(
+        item?.querySelector('[class*="media"], [class*="site"], .cos-color-text-slim')?.innerText || ''
+      ).trim()
+    });
+  }
+  return {sources};
+})()
+"""
+
+
 BAIDU_VISIBLE_SOURCES_JS = r"""
 (()=>{
   const visible = (element) => {
@@ -648,23 +725,71 @@ BAIDU_VISIBLE_SOURCES_JS = r"""
       rect.width > 0 && rect.height > 0;
   };
   const sources = [];
-  for (const popup of Array.from(document.querySelectorAll('.cos-tooltip-content')).filter(visible)) {
+  const popupSelectors = [
+    '.cos-tooltip-content', '[role="tooltip"]', '[role="dialog"]',
+    '[class*="tooltip"]', '[class*="popover"]', '[class*="citation"]',
+    '[class*="reference"]', '[class*="source"]'
+  ];
+  const popups = Array.from(new Set(
+    popupSelectors.flatMap(selector => Array.from(document.querySelectorAll(selector)))
+  )).filter(visible);
+  for (const popup of popups) {
     for (const anchor of popup.querySelectorAll('a[href]')) {
       const href = String(anchor.href || anchor.getAttribute('href') || '').trim();
       const title = String(
-        anchor.querySelector('.cosd-citation-title-text')?.innerText ||
-        anchor.innerText || anchor.title || ''
-      ).trim();
-      if (!href || !title) continue;
+        anchor.querySelector('.cosd-citation-title-text, [class*="title"]')?.innerText ||
+        anchor.getAttribute('aria-label') || anchor.innerText || anchor.title || ''
+      ).replace(/\s+/g, ' ').trim();
+      if (!/^https?:/i.test(href) || !title) continue;
       const item = anchor.closest('.cosd-citation-aggregated-item') || anchor.parentElement;
       sources.push({
         url:href,
         title,
-        media:String(item?.querySelector('.cos-color-text-slim')?.innerText || '').trim()
+        media:String(item?.querySelector(
+          '.cos-color-text-slim, [class*="media"], [class*="site"]'
+        )?.innerText || '').trim()
       });
     }
   }
   return {sources};
+})()
+"""
+
+
+BAIDU_OPEN_SOURCE_DRAWER_JS = r"""
+(()=>{
+  const card = document.querySelector(
+    '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
+  );
+  if (!card) return {clicked:false, text:''};
+  const compact = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const candidates = Array.from(card.querySelectorAll(
+    'button, [role="button"], a, [tabindex], div, span'
+  ));
+  const scored = candidates.map(element => {
+    const text = compact(
+      element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText
+    );
+    if (!text || text.length > 90) return null;
+    let score = 0;
+    if (/参考\s*\d+\s*篇(?:资料|内容)|\d+\s*篇(?:资料|参考)/.test(text)) score += 8;
+    if (/(?:查看|展开).*(?:信源|来源|参考|资料)|(?:信源|来源|参考资料)/.test(text)) score += 6;
+    if (/AI总结\s*\d+\s*篇结果生成/.test(text)) score += 4;
+    if (!score) return null;
+    if (element.matches('button, a, [role="button"], [tabindex]')) score += 3;
+    const rect = element.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) score += 2;
+    return {element, text, score};
+  }).filter(Boolean).sort((a, b) => b.score - a.score);
+  const target = scored[0];
+  if (!target) return {clicked:false, text:''};
+  const clickable = target.element.closest('button, a, [role="button"], [tabindex]') || target.element;
+  clickable.scrollIntoView({block:'center', inline:'nearest'});
+  try { clickable.click(); }
+  catch (_) { clickable.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); }
+  return {clicked:true, text:target.text};
 })()
 """
 
@@ -722,6 +847,10 @@ WENXIN_SEARCH_SNAPSHOT_JS = r"""
 """
 
 
+class BaiduSearchCardUnavailable(RuntimeError):
+    """The Baidu result page completed normally but exposed no AI answer card."""
+
+
 class WenxinWebCollector:
     """Collect Baidu search AI answers directly; no emulator or Wenxin App is used."""
 
@@ -771,19 +900,36 @@ class WenxinWebCollector:
         )
 
     def ensure_ready(self, timeout: int = 30) -> dict[str, Any]:
-        self.page.call("Page.navigate", {"url": self.HOME})
         deadline = time.monotonic() + max(5, timeout)
         last: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            last = self.page.evaluate(
-                "({url:location.href,title:document.title,body:String(document.body?.innerText||'').slice(0,500)})"
-            ) or {}
-            if "baidu.com" in str(last.get("url") or "") and "百度" in (
-                str(last.get("title") or "") + str(last.get("body") or "")
-            ):
-                return {"ok": True, **last}
-            time.sleep(0.5)
-        raise TimeoutError(f"百度搜索专用 Chrome 未就绪：{last}")
+        navigation_errors: list[str] = []
+        # Baidu occasionally completes the document after Playwright's short
+        # navigation timer has fired.  Treat that exception as a slow-load
+        # signal, inspect the actual page, and retry before failing the worker.
+        for attempt in range(3):
+            try:
+                self.page.call("Page.navigate", {"url": self.HOME})
+            except Exception as exc:
+                navigation_errors.append(f"第{attempt + 1}次导航：{exc}")
+
+            inspect_until = min(deadline, time.monotonic() + 8)
+            while time.monotonic() < inspect_until:
+                try:
+                    last = self.page.evaluate(
+                        "({url:location.href,title:document.title,body:String(document.body?.innerText||'').slice(0,500)})"
+                    ) or {}
+                except Exception as exc:
+                    navigation_errors.append(f"第{attempt + 1}次检测：{exc}")
+                    last = {}
+                if "baidu.com" in str(last.get("url") or "") and "百度" in (
+                    str(last.get("title") or "") + str(last.get("body") or "")
+                ):
+                    return {"ok": True, **last}
+                time.sleep(0.5)
+            if time.monotonic() >= deadline:
+                break
+        detail = navigation_errors[-1] if navigation_errors else "页面内容未就绪"
+        raise TimeoutError(f"百度搜索专用 Chrome 未就绪：{last}；{detail}")
 
     def account_identity(self) -> dict[str, str]:
         self.ensure_ready()
@@ -841,7 +987,30 @@ class WenxinWebCollector:
 
     def _normalize_sources(self, raw_sources: list[Any]) -> list[dict[str, str]]:
         output: list[dict[str, str]] = []
-        seen: set[str] = set()
+        url_indexes: dict[str, int] = {}
+        title_indexes: dict[str, int] = {}
+
+        def url_key(value: str) -> str:
+            return str(value or "").strip().rstrip("/").casefold()
+
+        def is_baidu_redirect(value: str) -> bool:
+            parsed = urlparse(str(value or "").strip())
+            return (
+                parsed.netloc.casefold().removeprefix("www.") == "baidu.com"
+                and parsed.path == "/link"
+            )
+
+        def title_key(value: str) -> str:
+            return re.sub(r"[^\w]+", "", str(value or "").casefold(), flags=re.UNICODE)
+
+        def quality(item: dict[str, str]) -> int:
+            return (
+                (4 if not is_baidu_redirect(item.get("url", "")) else 0)
+                + (2 if item.get("baidu_redirect_url") else 0)
+                + (1 if item.get("media") else 0)
+                + (1 if str(item.get("url") or "").startswith("https://") else 0)
+            )
+
         for raw in raw_sources:
             if not isinstance(raw, dict):
                 continue
@@ -850,18 +1019,45 @@ class WenxinWebCollector:
             if not original or not title:
                 continue
             resolved = self._resolve_source_url(original)
-            key = resolved.rstrip("/").casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            output.append(
-                {
-                    "url": resolved,
-                    "baidu_redirect_url": original if resolved != original else "",
-                    "title": title,
-                    "media": str(raw.get("media") or "").strip(),
-                }
+            candidate = {
+                "url": resolved,
+                "baidu_redirect_url": original if resolved != original else "",
+                "title": title,
+                "media": str(raw.get("media") or "").strip(),
+            }
+            aliases = {url_key(original), url_key(resolved)} - {""}
+            existing_index = next(
+                (url_indexes[alias] for alias in aliases if alias in url_indexes),
+                None,
             )
+            normalized_title = title_key(title)
+            title_index = title_indexes.get(normalized_title)
+            if existing_index is None and title_index is not None:
+                existing = output[title_index]
+                # Baidu sometimes renders both its /link wrapper and the final
+                # destination.  If resolving one wrapper times out, the exact
+                # normalized title still lets us merge only that wrapper pair.
+                if is_baidu_redirect(original) or is_baidu_redirect(existing["url"]) or existing.get(
+                    "baidu_redirect_url"
+                ):
+                    existing_index = title_index
+            if existing_index is None:
+                existing_index = len(output)
+                output.append(candidate)
+            elif quality(candidate) > quality(output[existing_index]):
+                existing = output[existing_index]
+                if not candidate["baidu_redirect_url"]:
+                    candidate["baidu_redirect_url"] = (
+                        existing.get("baidu_redirect_url", "")
+                        or (existing["url"] if is_baidu_redirect(existing["url"]) else "")
+                    )
+                if not candidate["media"]:
+                    candidate["media"] = existing.get("media", "")
+                output[existing_index] = candidate
+            for alias in aliases:
+                url_indexes[alias] = existing_index
+            if normalized_title:
+                title_indexes[normalized_title] = existing_index
         return output
 
     def _expand_ai_card(self) -> bool:
@@ -869,11 +1065,12 @@ class WenxinWebCollector:
 (()=>{
   const card = document.querySelector(
     '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
-    '#content_left [tpl="wenda_generate"], #content_left .ai-entry'
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
   );
   if (!card) return null;
   const control = Array.from(card.querySelectorAll('button, [role="button"], div, span'))
-    .find(element => /^展开剩余\d+%内容$/.test(String(element.innerText || '').trim()));
+    .find(element => /^展开剩余\s*\d+\s*%\s*内容$/.test(String(element.innerText || '').trim()));
   if (!control) return null;
   control.scrollIntoView({block:'center', inline:'nearest'});
   const rect = control.getBoundingClientRect();
@@ -894,7 +1091,8 @@ class WenxinWebCollector:
 (()=>{
   const card = document.querySelector(
     '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
-    '#content_left [tpl="wenda_generate"], #content_left .ai-entry'
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
   );
   if (!card) return null;
   const rect = card.getBoundingClientRect();
@@ -939,7 +1137,7 @@ class WenxinWebCollector:
             last = value if isinstance(value, dict) else {}
             if self._is_security_verification(last):
                 raise RuntimeError("检测到百度安全验证，立即关闭当前页面")
-            body = str(last.get("body") or "")
+            body = clean_baidu_ai_body(last.get("body"))
             sources = list(last.get("sources") or [])
             expected = int(last.get("expectedSourceCount") or 0)
             source_items = int(last.get("sourceItemCount") or expected)
@@ -961,6 +1159,7 @@ class WenxinWebCollector:
                     f"文心入口回答未完整：{question}（正文 {len(previous_body)} 字，"
                     f"信源 {len(last.get('sources') or [])}/{int(last.get('expectedSourceCount') or 0)} 条）"
                 )
+            raise RuntimeError(f"文心入口未展示可用参考资料：{question}；拒绝保存零信源回答")
         self._scroll_document()
         # Re-read after visible scrolling in case the page lazy-loaded more references.
         final = self.page.evaluate(WENXIN_SEARCH_SNAPSHOT_JS, timeout=30) or last
@@ -972,8 +1171,12 @@ class WenxinWebCollector:
         extracted_items = int(final.get("extractedSourceItemCount") or len(raw_sources))
         if len(self._compact(body)) < 40:
             raise RuntimeError(f"文心入口正文完整性复核失败：正文 {len(body)} 字")
+        source_list_present = bool(displayed_items > 0 or source_items > 0)
+        if not source_list_present or not sources:
+            raise RuntimeError(f"文心入口未展示可用参考资料：{question}；拒绝保存零信源回答")
         source_capture_complete = bool(
-            sources and source_items > 0 and extracted_items >= source_items
+            (sources and source_items > 0 and extracted_items >= source_items)
+            or (not source_list_present and bool(final.get("finished")))
         )
         # The page's article count includes duplicate cards.  Once every card
         # has been parsed, production statistics intentionally use unique URLs.
@@ -988,7 +1191,9 @@ class WenxinWebCollector:
             "expected_source_count": expected_unique,
             "citation_count": source_items,
             "source_capture_complete": source_capture_complete,
+            "source_list_present": source_list_present,
             "capture_warning": (
+                "页面未展示参考资料列表；本轮仅归档完整回答正文" if not source_list_present else
                 "" if source_capture_complete else
                 f"页面标示 {displayed_items} 篇资料，解析 {extracted_items}/{source_items} 个资料项，"
                 f"取得 {len(sources)} 条有效唯一链接"
@@ -1012,7 +1217,8 @@ class WenxinWebCollector:
 (()=>{{
   const card = document.querySelector(
     '#content_left [tpl="new_baikan_index"], #content_left [m-name*="new_baikan_index"], ' +
-    '#content_left [tpl="wenda_generate"], #content_left .ai-entry'
+    '#content_left [tpl="wenda_generate"], #content_left .ai-entry, ' +
+    '#content_left .cosc-card, #content_left [class*="nbk-index_"]'
   );
   const citationSelectors = [
     '.cosd-citation',
@@ -1043,9 +1249,25 @@ class WenxinWebCollector:
         value = self.page.evaluate(BAIDU_VISIBLE_SOURCES_JS, timeout=20)
         return list(value.get("sources") or []) if isinstance(value, dict) else []
 
+    def _direct_card_sources(self) -> list[dict[str, str]]:
+        """Read provenance links that Baidu now renders directly inside the card."""
+        value = self.page.evaluate(BAIDU_CARD_DIRECT_SOURCES_JS, timeout=20)
+        return list(value.get("sources") or []) if isinstance(value, dict) else []
+
     def _collect_citation_sources(self, citation_count: int) -> tuple[list[dict[str, str]], int]:
-        raw_sources: list[dict[str, str]] = []
+        # Newer Baidu cards render some source anchors inline and no longer use
+        # the old ``.cos-tooltip-content`` popup for every citation.
+        raw_sources: list[dict[str, str]] = self._direct_card_sources()
         citations_with_sources = 0
+        # Baidu increasingly hides the complete provenance list behind the
+        # "参考 N 篇资料" footer instead of rendering legacy citation markers.
+        # Open that drawer before falling back to per-marker hover/click logic.
+        if citation_count == 0 or not raw_sources:
+            opened = self.page.evaluate(BAIDU_OPEN_SOURCE_DRAWER_JS, timeout=20)
+            if isinstance(opened, dict) and opened.get("clicked"):
+                time.sleep(1.2)
+                raw_sources.extend(self._visible_sources())
+                raw_sources.extend(self._direct_card_sources())
         for index in range(citation_count):
             current: list[dict[str, str]] = []
             for attempt in range(3):
@@ -1075,7 +1297,13 @@ class WenxinWebCollector:
                 raw_sources.extend(current)
         return raw_sources, citations_with_sources
 
-    def collect_search(self, question: str, timeout: int = 90) -> dict[str, Any]:
+    def collect_search(
+        self,
+        question: str,
+        timeout: int = 90,
+        *,
+        fallback_to_wenxin: bool = True,
+    ) -> dict[str, Any]:
         question = str(question or "").strip()
         if not question:
             raise ValueError("百度搜索问题不能为空")
@@ -1095,7 +1323,7 @@ class WenxinWebCollector:
             last = value if isinstance(value, dict) else {}
             if self._is_security_verification(last):
                 raise RuntimeError("检测到百度安全验证，立即关闭当前页面")
-            body = str(last.get("body") or "")
+            body = clean_baidu_ai_body(last.get("body"))
             query_matches = self._compact(last.get("query") or "") == self._compact(question)
             ready = last.get("readyState") == "complete"
             if last.get("ok") and query_matches and ready and len(self._compact(body)) >= 40:
@@ -1109,9 +1337,14 @@ class WenxinWebCollector:
                 previous_body = body
                 complete_without_ai = complete_without_ai + 1 if ready and query_matches else 0
                 if complete_without_ai >= 12:
-                    return self.collect_wenxin_search(question, timeout=max(45, timeout))
+                    if fallback_to_wenxin:
+                        return self.collect_wenxin_search(question, timeout=max(45, timeout))
+                    raise BaiduSearchCardUnavailable(f"百度搜索未出现 AI 卡片：{question}")
             time.sleep(1)
         else:
+            query_matches = self._compact(last.get("query") or "") == self._compact(question)
+            if not fallback_to_wenxin and last.get("readyState") == "complete" and query_matches and not last.get("ok"):
+                raise BaiduSearchCardUnavailable(f"百度搜索未出现 AI 卡片：{question}")
             raise TimeoutError(f"等待百度 AI 回答超时：{question}")
 
         self._expand_ai_card()
@@ -1121,7 +1354,7 @@ class WenxinWebCollector:
         while time.monotonic() < expanded_deadline:
             value = self.page.evaluate(BAIDU_AI_SNAPSHOT_JS, timeout=30)
             expanded = value if isinstance(value, dict) else {}
-            body = str(expanded.get("body") or "")
+            body = clean_baidu_ai_body(expanded.get("body"))
             if expanded.get("ok") and not expanded.get("folded") and len(body) >= len(previous_body):
                 expanded_stable = expanded_stable + 1 if body == expanded_body else 1
                 expanded_body = body
@@ -1141,7 +1374,7 @@ class WenxinWebCollector:
         if callable(adaptive_snapshot):
             try:
                 adaptive = adaptive_snapshot()
-                adaptive_body = str(adaptive.get("body") or "")
+                adaptive_body = clean_baidu_ai_body(adaptive.get("body"))
                 # Prefer the larger stable body; this also protects against a
                 # renamed answer class truncating the JavaScript extraction.
                 if len(self._compact(adaptive_body)) > len(self._compact(previous_body)):
@@ -1153,22 +1386,21 @@ class WenxinWebCollector:
             except Exception:
                 pass
         citation_count = int(last.get("citationCount") or 0)
-        # A Baidu AI answer always has provenance.  A zero count means the result
-        # page changed its citation markup (or lazy rendering has not completed),
-        # never that a source-less capture is production-complete.  Use the
-        # dedicated Wenxin result page as the authoritative fallback instead of
-        # incorrectly persisting a successful 0/0 round.
-        if citation_count <= 0:
-            return self.collect_wenxin_search(question, timeout=max(45, timeout))
         raw_sources, captured_citations = self._collect_citation_sources(citation_count)
         sources = self._normalize_sources(raw_sources)
-        if citation_count and captured_citations < citation_count:
-            # The card exists but one or more citation popups are not usable.
-            # This is the same fallback condition as a missing card: obtain the
-            # authoritative answer/reference list from the Wenxin result page.
-            return self.collect_wenxin_search(question, timeout=max(45, timeout))
-        if not sources:
-            return self.collect_wenxin_search(question, timeout=max(45, timeout))
+        source_capture_complete = bool(
+            sources and (
+                citation_count == 0
+                or captured_citations >= citation_count
+                or len(sources) >= citation_count
+            )
+        )
+        warning = ""
+        if not source_capture_complete:
+            warning = (
+                f"百度卡片正文已完整归档；信源区域结构未完全识别（"
+                f"引用 {captured_citations}/{citation_count}，有效链接 {len(sources)} 条）"
+            )
         return {
             "url": url,
             "body": previous_body,
@@ -1176,9 +1408,42 @@ class WenxinWebCollector:
             "body_capture_complete": True,
             "sources": sources,
             "source_count": len(sources),
-            "expected_source_count": len(sources),
+            "expected_source_count": max(citation_count, len(sources)),
             "citation_count": citation_count,
-            "source_capture_complete": True,
+            "source_capture_complete": source_capture_complete,
+            "source_list_present": bool(citation_count or sources),
+            "capture_warning": warning,
             "capture_mode": "baidu_search_ai",
             "page_navigation_id": navigation_id,
         }
+
+    def collect_baidu_search_card(self, question: str, timeout: int = 90) -> dict[str, Any]:
+        """Collect only the Baidu result-page AI card, never a Wenxin fallback.
+
+        A normally loaded result page without an AI card is an observed product
+        outcome, not a collector failure.  Returning it explicitly lets the
+        dashboard say that Baidu did not expose a card after the daily probes.
+        """
+        try:
+            result = self.collect_search(
+                question,
+                timeout=timeout,
+                fallback_to_wenxin=False,
+            )
+        except BaiduSearchCardUnavailable as exc:
+            return {
+                "url": self.search_url(question),
+                "body": "",
+                "page_body": "",
+                "body_capture_complete": False,
+                "sources": [],
+                "source_count": 0,
+                "expected_source_count": 0,
+                "citation_count": 0,
+                "source_capture_complete": False,
+                "capture_mode": "baidu_search_ai",
+                "card_available": False,
+                "capture_warning": str(exc),
+            }
+        result["card_available"] = True
+        return result

@@ -27,8 +27,38 @@ class LanResultReceiverTest(unittest.TestCase):
         self.assertEqual(capture_quarantine_reason("wenxin", complete), "")
         self.assertEqual(
             capture_quarantine_reason("wenxin", {**complete, "sources": []}),
+            "",
+        )
+        source_less = {
+            **complete,
+            "sources": [],
+            "expected_source_count": 0,
+            "source_list_present": False,
+        }
+        self.assertEqual(
+            capture_quarantine_reason("wenxin", source_less),
+            "",
+        )
+        self.assertEqual(
+            capture_quarantine_reason("wenxin", {
+                **source_less,
+                "capture_mode": "baidu_wenxin_search",
+            }),
             "wenxin_source_capture_empty",
         )
+
+    def test_receipt_rejects_explicit_wenxin_page_without_visible_source_list(self) -> None:
+        record = {
+            "status": "success", "question": "推荐一款护发精油",
+            "web_body": "这是一段完整且足够长的文心产品推荐回答正文。",
+            "body_capture_complete": True, "sources": [],
+            "expected_source_count": 0, "source_capture_complete": True,
+            "source_list_present": False,
+            "capture_warning": "页面未展示参考资料列表；本轮仅归档完整回答正文",
+        }
+        receipt = receiver.result_receipt("wenxin", "a" * 64, {"source_device": "pc"}, record)
+        self.assertFalse(receipt["analysis"]["source_capture_complete"])
+        self.assertIs(receipt["analysis"]["source_list_present"], False)
 
     def test_every_model_quarantines_a_success_record_without_an_answer(self) -> None:
         for model in ("doubao", "yuanbao", "wenxin", "quark"):
@@ -37,6 +67,15 @@ class LanResultReceiverTest(unittest.TestCase):
                     capture_quarantine_reason(model, {"status": "success", "answer": "  "}),
                     "empty_answer",
                 )
+
+    def test_quark_page_shell_is_quarantined(self) -> None:
+        run = {
+            "status": "success",
+            "question": "护发精油推荐",
+            "answer": "新对话\n近期对话\n新对话\n推荐防晒霜\n推荐护手霜\n推荐身体乳\n推荐洗面奶\n推荐爽肤水\n推荐卸妆油\n推荐护发精油\nQwen 3.7\n内容由千问AI生成，仅供参考",
+            "body_capture_complete": True,
+        }
+        self.assertIn("quark_invalid_answer", capture_quarantine_reason("quark", run))
 
     def test_wenxin_duplicate_fingerprints_ignore_invisible_formatting(self) -> None:
         self.assertEqual(
@@ -221,6 +260,50 @@ class LanResultReceiverTest(unittest.TestCase):
             sync._urls({"receiver_url": "http://192.168.1.233:8791"}),
             ["http://192.168.1.233:8791", "http://192.168.1.233:8765"],
         )
+
+    def test_local_retention_removes_only_old_acknowledged_results(self) -> None:
+        original_root = sync.ROOT
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                sync.ROOT = Path(directory)
+                model, device = "wenxin", "worker-retention"
+                config_path = sync._config_path(model)
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(json.dumps({
+                    "enabled": True,
+                    "model": model,
+                    "device_name": device,
+                    "local_retention_days": 1,
+                }), encoding="utf-8")
+                result_path = sync.ROOT / "runtime" / "remote_workers" / "wenxin_collector_results.jsonl"
+                records = [
+                    {"collector_model": model, "question": "old-acked"},
+                    {"collector_model": model, "question": "old-unsent"},
+                    {"collector_model": model, "question": "recent-acked"},
+                ]
+                result_path.write_text(
+                    "".join(json.dumps(item) + "\n" for item in records), encoding="utf-8"
+                )
+                sent = sync.ROOT / "runtime" / "remote_workers" / model / "sent"
+                sent.mkdir(parents=True)
+                old_id = sync._request_id(model, records[0], device)
+                recent_id = sync._request_id(model, records[2], device)
+                (sent / f"{old_id}.json").write_text(
+                    json.dumps({"uploaded_at": time.time() - 90000}), encoding="utf-8"
+                )
+                (sent / f"{recent_id}.json").write_text(
+                    json.dumps({"uploaded_at": time.time()}), encoding="utf-8"
+                )
+
+                result = sync.prune_collector_results(model, result_path, force=True)
+
+                self.assertEqual(result["removed"], 1)
+                remaining = [json.loads(line) for line in result_path.read_text().splitlines()]
+                self.assertEqual([item["question"] for item in remaining], ["old-unsent", "recent-acked"])
+                self.assertFalse((sent / f"{old_id}.json").exists())
+                self.assertTrue((sent / f"{recent_id}.json").exists())
+        finally:
+            sync.ROOT = original_root
 
     def test_remote_plugin_activity_exposes_analysis_audit(self) -> None:
         original_root = plugins.ROOT

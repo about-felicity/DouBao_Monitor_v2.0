@@ -12,7 +12,10 @@ from typing import Any
 
 from monitor_core.plugins import ROOT, discover_plugins
 from monitor_core.collector_guard import collector_guard_port
-from monitor_core.lan_result_sync import start as start_result_sync
+from monitor_core.lan_result_sync import (
+    prune_collector_results,
+    start as start_result_sync,
+)
 
 
 REMOTE_MODELS = ("deepseek", "yuanbao", "wenxin")
@@ -106,6 +109,9 @@ def main() -> int:
         plugin = discover_plugins().get(args.model)
         if plugin is None:
             raise SystemExit(f"unknown model: {args.model}")
+        result_path = getattr(plugin, "collector_results", None) or getattr(plugin, "results", None)
+        if result_path:
+            prune_collector_results(args.model, Path(result_path), force=True)
         options: dict[str, Any] = {
             "rounds": max(1, args.rounds),
             "tasks": max(1, min(args.tasks, 4)),
